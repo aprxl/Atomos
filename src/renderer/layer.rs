@@ -35,7 +35,7 @@ use super::draw_command::DrawCommand;
 use super::pixels::Pixels;
 use super::rounding::Rounding;
 use super::text_stack::TextStack;
-use super::{Alignment, Font, FontParameters, Vertex, MSAA_SAMPLE_COUNT};
+use super::{Alignment, Font, FontParameters, TextSpan, Vertex, MSAA_SAMPLE_COUNT};
 
 /// Error from [`Layer::draw_path_from_file`]: either the file couldn't be
 /// read, or its contents didn't parse as SVG path data.
@@ -532,8 +532,10 @@ pub(super) struct LayerInner {
     // texture/bind group, so unlike the solid batch above these can't share
     // one buffer.
     image_draws: Vec<ImageDraw>,
-    // Shared by every layer — see `text_stack.rs`'s module doc.
+    // `FontSystem`/`TextAtlas`/etc. are shared by every layer; the
+    // `TextRenderer` below is not — see `text_stack.rs`'s module doc.
     text_stack: Rc<RefCell<TextStack>>,
+    text_renderer: glyphon::TextRenderer,
 
     pending: Vec<DrawCommand>,
     invalidation: InvalidationState,
@@ -589,6 +591,11 @@ impl LayerInner {
             LayerInvalidation::Manual => InvalidationState::Manual { dirty: false },
         };
 
+        // Own `TextRenderer` per layer, registered against the shared
+        // `TextAtlas` — see `TextStack::create_text_renderer`'s doc for why
+        // sharing one `TextRenderer` across layers is unsound.
+        let text_renderer = text_stack.borrow_mut().create_text_renderer(device);
+
         Self {
             device: device.clone(),
             queue: queue.clone(),
@@ -612,6 +619,7 @@ impl LayerInner {
             num_indices: 0,
             image_draws: Vec::new(),
             text_stack,
+            text_renderer,
             pending: Vec::new(),
             invalidation: invalidation_state,
         }
@@ -700,9 +708,12 @@ impl LayerInner {
         // — see `text_stack.rs`'s module doc for why — and must happen
         // before `pending` is cleared below (an `Automatic` layer's text
         // commands wouldn't survive to `render_to_texture` otherwise).
-        if let Err(e) =
-            self.text_stack.borrow_mut().prepare_layer(&self.device, &self.queue, &self.pending)
-        {
+        if let Err(e) = self.text_stack.borrow_mut().prepare_layer(
+            &self.device,
+            &self.queue,
+            &self.pending,
+            &mut self.text_renderer,
+        ) {
             eprintln!("Atomos: text glyph atlas full, some text may not render this frame: {e:?}");
         }
 
@@ -815,7 +826,7 @@ impl LayerInner {
 
         // Drawn last, on top of this layer's shapes/images — whatever
         // `prepare_layer` uploaded moments ago in `rebuild_if_needed`.
-        if let Err(e) = self.text_stack.borrow().render(&mut rpass) {
+        if let Err(e) = self.text_stack.borrow().render(&self.text_renderer, &mut rpass) {
             eprintln!("Atomos: text render error: {e:?}");
         }
     }
@@ -1017,7 +1028,7 @@ fn tessellate_command(command: &DrawCommand) -> (Vec<Vertex>, Vec<u16>) {
         // Handled entirely in `LayerInner::rebuild_if_needed`/
         // `render_to_texture` via the shared `TextStack`, not the solid
         // vertex/index batch.
-        DrawCommand::Text { .. } => (Vec::new(), Vec::new()),
+        DrawCommand::Text { .. } | DrawCommand::StyledText { .. } => (Vec::new(), Vec::new()),
     }
 }
 
@@ -1418,6 +1429,37 @@ impl Layer {
     /// logic themselves.
     pub fn get_text_size(&self, text: &str, font: &Font, font_parameters: &FontParameters) -> (f32, f32) {
         self.0.borrow().text_stack.borrow_mut().measure(text, font, font_parameters)
+    }
+
+    /// Draw multiple independently-styled runs of text as one logical
+    /// unit — e.g. one syntax-highlighted line, one [`TextSpan`] per
+    /// token. Every span is shaped together as a single cosmic-text
+    /// rich-text buffer, so this costs one shape operation regardless of
+    /// how many spans/colors are involved — unlike calling
+    /// [`Layer::draw_text`] once per token, which pays full shaping cost
+    /// per call.
+    ///
+    /// - `spans`: the styled runs, concatenated in order.
+    /// - `position`/`alignment`: apply to the *combined* bounding box of
+    ///   every span together, the same way [`Layer::draw_text`]'s do for
+    ///   its one string.
+    pub fn draw_styled_text(&self, spans: &[TextSpan], position: (f32, f32), alignment: Alignment) {
+        debug_assert!(
+            spans.iter().all(|span| matches!(span.color, Color::Solid(_))),
+            "draw_styled_text only supports Color::Solid per span"
+        );
+        self.0.borrow_mut().push(DrawCommand::StyledText {
+            spans: spans.to_vec(),
+            position: [position.0, position.1],
+            alignment,
+        });
+    }
+
+    /// [`Layer::get_text_size`], for a [`Layer::draw_styled_text`] call —
+    /// the combined bounding box every span in `spans` would occupy
+    /// shaped together, before any [`Alignment`] offset.
+    pub fn get_styled_text_size(&self, spans: &[TextSpan]) -> (f32, f32) {
+        self.0.borrow().text_stack.borrow_mut().measure_spans(spans)
     }
 
     /// Discard every pending/previously-built draw command for this layer.

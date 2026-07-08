@@ -7,6 +7,7 @@ use std::hash::{Hash, Hasher};
 use super::Color;
 use super::Pixels;
 use super::Rounding;
+use super::TextSpan;
 use super::{Alignment, Font, FontParameters};
 
 /// One `Layer::draw_*` call, queued until the layer is next (re)built.
@@ -61,6 +62,14 @@ pub(super) enum DrawCommand {
         font_parameters: FontParameters,
         alignment: Alignment,
         color: Color,
+    },
+    /// Multiple independently-styled [`TextSpan`]s shaped together as one
+    /// unit — see `Layer::draw_styled_text`. Same "always re-shaped every
+    /// frame" cost model as `Text` above, for the same reason.
+    StyledText {
+        spans: Vec<TextSpan>,
+        position: [f32; 2],
+        alignment: Alignment,
     },
 }
 
@@ -132,6 +141,21 @@ impl Hash for DrawCommand {
                 state.write_u32(font_parameters.tracking.to_bits());
                 alignment.hash(state);
                 color.hash_bits(state);
+            }
+            DrawCommand::StyledText { spans, position, alignment } => {
+                state.write_u8(6);
+                state.write_usize(spans.len());
+                for span in spans {
+                    span.text.hash(state);
+                    span.font.hash(state);
+                    state.write_u32(span.font_parameters.size.to_bits());
+                    state.write_u32(span.font_parameters.weight.to_bits());
+                    state.write_u32(span.font_parameters.width.to_bits());
+                    state.write_u32(span.font_parameters.tracking.to_bits());
+                    span.color.hash_bits(state);
+                }
+                hash_f32_pair(position, state);
+                alignment.hash(state);
             }
         }
     }

@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use glyphon::{
-    fontdb, Buffer, Color, ContentType, CustomGlyph, CustomGlyphId, FontSystem,
+    fontdb, Buffer, Color, ContentType, CustomGlyph, CustomGlyphId, FontSystem, LayoutGlyph,
     RasterizeCustomGlyphRequest, RasterizedCustomGlyph,
 };
 use swash::scale::{image::Image, Render, ScaleContext, Source};
@@ -79,11 +79,52 @@ impl EffectGlyphs {
         effect: (f32, f32), // (embolden, condense)
         color: [u8; 4],
     ) -> Vec<CustomGlyph> {
+        let uniform_color = Color::rgba(color[0], color[1], color[2], color[3]);
+        self.layout_to_custom_glyphs_with(font_system, buffer, position, |_glyph| (effect, uniform_color))
+    }
+
+    /// Per-span variant, for `Layer::draw_styled_text`: every span in a
+    /// call is shaped together as one cosmic-text rich-text buffer (see
+    /// `TextStack::shape_spans`), so unlike [`Self::layout_to_custom_glyphs`]
+    /// there's no single effect/color for the whole buffer — each glyph
+    /// recovers its own span's `(weight, width)` via `glyph.metadata`, an
+    /// index into `span_effects` (cosmic-text has no native per-span
+    /// concept for this synthetic effect, so it rides through shaping via
+    /// the generic `metadata` field `shape_spans` tags every span with).
+    /// Color, unlike weight/width, *is* native to cosmic-text — it comes
+    /// back already resolved per glyph via `glyph.color_opt`.
+    pub fn layout_to_custom_glyphs_spans(
+        &mut self,
+        font_system: &mut FontSystem,
+        buffer: &Buffer,
+        position: (f32, f32),
+        span_effects: &[(f32, f32)],
+    ) -> Vec<CustomGlyph> {
+        self.layout_to_custom_glyphs_with(font_system, buffer, position, |glyph| {
+            let effect = span_effects.get(glyph.metadata).copied().unwrap_or((0.0, 1.0));
+            let color = glyph.color_opt.unwrap_or(Color::rgba(0xFF, 0xFF, 0xFF, 0xFF));
+            (effect, color)
+        })
+    }
+
+    /// Shared core of [`Self::layout_to_custom_glyphs`]/
+    /// [`Self::layout_to_custom_glyphs_spans`]: walks every glyph in
+    /// `buffer`, asking `effect_and_color` for that glyph's
+    /// `(embolden, condense)`/color, then rasterizes (cached by
+    /// `EffectGlyphKey`) and emits a `CustomGlyph`.
+    fn layout_to_custom_glyphs_with(
+        &mut self,
+        font_system: &mut FontSystem,
+        buffer: &Buffer,
+        position: (f32, f32),
+        mut effect_and_color: impl FnMut(&LayoutGlyph) -> ((f32, f32), Color),
+    ) -> Vec<CustomGlyph> {
         let (left, top) = position;
-        let (embolden, condense) = effect;
         let mut glyphs = Vec::new();
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
+                let (effect, color) = effect_and_color(glyph);
+                let (embolden, condense) = effect;
                 let physical = glyph.physical((left, top + run.line_y), 1.0);
                 let key = EffectGlyphKey {
                     font_id: physical.cache_key.font_id,
@@ -128,7 +169,7 @@ impl EffectGlyphs {
                     top: physical.y as f32 - image.placement.top as f32,
                     width: image.placement.width as f32,
                     height: image.placement.height as f32,
-                    color: Some(Color::rgba(color[0], color[1], color[2], color[3])),
+                    color: Some(color),
                     snap_to_physical_pixel: true,
                     metadata: 0,
                 });

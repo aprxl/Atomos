@@ -31,6 +31,7 @@ mod glyph_effects;
 mod layer;
 mod pixels;
 mod rounding;
+mod text_span;
 mod text_stack;
 
 // `GradientDirection`/`Rgba` are vocabulary for richer `Color` use
@@ -50,6 +51,7 @@ pub use layer::{Layer, LayerInvalidation};
 pub use layer::PathFileError;
 pub use pixels::Pixels;
 pub use rounding::Rounding;
+pub use text_span::TextSpan;
 
 /// MSAA sample count for every layer's own render pass (the solid, image,
 /// and text pipelines all draw into a multisampled offscreen target,
