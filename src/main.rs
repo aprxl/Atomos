@@ -169,129 +169,25 @@ impl ApplicationHandler for App {
                 // `Layer` should hash it to the same value each frame and
                 // skip rebuilding after the first.
                 if let Some(layer) = &self.top_layer {
-                    layer.draw_rectangle(
-                        TOP_LAYER_RECT_POS,
-                        TOP_LAYER_RECT_SIZE,
-                        Color::rgba(0x64, 0x64, 0xC8, 0xFF),
-                        Rounding::uniform(12.0),
-                    );
-                    layer.draw_polygon(&TOP_LAYER_TRIANGLE, Color::rgb(0x50, 0xB0, 0x70));
-                    layer.draw_circle(
-                        TOP_LAYER_CIRCLE_CENTER,
-                        TOP_LAYER_CIRCLE_RADIUS,
-                        Color::rgb(0xD0, 0xB0, 0x40),
-                    );
-                    layer
-                        .draw_path(
-                            TOP_LAYER_SVG_PATH,
-                            TOP_LAYER_SVG_PATH_POS,
-                            Color::rgb(0xC0, 0x80, 0xF0),
-                        )
-                        .expect("the hardcoded demo SVG path is valid path syntax");
-
-                    // Color::Gradient / Color::PerVertex showcase.
-                    layer.draw_rectangle(
-                        SHOWCASE_GRADIENT_H_RECT_POS,
-                        SHOWCASE_GRADIENT_H_RECT_SIZE,
-                        Color::Gradient {
-                            stops: [[0xE0, 0x40, 0x40, 0xFF], [0x40, 0x40, 0xE0, 0xFF]],
-                            direction: GradientDirection::Horizontal,
-                        },
-                        Rounding::uniform(10.0),
-                    );
-                    layer.draw_rectangle(
-                        SHOWCASE_GRADIENT_V_RECT_POS,
-                        SHOWCASE_GRADIENT_V_RECT_SIZE,
-                        Color::Gradient {
-                            stops: [[0x40, 0xE0, 0x40, 0xFF], [0xE0, 0xE0, 0x40, 0xFF]],
-                            direction: GradientDirection::Vertical,
-                        },
-                        Rounding::uniform(10.0),
-                    );
-                    layer.draw_rectangle(
-                        SHOWCASE_PERVERTEX_RECT_POS,
-                        SHOWCASE_PERVERTEX_RECT_SIZE,
-                        Color::PerVertex([
-                            [0xE0, 0x40, 0x40, 0xFF], // top-left: red
-                            [0x40, 0xE0, 0x40, 0xFF], // top-right: green
-                            [0x40, 0x40, 0xE0, 0xFF], // bottom-right: blue
-                            [0xE0, 0xE0, 0x40, 0xFF], // bottom-left: yellow
-                        ]),
-                        Rounding::NONE,
-                    );
-                    layer.draw_circle(
-                        SHOWCASE_GRADIENT_CIRCLE_CENTER,
-                        SHOWCASE_GRADIENT_CIRCLE_RADIUS,
-                        Color::Gradient {
-                            stops: [[0xF0, 0x80, 0xC0, 0xFF], [0x40, 0xC0, 0xF0, 0xFF]],
-                            direction: GradientDirection::Vertical,
-                        },
-                    );
-                    layer.draw_polygon(
-                        &SHOWCASE_GRADIENT_TRIANGLE,
-                        Color::Gradient {
-                            stops: [[0xFF, 0xA0, 0x40, 0xFF], [0x40, 0x80, 0xFF, 0xFF]],
-                            direction: GradientDirection::Horizontal,
-                        },
-                    );
-
-                    // draw_text showcase.
-                    layer.draw_text(
-                        "System font (sans-serif)",
-                        SHOWCASE_TEXT_SYSTEM_POS,
-                        Color::rgb(0xE6, 0xE6, 0xE6),
-                        Alignment::TOP_LEFT,
-                        Font::Named("sans-serif".to_string()),
-                        FontParameters::new(28.0),
-                    );
-                    layer.draw_text(
-                        "TX-02, faux-bold + tracking",
-                        SHOWCASE_TEXT_WEIGHT_POS,
-                        Color::rgb(0xE6, 0xE6, 0xE6),
-                        Alignment::TOP_LEFT,
-                        Font::Bytes(TX02_FONT_BYTES),
-                        FontParameters { size: 28.0, weight: 1.4, width: 1.0, tracking: 0.2 },
-                    );
-                    layer.draw_text(
-                        "TX-02, \u{2208}",
-                        SHOWCASE_TEXT_CONDENSE_POS,
-                        Color::rgb(0xE6, 0xE6, 0xE6),
-                        Alignment::TOP_LEFT,
-                        Font::Bytes(TX02_FONT_BYTES),
-                        FontParameters { size: 28.0, weight: 0.0, width: 0.72, tracking: -0.1 },
-                    );
-
-                    // `get_text_size` showcase: size a background box to
-                    // fit a centered label, using the same measurement
-                    // `draw_text` resolves `Alignment::CENTER` from.
-                    let boxed_text = "Centered, boxed via get_text_size";
-                    let boxed_font = Font::Named("sans-serif".to_string());
-                    let mut boxed_params = FontParameters::new(22.0);
-                    boxed_params.weight = 0.8;
-                    boxed_params.tracking = 0.4;
-                    let (text_w, text_h) = layer.get_text_size(boxed_text, &boxed_font, &boxed_params);
-                    const BOX_PADDING: f32 = 14.0;
-                    layer.draw_rectangle(
-                        (
-                            SHOWCASE_TEXT_BOXED_ANCHOR.0 - text_w / 2.0 - BOX_PADDING,
-                            SHOWCASE_TEXT_BOXED_ANCHOR.1 - text_h / 2.0 - BOX_PADDING,
-                        ),
-                        (text_w + BOX_PADDING * 2.0, text_h + BOX_PADDING * 2.0),
-                        Color::rgba(0x20, 0x20, 0x28, 0xD0),
-                        Rounding::uniform(8.0),
-                    );
-                    layer.draw_text(
-                        boxed_text,
-                        SHOWCASE_TEXT_BOXED_ANCHOR,
-                        Color::rgb(0xFF, 0xFF, 0xFF),
-                        Alignment::CENTER,
-                        boxed_font,
-                        boxed_params,
-                    );
+                    let sin_time = self.renderer.as_ref().unwrap()
+                        .get_render_time().as_secs_f32()
+                        .sin().abs();
+                    let alpha = sin_time * 255.;
+                    for i in 1..800 {
+                        layer.draw_text(format!("hello world {i}!").as_str(), (20., 20.), Color::rgba(200, 225, 100, 255),
+                                        Alignment::TOP_LEFT, Font::Named("sans-serif".into()), FontParameters::new(32. + 16.));
+                    }
                 }
                 if let Some(r) = &mut self.renderer {
                     if let Err(e) = r.render() {
                         eprintln!("render error: {e}");
+                    }
+                    if let Some(w) = &self.window {
+                        w.set_title(&format!(
+                            "Atomos — Phase 0 — frame {:.2}ms, total render {:.2}s",
+                            r.get_frametime().as_secs_f64() * 1000.0,
+                            r.get_render_time().as_secs_f64(),
+                        ));
                     }
                 }
                 if let Some(w) = &self.window {

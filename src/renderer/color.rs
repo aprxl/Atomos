@@ -66,6 +66,13 @@ impl Color {
         Self::Solid([r, g, b, 0xFF])
     }
 
+    pub const fn gradient(first: Rgba, second: Rgba, direction: GradientDirection) -> Self {
+        Self::Gradient {
+            stops: [first, second],
+            direction
+        }
+    }
+
     /// Resolve this color at a single point, given the axis-aligned
     /// bounding box (`min`, `max`) of the shape being colored. See the type
     /// doc for how each variant behaves; `pos` is expected to lie within
