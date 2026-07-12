@@ -78,7 +78,11 @@ fn checkerboard_rgba(size: u32, cell: u32) -> Vec<u8> {
     for y in 0..size {
         for x in 0..size {
             let on = ((x / cell) + (y / cell)).is_multiple_of(2);
-            let (r, g, b) = if on { (0xE0, 0xC0, 0x40) } else { (0x30, 0x30, 0x38) };
+            let (r, g, b) = if on {
+                (0xE0, 0xC0, 0x40)
+            } else {
+                (0x30, 0x30, 0x38)
+            };
             pixels.extend_from_slice(&[r, g, b, 0xFF]);
         }
     }
@@ -154,13 +158,23 @@ impl ApplicationHandler for App {
         // cosmic-text has no native per-span concept for it (see
         // `glyph_effects.rs`/`text_stack.rs`'s `shape_spans`).
         const CODE_SIZE: f32 = 24.0;
-        const CONDENSED: FontParameters = FontParameters { size: CODE_SIZE, weight: 0.0, width: 0.75, tracking: 0.0 };
+        const CONDENSED: FontParameters = FontParameters {
+            size: CODE_SIZE,
+            weight: 0.0,
+            width: 0.75,
+            tracking: 0.0,
+        };
         bottom_layer.draw_styled_text(
             &[
                 TextSpan::new(
                     "fn ",
                     Font::Bytes(TX02_FONT_BYTES),
-                    FontParameters { size: CODE_SIZE, weight: 1.3, width: 1.0, tracking: 0.0 },
+                    FontParameters {
+                        size: CODE_SIZE,
+                        weight: 1.3,
+                        width: 1.0,
+                        tracking: 0.0,
+                    },
                     Color::rgb(0xC5, 0x8C, 0xFF), // keyword: violet, bold
                 ),
                 TextSpan::new(
@@ -169,7 +183,12 @@ impl ApplicationHandler for App {
                     FontParameters::new(CODE_SIZE),
                     Color::rgb(0xFF, 0xD8, 0x66), // fn name: gold
                 ),
-                TextSpan::new("() ", Font::Bytes(TX02_FONT_BYTES), CONDENSED, Color::rgb(0xA0, 0xA0, 0xA8)),
+                TextSpan::new(
+                    "() ",
+                    Font::Bytes(TX02_FONT_BYTES),
+                    CONDENSED,
+                    Color::rgb(0xA0, 0xA0, 0xA8),
+                ),
                 TextSpan::new(
                     "-> ",
                     Font::Bytes(TX02_FONT_BYTES),
@@ -182,14 +201,29 @@ impl ApplicationHandler for App {
                     FontParameters::new(CODE_SIZE),
                     Color::rgb(0x6E, 0xE7, 0xB7), // type: green
                 ),
-                TextSpan::new("{ ", Font::Bytes(TX02_FONT_BYTES), CONDENSED, Color::rgb(0xA0, 0xA0, 0xA8)),
+                TextSpan::new(
+                    "{ ",
+                    Font::Bytes(TX02_FONT_BYTES),
+                    CONDENSED,
+                    Color::rgb(0xA0, 0xA0, 0xA8),
+                ),
                 TextSpan::new(
                     "42",
                     Font::Bytes(TX02_FONT_BYTES),
-                    FontParameters { size: CODE_SIZE, weight: 0.9, width: 1.0, tracking: 0.0 },
+                    FontParameters {
+                        size: CODE_SIZE,
+                        weight: 0.9,
+                        width: 1.0,
+                        tracking: 0.0,
+                    },
                     Color::rgb(0xF0, 0x90, 0x50), // number: orange, bold
                 ),
-                TextSpan::new(" }", Font::Bytes(TX02_FONT_BYTES), CONDENSED, Color::rgb(0xA0, 0xA0, 0xA8)),
+                TextSpan::new(
+                    " }",
+                    Font::Bytes(TX02_FONT_BYTES),
+                    CONDENSED,
+                    Color::rgb(0xA0, 0xA0, 0xA8),
+                ),
             ],
             SHOWCASE_STYLED_TEXT_POS,
             Alignment::TOP_LEFT,
@@ -202,15 +236,25 @@ impl ApplicationHandler for App {
         // box correctly too.
         let styled_boxed_spans = [
             TextSpan::new(
-                "3  2",
+                "3  2 ",
                 Font::Bytes(TX02_FONT_BYTES),
-                FontParameters { size: 20.0, weight: 1.1, width: 1.0, tracking: 0.0 },
+                FontParameters {
+                    size: 20.0,
+                    weight: 1.1,
+                    width: 1.0,
+                    tracking: 0.0,
+                },
                 Color::rgb(0xF0, 0x90, 0x50),
             ),
             TextSpan::new(
                 "styled ",
                 Font::Bytes(TX02_FONT_BYTES),
-                FontParameters { size: 20.0, weight: 0.0, width: 0.8, tracking: 0.3 },
+                FontParameters {
+                    size: 20.0,
+                    weight: 0.0,
+                    width: 0.8,
+                    tracking: 0.3,
+                },
                 Color::rgb(0x80, 0xA0, 0xF0),
             ),
             TextSpan::new(
@@ -227,11 +271,18 @@ impl ApplicationHandler for App {
                 SHOWCASE_STYLED_TEXT_BOXED_ANCHOR.0 - styled_w / 2.0 - STYLED_BOX_PADDING,
                 SHOWCASE_STYLED_TEXT_BOXED_ANCHOR.1 - styled_h / 2.0 - STYLED_BOX_PADDING,
             ),
-            (styled_w + STYLED_BOX_PADDING * 2.0, styled_h + STYLED_BOX_PADDING * 2.0),
+            (
+                styled_w + STYLED_BOX_PADDING * 2.0,
+                styled_h + STYLED_BOX_PADDING * 2.0,
+            ),
             Color::rgba(0x20, 0x20, 0x28, 0xD0),
             Rounding::uniform(8.0),
         );
-        bottom_layer.draw_styled_text(&styled_boxed_spans, SHOWCASE_STYLED_TEXT_BOXED_ANCHOR, Alignment::CENTER);
+        bottom_layer.draw_styled_text(
+            &styled_boxed_spans,
+            SHOWCASE_STYLED_TEXT_BOXED_ANCHOR,
+            Alignment::CENTER,
+        );
 
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -264,8 +315,14 @@ impl ApplicationHandler for App {
                         eprintln!("render error: {e}");
                     }
                     if let Some(w) = &self.window {
+                        // `get_gpu_frametime` is `None` on adapters without
+                        // timestamp queries — just omit it from the title.
+                        let gpu = r
+                            .get_gpu_frametime()
+                            .map(|d| format!(", gpu {:.2}ms", d.as_secs_f64() * 1000.0))
+                            .unwrap_or_default();
                         w.set_title(&format!(
-                            "Atomos — Phase 0 — frame {:.2}ms, total render {:.2}s",
+                            "Atomos — Phase 0 — frame {:.2}ms{gpu}, total render {:.2}s",
                             r.get_frametime().as_secs_f64() * 1000.0,
                             r.get_render_time().as_secs_f64(),
                         ));

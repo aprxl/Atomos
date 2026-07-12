@@ -43,8 +43,12 @@ pub(super) enum DrawCommand {
     /// variant is re-tessellated — for a large, frequently-redrawn
     /// (`Automatic`) image this means hashing/re-uploading its full pixel
     /// buffer every frame it's unchanged; fine for icon-sized images, a
-    /// real cost for anything bigger. Not optimized further here — flagged
-    /// as a later problem, same as the rest of this pass's cost model.
+    /// real cost for anything bigger (a 1080p image is ~8 MB hashed per
+    /// frame). Known deferred cost — revisit when images beyond icons
+    /// actually appear: back `Pixels` with an `Rc` so clones share the
+    /// allocation and hash by pointer identity (the same trick
+    /// `Font::Bytes` uses), and cache uploaded textures across rebuilds
+    /// keyed by that identity.
     Image {
         pixels: Pixels,
         top_left: [f32; 2],

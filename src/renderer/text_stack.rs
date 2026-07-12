@@ -10,39 +10,71 @@
 //! `TextRenderer` across layers is actually unsound (a real crash this
 //! renderer hit): each layer gets its own via that method.
 //!
-//! **Every `draw_text` call is re-shaped and re-prepared every frame**,
-//! regardless of whether its content changed — unlike every other
-//! `DrawCommand`, text does not skip work on an unchanged `Automatic`
-//! layer. This is a deliberate simplification, not an oversight: glyphon's
-//! `prepare()`/`render()` pair must run back-to-back for a given layer
-//! (prepare uploads this frame's glyphs into the shared atlas; render
-//! draws whatever was just uploaded), and since every layer's render pass
-//! shares that one atlas, skipping `prepare()` for an "unchanged" layer
-//! risks drawing glyphs a *different* layer's `prepare()` already evicted.
-//! Always re-preparing right before rendering, one layer fully at a time,
-//! sidesteps that risk entirely. Fine for icon-sized labels; a real cost
-//! for large blocks of frequently-redrawn text — revisiting this (e.g. a
-//! dedicated atlas per layer) is future work.
+//! **Text is re-*prepared* every frame, but only re-*shaped* when its
+//! content actually changes.** The prepare side is a hard constraint:
+//! glyphon's `prepare()`/`render()` pair must run back-to-back for a given
+//! layer (prepare uploads this frame's glyphs into the shared atlas;
+//! render draws whatever was just uploaded), and since every layer's
+//! render pass shares that one atlas, skipping `prepare()` for an
+//! "unchanged" layer risks drawing glyphs a *different* layer's
+//! `prepare()` already evicted. Shaping, though — the genuinely expensive
+//! part (rustybuzz layout plus a fresh cosmic-text `Buffer`) — is cached
+//! in [`TextStack::shape_cache`], keyed by shaping inputs only: text,
+//! font, size, tracking (plus per-span color for styled text, which is
+//! baked into the shaped buffer via `Attrs`). Position, alignment, and
+//! the synthetic weight/width are placement/raster-time inputs and
+//! deliberately *not* part of the key, so moving or fading text never
+//! re-shapes. Entries unused for [`SHAPE_CACHE_EVICT_AFTER_FRAMES`]
+//! frames are dropped by [`TextStack::advance_frame`], called once per
+//! rendered frame — the cache is bounded by "distinct text visible
+//! recently", which for an editor viewport is a few thousand small
+//! buffers at most.
 
-use std::collections::hash_map::HashMap;
+use std::collections::hash_map::{DefaultHasher, HashMap};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use glyphon::{
-    fontdb, Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics, Resolution,
-    Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    fontdb, Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, LayoutGlyph, Metrics,
+    Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 
 use super::color::Color;
 use super::draw_command::DrawCommand;
 use super::font::Font;
 use super::font_parameters::FontParameters;
-use super::glyph_effects::EffectGlyphs;
+use super::glyph_effects::{effect_advance_delta, EffectGlyphs, GlyphEffect};
 use super::text_span::TextSpan;
 use super::{Alignment, HorizontalAlign, VerticalAlign, MSAA_SAMPLE_COUNT};
 
 /// Line height as a multiple of font size — matches the ratio the
 /// original Phase-0 text spike used.
 const LINE_HEIGHT_RATIO: f32 = 1.25;
+
+/// How many frames a [`TextStack::shape_cache`] entry may go unused before
+/// [`TextStack::advance_frame`] drops it. ~5 seconds at 60 Hz: long enough
+/// that scrolling back to recently-seen text is still a hit, short enough
+/// that one-off strings (a frame counter, a transient message) don't
+/// accumulate forever.
+const SHAPE_CACHE_EVICT_AFTER_FRAMES: u64 = 300;
+
+/// How often [`TextStack::advance_frame`] calls `atlas.trim()` (bounding
+/// the shared glyph atlas's memory growth) and bumps `atlas_generation`.
+/// ~30 seconds at 60 Hz — infrequent enough that the "every layer with
+/// text must re-prepare once" cost a trim forces (see
+/// `LayerInner::rebuild_if_needed`) stays rare, frequent enough to reclaim
+/// glyphs from long-idle sessions with heavy glyph churn (e.g. continuous
+/// `FontParameters::weight`/`width` animation, which mints a new
+/// `EffectGlyphKey` — and atlas entry — per distinct value).
+const ATLAS_TRIM_INTERVAL_FRAMES: u64 = 1800;
+
+/// One cached shaping result — see the module doc for what the cache key
+/// covers and why.
+struct CachedShape {
+    buffer: Buffer,
+    /// `TextStack::frame` value the entry was last requested on.
+    last_used: u64,
+}
 
 /// Cache key for [`TextStack::registered_fonts`]. `Bytes` is keyed by
 /// pointer identity + length rather than content — same reasoning as
@@ -79,6 +111,20 @@ pub(super) struct TextStack {
     // glyphs directly. One permanently-empty `Buffer` shared by all of
     // them, rather than allocating a fresh empty one per `draw_text` call.
     blank_buffer: Buffer,
+    // Shaped-buffer cache — see the module doc. Keyed by a hash of the
+    // shaping inputs ([`shaped_text_key`]/[`shaped_spans_key`]).
+    shape_cache: HashMap<u64, CachedShape>,
+    // Frame clock for `shape_cache` eviction, bumped once per rendered
+    // frame by [`TextStack::advance_frame`].
+    frame: u64,
+    // Bumped every [`ATLAS_TRIM_INTERVAL_FRAMES`] frames, each time
+    // `advance_frame` calls `atlas.trim()`. A `LayerInner` compares this
+    // against the generation it last successfully prepared under — a
+    // mismatch means the atlas may have evicted glyphs it depends on since
+    // then (trim clears glyphon's "in use" protection set), so it must
+    // re-prepare even if its own text content hasn't changed. See
+    // `LayerInner::rebuild_if_needed`'s skip-prepare logic.
+    atlas_generation: u64,
 }
 
 impl TextStack {
@@ -111,7 +157,35 @@ impl TextStack {
             effect_glyphs: EffectGlyphs::new(),
             registered_fonts: HashMap::new(),
             blank_buffer,
+            shape_cache: HashMap::new(),
+            frame: 0,
+            atlas_generation: 0,
         }
+    }
+
+    /// Advance the shape-cache clock (dropping entries unused for
+    /// [`SHAPE_CACHE_EVICT_AFTER_FRAMES`] frames) and, every
+    /// [`ATLAS_TRIM_INTERVAL_FRAMES`] frames, trim the shared glyph atlas
+    /// and bump `atlas_generation`. Called once per rendered frame by
+    /// `Renderer::render` (not per layer — several layers share this stack
+    /// within one frame).
+    pub(super) fn advance_frame(&mut self) {
+        self.frame += 1;
+        let frame = self.frame;
+        self.shape_cache
+            .retain(|_, entry| frame - entry.last_used <= SHAPE_CACHE_EVICT_AFTER_FRAMES);
+
+        if frame.is_multiple_of(ATLAS_TRIM_INTERVAL_FRAMES) {
+            self.atlas.trim();
+            self.atlas_generation += 1;
+        }
+    }
+
+    /// Current atlas protection epoch — see the `atlas_generation` field
+    /// doc. Compared by [`super::layer::LayerInner`] against the
+    /// generation it last successfully prepared under.
+    pub(super) fn atlas_generation(&self) -> u64 {
+        self.atlas_generation
     }
 
     /// Build a new [`TextRenderer`] registered against this stack's shared
@@ -155,10 +229,41 @@ impl TextStack {
     /// Measure the pixel size `text` would occupy shaped with `font`/
     /// `font_parameters`, before any [`Alignment`] offset is applied — the
     /// same measurement [`TextStack::prepare_layer`] uses internally to
-    /// resolve alignment. Exposed via [`super::Layer::get_text_size`].
+    /// resolve alignment (and the same shape cache, so measuring text that
+    /// is also drawn this frame shapes it once, not twice). Exposed via
+    /// [`super::Layer::get_text_size`].
     pub(super) fn measure(&mut self, text: &str, font: &Font, font_parameters: &FontParameters) -> (f32, f32) {
+        let key = self.ensure_shaped(text, font, font_parameters);
+        let effect = GlyphEffect::from(font_parameters);
+        measure_shaped_buffer_with(&self.shape_cache[&key].buffer, |_| effect)
+    }
+
+    /// Look up (or shape and insert) the cached buffer for one
+    /// `draw_text`-style string, returning its cache key. The entry is
+    /// stamped with the current frame either way.
+    fn ensure_shaped(&mut self, text: &str, font: &Font, font_parameters: &FontParameters) -> u64 {
+        let key = shaped_text_key(text, font, font_parameters);
+        let frame = self.frame;
+        if let Some(entry) = self.shape_cache.get_mut(&key) {
+            entry.last_used = frame;
+            return key;
+        }
         let buffer = self.shape(text, font, font_parameters);
-        measure_shaped_buffer(&buffer)
+        self.shape_cache.insert(key, CachedShape { buffer, last_used: frame });
+        key
+    }
+
+    /// [`TextStack::ensure_shaped`], for a `draw_styled_text` span list.
+    fn ensure_shaped_spans(&mut self, spans: &[TextSpan]) -> u64 {
+        let key = shaped_spans_key(spans);
+        let frame = self.frame;
+        if let Some(entry) = self.shape_cache.get_mut(&key) {
+            entry.last_used = frame;
+            return key;
+        }
+        let buffer = self.shape_spans(spans);
+        self.shape_cache.insert(key, CachedShape { buffer, last_used: frame });
+        key
     }
 
     /// Resolve a [`Font`] to the family name cosmic-text's `Attrs` should
@@ -199,11 +304,15 @@ impl TextStack {
 
     /// Measure the combined bounding box `spans` would occupy shaped
     /// together, before any [`Alignment`] offset — the spans counterpart to
-    /// [`TextStack::measure`]. Exposed via
+    /// [`TextStack::measure`], sharing the same shape cache. Exposed via
     /// [`super::Layer::get_styled_text_size`].
     pub(super) fn measure_spans(&mut self, spans: &[TextSpan]) -> (f32, f32) {
-        let (buffer, _) = self.shape_spans(spans);
-        measure_shaped_buffer(&buffer)
+        let key = self.ensure_shaped_spans(spans);
+        let span_effects: Vec<GlyphEffect> =
+            spans.iter().map(|span| GlyphEffect::from(&span.font_parameters)).collect();
+        measure_shaped_buffer_with(&self.shape_cache[&key].buffer, |glyph| {
+            span_effects.get(glyph.metadata).copied().unwrap_or(GlyphEffect::NEUTRAL)
+        })
     }
 
     /// Like [`TextStack::shape`], but for [`TextSpan`]s: every span is
@@ -211,26 +320,19 @@ impl TextStack {
     /// operation for the whole run, not one per span — the entire point of
     /// `draw_styled_text`), each keeping its own font/size/tracking/color.
     /// `weight`/`width` (this renderer's synthetic faux-bold/condense) have
-    /// no native per-span cosmic-text attribute, so they're returned
-    /// alongside the buffer as `span_effects`, indexed by the
-    /// `Attrs::metadata` each span is tagged with below —
-    /// `EffectGlyphs::layout_to_custom_glyphs_spans` recovers a glyph's
-    /// effect via `span_effects[glyph.metadata]`. Color, size, and tracking
-    /// all have native per-span `Attrs` fields, so they need no such
-    /// workaround.
-    fn shape_spans(&mut self, spans: &[TextSpan]) -> (Buffer, Vec<(f32, f32)>) {
+    /// no native per-span cosmic-text attribute and don't participate in
+    /// shaping at all — callers rebuild the per-span [`GlyphEffect`] table
+    /// themselves and recover a glyph's effect via the `Attrs::metadata`
+    /// span index each span is tagged with below. Color, size, and
+    /// tracking all have native per-span `Attrs` fields.
+    fn shape_spans(&mut self, spans: &[TextSpan]) -> Buffer {
         // Resolved before building any `Attrs` below, since those borrow
         // the resolved family names by reference — `resolve_family` needs
         // `&mut self` and can't be called again once that borrow starts.
         let families: Vec<Option<String>> =
             spans.iter().map(|span| self.resolve_family(&span.font)).collect();
 
-        let span_effects: Vec<(f32, f32)> = spans
-            .iter()
-            .map(|span| (span.font_parameters.weight, span.font_parameters.width))
-            .collect();
-
-        let owned_attrs: Vec<(String, Attrs)> = spans
+        let attrs_per_span: Vec<Attrs> = spans
             .iter()
             .zip(&families)
             .enumerate()
@@ -251,7 +353,7 @@ impl TextStack {
                 };
                 attrs = attrs.color(GlyphonColor::rgba(rgba[0], rgba[1], rgba[2], rgba[3]));
                 attrs = attrs.metadata(index);
-                (span.text.clone(), attrs)
+                attrs
             })
             .collect();
 
@@ -267,14 +369,17 @@ impl TextStack {
             let mut borrowed = buffer.borrow_with(&mut self.font_system);
             borrowed.set_size(None, None);
             borrowed.set_rich_text(
-                owned_attrs.iter().map(|(text, attrs)| (text.as_str(), attrs.clone())),
+                spans
+                    .iter()
+                    .zip(&attrs_per_span)
+                    .map(|(span, attrs)| (span.text.as_str(), attrs.clone())),
                 &Attrs::new(),
                 Shaping::Advanced,
                 None,
             );
             borrowed.shape_until_scroll(true);
         }
-        (buffer, span_effects)
+        buffer
     }
 
     /// Shape and rasterize every `DrawCommand::Text`/`StyledText` in
@@ -302,9 +407,8 @@ impl TextStack {
                     alignment,
                     color,
                 } => {
-                    let buffer = self.shape(text, font, font_parameters);
-                    let (width, height) = measure_shaped_buffer(&buffer);
-                    let anchored = apply_alignment(*position, *alignment, width, height);
+                    let key = self.ensure_shaped(text, font, font_parameters);
+                    let effect = GlyphEffect::from(font_parameters);
                     let rgba = match color {
                         Color::Solid(rgba) => *rgba,
                         _ => {
@@ -315,22 +419,37 @@ impl TextStack {
                             [0xFF, 0xFF, 0xFF, 0xFF]
                         }
                     };
-                    let glyphs = self.effect_glyphs.layout_to_custom_glyphs(
-                        &mut self.font_system,
-                        &buffer,
+                    // Destructured so the cached buffer (immutable) and
+                    // `font_system`/`effect_glyphs` (mutable) borrows are
+                    // visibly disjoint fields of `self`.
+                    let TextStack { shape_cache, font_system, effect_glyphs, .. } = self;
+                    let buffer = &shape_cache[&key].buffer;
+                    let (width, height) = measure_shaped_buffer_with(buffer, |_| effect);
+                    let anchored = apply_alignment(*position, *alignment, width, height);
+                    let glyphs = effect_glyphs.layout_to_custom_glyphs(
+                        font_system,
+                        buffer,
                         (anchored[0], anchored[1]),
-                        (font_parameters.weight, font_parameters.width),
+                        effect,
                         rgba,
                     );
                     all_glyphs.push(glyphs);
                 }
                 DrawCommand::StyledText { spans, position, alignment } => {
-                    let (buffer, span_effects) = self.shape_spans(spans);
-                    let (width, height) = measure_shaped_buffer(&buffer);
+                    let key = self.ensure_shaped_spans(spans);
+                    let span_effects: Vec<GlyphEffect> = spans
+                        .iter()
+                        .map(|span| GlyphEffect::from(&span.font_parameters))
+                        .collect();
+                    let TextStack { shape_cache, font_system, effect_glyphs, .. } = self;
+                    let buffer = &shape_cache[&key].buffer;
+                    let (width, height) = measure_shaped_buffer_with(buffer, |glyph| {
+                        span_effects.get(glyph.metadata).copied().unwrap_or(GlyphEffect::NEUTRAL)
+                    });
                     let anchored = apply_alignment(*position, *alignment, width, height);
-                    let glyphs = self.effect_glyphs.layout_to_custom_glyphs_spans(
-                        &mut self.font_system,
-                        &buffer,
+                    let glyphs = effect_glyphs.layout_to_custom_glyphs_spans(
+                        font_system,
+                        buffer,
                         (anchored[0], anchored[1]),
                         &span_effects,
                     );
@@ -378,6 +497,40 @@ impl TextStack {
     }
 }
 
+/// Shape-cache key for one `draw_text` string: exactly the inputs
+/// [`TextStack::shape`] reads, nothing more. Weight/width/color/position/
+/// alignment are deliberately absent — they're applied per glyph at
+/// placement/raster time, so changing them (fading, moving) must stay a
+/// cache hit.
+fn shaped_text_key(text: &str, font: &Font, font_parameters: &FontParameters) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write_u8(0); // namespace tag vs. `shaped_spans_key`
+    text.hash(&mut hasher);
+    font.hash(&mut hasher);
+    hasher.write_u32(font_parameters.size.to_bits());
+    hasher.write_u32(font_parameters.tracking.to_bits());
+    hasher.finish()
+}
+
+/// Shape-cache key for a `draw_styled_text` span list. Same rules as
+/// [`shaped_text_key`], with one addition: span *color* is part of the key
+/// because it's baked into the shaped buffer via `Attrs::color` (unlike
+/// `draw_text`'s color, which is applied at glyph emission) — so animating
+/// a styled span's color re-shapes. Weight/width stay excluded here too.
+fn shaped_spans_key(spans: &[TextSpan]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write_u8(1); // namespace tag vs. `shaped_text_key`
+    hasher.write_usize(spans.len());
+    for span in spans {
+        span.text.hash(&mut hasher);
+        span.font.hash(&mut hasher);
+        hasher.write_u32(span.font_parameters.size.to_bits());
+        hasher.write_u32(span.font_parameters.tracking.to_bits());
+        span.color.hash_bits(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn build_buffer(font_system: &mut FontSystem, text: &str, attrs: &Attrs, size_px: f32) -> Buffer {
     let metrics = Metrics::new(size_px, size_px * LINE_HEIGHT_RATIO);
     let mut buffer = Buffer::new(font_system, metrics);
@@ -391,12 +544,26 @@ fn build_buffer(font_system: &mut FontSystem, text: &str, attrs: &Attrs, size_px
 }
 
 /// Total width (widest line) and height (bottom edge of the last line) of
-/// an already-shaped buffer.
-fn measure_shaped_buffer(buffer: &Buffer) -> (f32, f32) {
+/// an already-shaped buffer, *including* the per-glyph advance corrections
+/// the synthetic `weight`/`width` effects introduce at render time
+/// (`effect` returns a glyph's `(embolden, condense)` — see
+/// [`effect_advance_delta`]). Without these deltas, a line ending in bold
+/// glyphs would measure narrower than it renders (and a condensed line
+/// wider), breaking `Alignment::Center`/`Right` and `get_text_size`-sized
+/// boxes.
+fn measure_shaped_buffer_with(
+    buffer: &Buffer,
+    mut effect: impl FnMut(&LayoutGlyph) -> GlyphEffect,
+) -> (f32, f32) {
     let mut width: f32 = 0.0;
     let mut height: f32 = 0.0;
     for run in buffer.layout_runs() {
-        width = width.max(run.line_w);
+        let mut delta: f32 = 0.0;
+        for glyph in run.glyphs {
+            let effect = effect(glyph);
+            delta += effect_advance_delta(effect.embolden.max(0.0), effect.condense, glyph.w);
+        }
+        width = width.max(run.line_w + delta);
         height = height.max(run.line_top + run.line_height);
     }
     (width, height)

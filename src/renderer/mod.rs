@@ -17,7 +17,9 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use wgpu::{CurrentSurfaceTexture, QuerySet};
 use winit::{event::WindowEvent, window::Window};
@@ -103,6 +105,15 @@ pub struct Renderer {
     // GPU resources shared by every `Layer` (its pipelines, bind group
     // layouts, the composite quad) — built once here rather than per layer.
     layer_pipelines: layer::LayerPipelines,
+    // The one multisampled scratch texture every layer's render pass draws
+    // into (each resolving into its own single-sample texture). Shared
+    // because layer passes run sequentially and the target is transient
+    // (cleared per pass, discarded after resolve) — per-layer copies would
+    // cost a full-surface 4x texture each. Kept alive for `msaa_view`.
+    #[allow(dead_code)]
+    msaa_texture: wgpu::Texture,
+    msaa_view: wgpu::TextureView,
+    msaa_size: (u32, u32),
     // The glyphon/cosmic-text stack every `Layer`'s `draw_text` shares —
     // see `text_stack.rs`'s module doc for why it's one shared instance,
     // not one per layer.
@@ -111,26 +122,182 @@ pub struct Renderer {
     // `Weak`, not `Rc` — a layer stops being composited once the caller
     // drops their last `Layer` handle.
     layers: VecDeque<std::rc::Weak<RefCell<layer::LayerInner>>>,
-    // GPU timestamp queries around each frame's commands, so frame time is
-    // measured in GPU time rather than wall-clock CPU time (which would
-    // include time spent waiting on `Fifo` vsync and doesn't reflect actual
-    // GPU work). `timestamp_query_set` holds the two raw timestamps (frame
-    // start/end); `timestamp_resolve_buffer` is where the GPU writes them as
-    // plain `u64`s; `timestamp_readback_buffer` is a `MAP_READ` copy of that
-    // the CPU can actually read from.
-    timestamp_query_set: QuerySet,
-    timestamp_resolve_buffer: wgpu::Buffer,
-    timestamp_readback_buffer: wgpu::Buffer,
-    // Nanoseconds per timestamp tick — device/driver-specific, queried once.
-    timestamp_period_ns: f64,
-    // GPU duration of the most recently completed frame.
-    last_frametime: std::time::Duration,
-    // Wall-clock instant the renderer was created — `get_render_time` reports
-    // elapsed time against this. Summing per-frame GPU durations instead
-    // (as `last_frametime` does) would undercount badly: GPU work is only a
-    // sliver of each frame, the rest is spent idle waiting on `Fifo` vsync,
-    // so that sum stays far below true elapsed time.
-    start_time: std::time::Instant,
+    // GPU frame-duration measurement via timestamp queries — `None` on
+    // adapters without timestamp support, in which case
+    // `Renderer::get_gpu_frametime` reports `None` and everything else
+    // works normally. Deliberately *not* what `get_frametime` (the
+    // animation-facing API) is built on — that one is wall-clock and works
+    // everywhere.
+    timestamps: Option<TimestampState>,
+    // Wall-clock instant the previous `render()` finished — the anchor
+    // `frame_delta` is measured from. `None` until the first frame.
+    previous_frame_at: Option<Instant>,
+    // Wall-clock time between the two most recent frames — what
+    // `Renderer::get_frametime` returns. Includes vsync pacing, which is
+    // exactly what animation stepping needs (GPU-busy time would step
+    // animations far too slowly).
+    frame_delta: Duration,
+    // Wall-clock instant the renderer was created — `get_render_time`
+    // reports elapsed time against this.
+    start_time: Instant,
+}
+
+/// How many timestamp readback buffers are kept in flight. Each is tiny
+/// (16 bytes); three is enough that a slot is essentially always free
+/// under `desired_maximum_frame_latency: 2`.
+const TIMESTAMP_RING_SLOTS: usize = 3;
+
+/// 2 timestamps * 8 bytes (`QUERY_SIZE`) each.
+const TIMESTAMP_BUFFER_SIZE: wgpu::BufferAddress = 16;
+
+// `ReadbackSlot::status` values: the `map_async` callback (which may run on
+// another thread) reports completion through an atomic rather than any
+// blocking wait.
+const SLOT_STATUS_PENDING: u8 = 0;
+const SLOT_STATUS_MAPPED: u8 = 1;
+const SLOT_STATUS_FAILED: u8 = 2;
+
+/// One buffer of the timestamp readback ring plus its bookkeeping.
+struct ReadbackSlot {
+    buffer: wgpu::Buffer,
+    /// Written by the `map_async` callback, read by
+    /// [`TimestampState::collect`].
+    status: Arc<AtomicU8>,
+    /// A copy into this slot has been recorded and its map requested, but
+    /// the result hasn't been consumed yet.
+    in_flight: bool,
+    /// Which frame's measurement this slot carries — newer wins when
+    /// several complete in the same poll.
+    serial: u64,
+}
+
+/// GPU frame-duration measurement: two timestamps written around each
+/// frame's commands, resolved and copied into a small ring of `MAP_READ`
+/// buffers that are read back *without ever blocking on the GPU* — the
+/// naive map-then-`poll(Wait)` approach fully serializes CPU and GPU (the
+/// CPU can't start frame N+1 until frame N finishes executing), silently
+/// destroying the pipelining `desired_maximum_frame_latency` exists to
+/// provide. Instead each frame requests an async map and a later frame
+/// harvests whichever slots have completed (1–3 frames latent — fine for a
+/// profiling metric).
+struct TimestampState {
+    query_set: QuerySet,
+    /// Where `resolve_query_set` writes the raw `u64` ticks (reused every
+    /// frame; GPU-side ordering makes that safe).
+    resolve_buffer: wgpu::Buffer,
+    slots: [ReadbackSlot; TIMESTAMP_RING_SLOTS],
+    /// Nanoseconds per timestamp tick — device/driver-specific.
+    period_ns: f64,
+    next_serial: u64,
+    /// Highest serial consumed so far — guards against an older in-flight
+    /// result overwriting a newer one.
+    consumed_serial: u64,
+    /// GPU duration of the most recently measured frame, if any sample has
+    /// completed yet.
+    last_gpu_frametime: Option<Duration>,
+}
+
+impl TimestampState {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("atomos-timestamp-query"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("atomos-timestamp-resolve-buffer"),
+            size: TIMESTAMP_BUFFER_SIZE,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let slots = std::array::from_fn(|_| ReadbackSlot {
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("atomos-timestamp-readback-buffer"),
+                size: TIMESTAMP_BUFFER_SIZE,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            status: Arc::new(AtomicU8::new(SLOT_STATUS_PENDING)),
+            in_flight: false,
+            serial: 0,
+        });
+        Self {
+            query_set,
+            resolve_buffer,
+            slots,
+            period_ns: queue.get_timestamp_period() as f64,
+            next_serial: 1,
+            consumed_serial: 0,
+            last_gpu_frametime: None,
+        }
+    }
+
+    /// Record the end-of-frame timestamp, resolve both, and copy them into
+    /// a free ring slot. Returns the slot to map after submit — `None` when
+    /// every slot is still in flight (the GPU is badly behind; this frame
+    /// simply goes unmeasured rather than blocking).
+    fn record_frame_end(&mut self, encoder: &mut wgpu::CommandEncoder) -> Option<usize> {
+        encoder.write_timestamp(&self.query_set, 1);
+        encoder.resolve_query_set(&self.query_set, 0..2, &self.resolve_buffer, 0);
+        let index = self.slots.iter().position(|slot| !slot.in_flight)?;
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buffer,
+            0,
+            &self.slots[index].buffer,
+            0,
+            TIMESTAMP_BUFFER_SIZE,
+        );
+        Some(index)
+    }
+
+    /// Request the async map of a slot [`TimestampState::record_frame_end`]
+    /// picked. Called after `queue.submit` so the copy is already queued.
+    fn begin_map(&mut self, index: usize) {
+        let slot = &mut self.slots[index];
+        slot.in_flight = true;
+        slot.serial = self.next_serial;
+        self.next_serial += 1;
+        slot.status.store(SLOT_STATUS_PENDING, Ordering::Release);
+        let status = slot.status.clone();
+        slot.buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            let outcome = if result.is_ok() { SLOT_STATUS_MAPPED } else { SLOT_STATUS_FAILED };
+            status.store(outcome, Ordering::Release);
+        });
+    }
+
+    /// Drive map callbacks with a *non-blocking* poll and consume every
+    /// slot that has completed since last frame, keeping the newest
+    /// measurement.
+    fn collect(&mut self, device: &wgpu::Device) {
+        let _ = device.poll(wgpu::PollType::Poll);
+        for slot in &mut self.slots {
+            if !slot.in_flight {
+                continue;
+            }
+            match slot.status.load(Ordering::Acquire) {
+                SLOT_STATUS_MAPPED => {
+                    let ticks: [u64; 2] = {
+                        let data = slot.buffer.slice(..).get_mapped_range();
+                        let ticks: &[u64] = bytemuck::cast_slice(&data);
+                        [ticks[0], ticks[1]]
+                    };
+                    slot.buffer.unmap();
+                    slot.in_flight = false;
+                    if slot.serial > self.consumed_serial {
+                        self.consumed_serial = slot.serial;
+                        let elapsed_ns =
+                            ticks[1].saturating_sub(ticks[0]) as f64 * self.period_ns;
+                        self.last_gpu_frametime =
+                            Some(Duration::from_nanos(elapsed_ns as u64));
+                    }
+                }
+                // Map failed (e.g. device loss) — the buffer never mapped,
+                // so there's nothing to unmap; just free the slot.
+                SLOT_STATUS_FAILED => slot.in_flight = false,
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Pixel-space vertex format shared by every [`Layer`]'s internal solid
@@ -182,15 +349,26 @@ impl Renderer {
             .await
             .expect("no compatible wgpu adapter found");
 
+        // `TIMESTAMP_QUERY_INSIDE_ENCODERS` is needed on top of plain
+        // `TIMESTAMP_QUERY` because `render`'s two `write_timestamp` calls
+        // happen directly on the `CommandEncoder`, not inside a
+        // render/compute pass. Both are *optional*: on adapters without
+        // them, the renderer still works fully — only `get_gpu_frametime`
+        // degrades to `None` (the animation-facing `get_frametime` is
+        // wall-clock and needs no GPU features). Requesting an unsupported
+        // feature would fail device creation outright, hence the check.
+        let timestamp_features = wgpu::Features::TIMESTAMP_QUERY
+            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let timestamps_supported = adapter.features().contains(timestamp_features);
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("atomos-device"),
-                // `TIMESTAMP_QUERY_INSIDE_ENCODERS` is needed on top of plain
-                // `TIMESTAMP_QUERY` because `render`'s two `write_timestamp`
-                // calls happen directly on the `CommandEncoder`, not inside a
-                // render/compute pass.
-                required_features: wgpu::Features::TIMESTAMP_QUERY
-                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+                required_features: if timestamps_supported {
+                    timestamp_features
+                } else {
+                    wgpu::Features::empty()
+                },
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::default(),
                 memory_hints: wgpu::MemoryHints::default(),
@@ -227,6 +405,9 @@ impl Renderer {
         surface.configure(&device, &surface_config);
 
         let layer_pipelines = layer::LayerPipelines::new(&device, surface_config.format);
+        let msaa_size = (surface_config.width, surface_config.height);
+        let (msaa_texture, msaa_view) =
+            layer::create_msaa_texture(&device, surface_config.format, msaa_size);
         let text_stack = Rc::new(RefCell::new(text_stack::TextStack::new(
             &device,
             &queue,
@@ -235,29 +416,7 @@ impl Renderer {
         )));
         let layers = VecDeque::new();
 
-        // Query set for timestamping frame times. This is used instead of `Instant::now` because
-        // CPU time is not accurate enough for GPU asynchronous operations. We only need two timestamps, one
-        // for the beginning and another for the end.
-        let timestamp_query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("atomos-timestamp-query"),
-            ty: wgpu::QueryType::Timestamp,
-            count: 2
-        });
-        // 2 timestamps * 8 bytes (`QUERY_SIZE`) each.
-        const TIMESTAMP_BUFFER_SIZE: wgpu::BufferAddress = 16;
-        let timestamp_resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("atomos-timestamp-resolve-buffer"),
-            size: TIMESTAMP_BUFFER_SIZE,
-            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let timestamp_readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("atomos-timestamp-readback-buffer"),
-            size: TIMESTAMP_BUFFER_SIZE,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let timestamp_period_ns = queue.get_timestamp_period() as f64;
+        let timestamps = timestamps_supported.then(|| TimestampState::new(&device, &queue));
 
         Self {
             window,
@@ -266,14 +425,15 @@ impl Renderer {
             surface,
             surface_config,
             layer_pipelines,
+            msaa_texture,
+            msaa_view,
+            msaa_size,
             text_stack,
             layers,
-            timestamp_query_set,
-            timestamp_resolve_buffer,
-            timestamp_readback_buffer,
-            timestamp_period_ns,
-            last_frametime: std::time::Duration::ZERO,
-            start_time: std::time::Instant::now(),
+            timestamps,
+            previous_frame_at: None,
+            frame_delta: Duration::ZERO,
+            start_time: Instant::now(),
         }
     }
 
@@ -368,7 +528,9 @@ impl Renderer {
                 label: Some("atomos-frame-encoder"),
             });
 
-        encoder.write_timestamp(&self.timestamp_query_set, 0);
+        if let Some(timestamps) = &self.timestamps {
+            encoder.write_timestamp(&timestamps.query_set, 0);
+        }
 
         {
             // Nothing draws directly into the swap chain any more — every
@@ -397,69 +559,82 @@ impl Renderer {
             });
         }
 
+        // Once per frame (not per layer — every layer shares this stack):
+        // tick the shaped-text cache clock and evict stale entries.
+        self.text_stack.borrow_mut().advance_frame();
+
+        // Layers resize lazily against the current surface size (see
+        // `layer::render_layers`), so the shared MSAA scratch target does
+        // the same here rather than in `resize()`.
+        let surface_size = (self.surface_config.width, self.surface_config.height);
+        if self.msaa_size != surface_size {
+            let (msaa_texture, msaa_view) =
+                layer::create_msaa_texture(&self.device, self.surface_config.format, surface_size);
+            self.msaa_texture = msaa_texture;
+            self.msaa_view = msaa_view;
+            self.msaa_size = surface_size;
+        }
+
         layer::render_layers(
             &mut encoder,
             &view,
+            &self.msaa_view,
             &mut self.layers,
-            (self.surface_config.width, self.surface_config.height),
+            surface_size,
         );
 
-        encoder.write_timestamp(&self.timestamp_query_set, 1);
-        encoder.resolve_query_set(&self.timestamp_query_set, 0..2, &self.timestamp_resolve_buffer, 0);
-        encoder.copy_buffer_to_buffer(
-            &self.timestamp_resolve_buffer,
-            0,
-            &self.timestamp_readback_buffer,
-            0,
-            self.timestamp_readback_buffer.size(),
-        );
+        let map_slot = self
+            .timestamps
+            .as_mut()
+            .and_then(|timestamps| timestamps.record_frame_end(&mut encoder));
 
         self.queue.submit(std::iter::once(encoder.finish()));
         // In wgpu 29, `present` is a method on `SurfaceTexture`; in wgpu 30
         // it moved to `Queue`.
         frame.present();
 
-        self.read_back_frametime();
+        if let Some(timestamps) = &mut self.timestamps {
+            if let Some(index) = map_slot {
+                timestamps.begin_map(index);
+            }
+            timestamps.collect(&self.device);
+        }
+
+        // Wall-clock frame delta, the anchor for `get_frametime`. Measured
+        // at the same point every frame so the delta is stable under vsync.
+        let now = Instant::now();
+        if let Some(previous) = self.previous_frame_at {
+            self.frame_delta = now.duration_since(previous);
+        }
+        self.previous_frame_at = Some(now);
 
         Ok(())
     }
 
-    /// Block until this frame's GPU commands finish, then read the two
-    /// timestamps written around them and fold the result into
-    /// `last_frametime`.
+    /// Wall-clock time between the two most recent frames — the value to
+    /// step animations by. Always available on every machine (no GPU
+    /// features involved) and includes vsync pacing, so an animation
+    /// advanced by this per frame moves in real time. Returns
+    /// [`Duration::ZERO`] until two frames have been rendered.
     ///
-    /// This does wait on the GPU (via `device.poll`), which the rest of
-    /// `render` otherwise avoids — acceptable for now since `Fifo` present
-    /// mode already blocks the CPU on vsync every frame anyway; revisit if
-    /// that stops being true (e.g. an `Immediate`/uncapped mode is added).
-    fn read_back_frametime(&mut self) {
-        let slice = self.timestamp_readback_buffer.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("polling the device for the timestamp readback failed");
-
-        let ticks: [u64; 2] = {
-            let data = slice.get_mapped_range();
-            let ticks: &[u64] = bytemuck::cast_slice(&data);
-            [ticks[0], ticks[1]]
-        };
-        self.timestamp_readback_buffer.unmap();
-
-        let elapsed_ticks = ticks[1].saturating_sub(ticks[0]);
-        let elapsed_ns = elapsed_ticks as f64 * self.timestamp_period_ns;
-        self.last_frametime = std::time::Duration::from_nanos(elapsed_ns as u64);
+    /// Not a measure of how hard the GPU is working — see
+    /// [`Renderer::get_gpu_frametime`] for that.
+    pub fn get_frametime(&self) -> Duration {
+        self.frame_delta
     }
 
-    /// GPU duration of the most recently completed frame (the time spent
-    /// executing this renderer's own commands, not wall-clock frame pacing —
-    /// see `read_back_frametime`).
-    pub fn get_frametime(&self) -> std::time::Duration {
-        self.last_frametime
+    /// GPU execution time of this renderer's own commands for the most
+    /// recently *measured* frame — a profiling metric, measured with GPU
+    /// timestamp queries and read back asynchronously, so the value is 1–3
+    /// frames old. `None` when the adapter doesn't support timestamp
+    /// queries, or before the first measurement completes. Use
+    /// [`Renderer::get_frametime`] for animation stepping, not this.
+    pub fn get_gpu_frametime(&self) -> Option<Duration> {
+        self.timestamps.as_ref().and_then(|timestamps| timestamps.last_gpu_frametime)
     }
 
     /// Wall-clock time elapsed since this `Renderer` was created.
-    pub fn get_render_time(&self) -> std::time::Duration {
+    pub fn get_render_time(&self) -> Duration {
         self.start_time.elapsed()
     }
 

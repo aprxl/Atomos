@@ -515,12 +515,12 @@ pub(super) struct LayerInner {
     #[allow(dead_code)]
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
-    // The solid/image pipelines actually render into this (multisampled),
-    // resolving into `texture_view` — never sampled, so `msaa_texture` is
-    // only kept alive for `msaa_view`'s sake.
-    #[allow(dead_code)]
-    msaa_texture: wgpu::Texture,
-    msaa_view: wgpu::TextureView,
+    // No per-layer MSAA target: layers render into the renderer's one
+    // shared multisampled scratch texture (resolving into their own
+    // `texture_view`), passed into `render_to_texture` each frame. Safe to
+    // share because layer passes are recorded strictly sequentially and
+    // the target is cleared at pass start / discarded at pass end — and it
+    // saves a full-surface 4x texture (~59 MB at 1440p) per layer.
     screen_size_buffer: wgpu::Buffer,
     screen_size_bind_group: wgpu::BindGroup,
     composite_bind_group: wgpu::BindGroup,
@@ -536,6 +536,29 @@ pub(super) struct LayerInner {
     // `TextRenderer` below is not — see `text_stack.rs`'s module doc.
     text_stack: Rc<RefCell<TextStack>>,
     text_renderer: glyphon::TextRenderer,
+    // Whether the most recent `prepare_layer` call had any text commands.
+    // Lets `rebuild_if_needed` skip the per-frame prepare entirely for
+    // text-free layers (a cursor layer, a selection layer): when this
+    // frame has no text AND the last prepared batch was already empty,
+    // `text_renderer` is guaranteed empty, so there is nothing to refresh
+    // — and `TextStack::render` on an empty renderer is already a no-op.
+    had_text: bool,
+    // Hash of this layer's text `DrawCommand`s as of the last successful
+    // `prepare_layer` call (`None` when `had_text` is false). Lets
+    // `rebuild_if_needed` skip re-preparing when text content is
+    // byte-for-byte unchanged from last time — the expensive part of text
+    // handling (walking every glyph into `CustomGlyph`s, both here and
+    // inside glyphon's own `prepare_with_custom`) happens regardless of
+    // the shape cache, so this is what actually avoids redoing it for
+    // static text.
+    last_text_hash: Option<u64>,
+    // `TextStack::atlas_generation` as of the last successful
+    // `prepare_layer` call. A mismatch means the shared atlas may have
+    // been trimmed (and evicted glyphs this layer depends on) since then,
+    // so a re-prepare is needed even if `last_text_hash` still matches —
+    // see `TextStack::advance_frame`'s doc for why trimming makes this
+    // necessary.
+    text_prepared_generation: Option<u64>,
 
     pending: Vec<DrawCommand>,
     invalidation: InvalidationState,
@@ -563,7 +586,6 @@ impl LayerInner {
         invalidation: LayerInvalidation,
     ) -> Self {
         let (texture, texture_view) = create_layer_texture(device, format, size);
-        let (msaa_texture, msaa_view) = create_layer_msaa_texture(device, format, size);
         let screen_size_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("atomos-layer-screen-size-ubo"),
             contents: bytemuck::bytes_of(&ScreenSize {
@@ -609,8 +631,6 @@ impl LayerInner {
             size,
             texture,
             texture_view,
-            msaa_texture,
-            msaa_view,
             screen_size_buffer,
             screen_size_bind_group,
             composite_bind_group,
@@ -620,6 +640,9 @@ impl LayerInner {
             image_draws: Vec::new(),
             text_stack,
             text_renderer,
+            had_text: false,
+            last_text_hash: None,
+            text_prepared_generation: None,
             pending: Vec::new(),
             invalidation: invalidation_state,
         }
@@ -656,7 +679,6 @@ impl LayerInner {
         }
         self.size = size;
         let (texture, texture_view) = create_layer_texture(&self.device, self.format, size);
-        let (msaa_texture, msaa_view) = create_layer_msaa_texture(&self.device, self.format, size);
         self.queue.write_buffer(
             &self.screen_size_buffer,
             0,
@@ -672,8 +694,6 @@ impl LayerInner {
         );
         self.texture = texture;
         self.texture_view = texture_view;
-        self.msaa_texture = msaa_texture;
-        self.msaa_view = msaa_view;
         // Shared across every layer, so this runs redundantly once per
         // layer on an actual resize — harmless, it's just a small
         // `Resolution` update.
@@ -704,18 +724,50 @@ impl LayerInner {
             self.build_buffers();
         }
 
-        // Text always re-shapes/re-prepares regardless of `should_rebuild`
-        // — see `text_stack.rs`'s module doc for why — and must happen
-        // before `pending` is cleared below (an `Automatic` layer's text
-        // commands wouldn't survive to `render_to_texture` otherwise).
-        if let Err(e) = self.text_stack.borrow_mut().prepare_layer(
-            &self.device,
-            &self.queue,
-            &self.pending,
-            &mut self.text_renderer,
-        ) {
-            eprintln!("Atomos: text glyph atlas full, some text may not render this frame: {e:?}");
+        // Text re-prepares whenever its content changed, or unconditionally
+        // once per atlas trim cycle — never simply "every frame" (see
+        // `TextStack::advance_frame`'s doc and `LayerInner::last_text_hash`/
+        // `text_prepared_generation`'s field docs for why both checks are
+        // needed for correctness, not just the hash). Must happen before
+        // `pending` is cleared below (an `Automatic` layer's text commands
+        // wouldn't survive to `render_to_texture` otherwise).
+        let mut text_hasher = DefaultHasher::new();
+        let mut has_text = false;
+        for command in &self.pending {
+            if matches!(command, DrawCommand::Text { .. } | DrawCommand::StyledText { .. }) {
+                has_text = true;
+                command.hash(&mut text_hasher);
+            }
         }
+        let text_hash = has_text.then(|| text_hasher.finish());
+
+        let atlas_generation = self.text_stack.borrow().atlas_generation();
+        let needs_prepare = if has_text {
+            text_hash != self.last_text_hash
+                || self.text_prepared_generation != Some(atlas_generation)
+        } else {
+            // No text this frame — the only reason to prepare is to clear
+            // out a previous frame's glyphs (see the `had_text` field doc);
+            // an atlas trim can't have invalidated anything since an empty
+            // `text_renderer` has no glyphs for it to have evicted.
+            self.had_text
+        };
+
+        if needs_prepare {
+            if let Err(e) = self.text_stack.borrow_mut().prepare_layer(
+                &self.device,
+                &self.queue,
+                &self.pending,
+                &mut self.text_renderer,
+            ) {
+                eprintln!(
+                    "Atomos: text glyph atlas full, some text may not render this frame: {e:?}"
+                );
+            }
+            self.last_text_hash = text_hash;
+            self.text_prepared_generation = Some(atlas_generation);
+        }
+        self.had_text = has_text;
 
         // `Automatic` layers expect a full re-description of their content
         // every frame; `Manual` layers persist theirs until `clear()`.
@@ -728,7 +780,16 @@ impl LayerInner {
 
     fn build_buffers(&mut self) {
         let mut vertices: Vec<Vertex> = Vec::new();
-        let mut indices: Vec<u16> = Vec::new();
+        // u32 indices, not u16 — a busy layer (an editor viewport's worth of
+        // selection highlights, cursors, rounded rects at dozens of vertices
+        // each) can exceed 65,535 vertices, and a u16 `base` would then wrap
+        // *silently* into corrupted geometry. The doubled index memory is
+        // noise next to the vertex data itself.
+        let mut indices: Vec<u32> = Vec::new();
+        // One tessellator for the whole rebuild — lyon reuses its internal
+        // allocations across `tessellate_path` calls, which a
+        // fresh-per-command tessellator would throw away.
+        let mut tessellator = FillTessellator::new();
         self.image_draws.clear();
         for command in &self.pending {
             // `Image` needs its own texture/bind group, not a shared
@@ -746,13 +807,18 @@ impl LayerInner {
                 ));
                 continue;
             }
-            let (mut cmd_vertices, cmd_indices) = tessellate_command(command);
-            let base = vertices.len() as u16;
+            let (mut cmd_vertices, cmd_indices) = tessellate_command(command, &mut tessellator);
+            let base = vertices.len() as u32;
             vertices.append(&mut cmd_vertices);
             indices.extend(cmd_indices.into_iter().map(|i| i + base));
         }
 
         self.num_indices = indices.len() as u32;
+        // Fresh GPU buffers on every rebuild rather than `write_buffer`
+        // into persisted, grow-only ones. Known deferred cost — revisit if
+        // profiling ever shows rebuild-heavy workloads (per-keystroke
+        // invalidation) spending real time here; wgpu buffer creation at
+        // these sizes hasn't been the bottleneck so far.
         self.vertex_buffer = if vertices.is_empty() {
             None
         } else {
@@ -784,15 +850,17 @@ impl LayerInner {
     /// swap-chain pass — cheap to skip entirely for layers with no
     /// geometry (an empty `pending` still needs its texture cleared to
     /// transparent so it doesn't keep showing stale content).
-    fn render_to_texture(&self, encoder: &mut wgpu::CommandEncoder) {
+    fn render_to_texture(&self, encoder: &mut wgpu::CommandEncoder, msaa_view: &wgpu::TextureView) {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("atomos-layer-pass"),
-            // Render into the multisampled target; the GPU resolves it into
-            // `texture_view` automatically. The multisampled contents
-            // themselves are never read again (cleared fresh every
-            // rebuild), so `Discard` rather than `Store`.
+            // Render into the renderer's shared multisampled scratch
+            // target; the GPU resolves it into this layer's own
+            // `texture_view` automatically. The multisampled contents are
+            // never read again (cleared fresh at every pass start), so
+            // `Discard` rather than `Store` — which is also what makes
+            // sharing one scratch texture across layers safe.
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.msaa_view,
+                view: msaa_view,
                 depth_slice: None,
                 resolve_target: Some(&self.texture_view),
                 ops: wgpu::Operations {
@@ -810,7 +878,7 @@ impl LayerInner {
             rpass.set_pipeline(&self.solid_pipeline);
             rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
             rpass.set_vertex_buffer(0, vbuf.slice(..));
-            rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint16);
+            rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
             rpass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
@@ -866,12 +934,12 @@ fn create_layer_texture(
     (texture, view)
 }
 
-/// Build the offscreen multisampled colour texture the solid/image
-/// pipelines actually render into — resolved into the layer's real
-/// (single-sample) texture at the end of the pass. Never sampled — only
-/// `RENDER_ATTACHMENT` usage — mirroring the main swap-chain's old MSAA
-/// target.
-fn create_layer_msaa_texture(
+/// Build the offscreen multisampled colour texture every layer's
+/// solid/image/text pipelines render into — resolved into that layer's own
+/// (single-sample) texture at the end of its pass. One shared instance for
+/// all layers, owned by the renderer (see `LayerInner`'s field comment on
+/// why sharing is safe). Never sampled — only `RENDER_ATTACHMENT` usage.
+pub(super) fn create_msaa_texture(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     (width, height): (u32, u32),
@@ -1010,17 +1078,24 @@ impl FillVertexConstructor<Vertex> for ColorAtPosition<'_> {
     }
 }
 
-fn tessellate_command(command: &DrawCommand) -> (Vec<Vertex>, Vec<u16>) {
+fn tessellate_command(
+    command: &DrawCommand,
+    tessellator: &mut FillTessellator,
+) -> (Vec<Vertex>, Vec<u32>) {
     match command {
         DrawCommand::Rectangle {
             top_left,
             size,
             color,
             rounding,
-        } => tessellate_rectangle(*top_left, *size, color, rounding),
-        DrawCommand::Polygon { vertices, color } => tessellate_polygon(vertices, color),
-        DrawCommand::Circle { center, radius, color } => tessellate_circle(*center, *radius, color),
-        DrawCommand::Path { d, position, color } => tessellate_svg_path(d, *position, color),
+        } => tessellate_rectangle(*top_left, *size, color, rounding, tessellator),
+        DrawCommand::Polygon { vertices, color } => tessellate_polygon(vertices, color, tessellator),
+        DrawCommand::Circle { center, radius, color } => {
+            tessellate_circle(*center, *radius, color, tessellator)
+        }
+        DrawCommand::Path { d, position, color } => {
+            tessellate_svg_path(d, *position, color, tessellator)
+        }
         // Handled directly in `LayerInner::build_buffers`, which needs its
         // own texture per image rather than a shared vertex/index buffer
         // — filtered out before ever reaching here.
@@ -1094,11 +1169,16 @@ fn path_bounding_box(path: &Path) -> ([f32; 2], [f32; 2]) {
 /// bounding box, then translates every vertex by `position` — `position` is
 /// a plain offset, not a scale, so the path's authored units become pixels
 /// directly.
-fn tessellate_svg_path(d: &str, position: [f32; 2], color: &Color) -> (Vec<Vertex>, Vec<u16>) {
+fn tessellate_svg_path(
+    d: &str,
+    position: [f32; 2],
+    color: &Color,
+    tessellator: &mut FillTessellator,
+) -> (Vec<Vertex>, Vec<u32>) {
     let path = parse_svg_path(d)
         .expect("Layer::draw_path already validated this string's syntax when it was queued");
     let (min, max) = path_bounding_box(&path);
-    let (mut vertices, indices) = tessellate_filled(&path, color, min, max);
+    let (mut vertices, indices) = tessellate_filled(&path, color, min, max, tessellator);
     for vertex in &mut vertices {
         vertex.position[0] += position[0];
         vertex.position[1] += position[1];
@@ -1110,9 +1190,14 @@ fn tessellate_svg_path(d: &str, position: [f32; 2], color: &Color) -> (Vec<Verte
 /// via [`Color::resolve`] against the shape's own bounding box (`min`,
 /// `max`) — shared by every `DrawCommand`'s tessellation, only the path
 /// construction differs.
-fn tessellate_filled(path: &Path, color: &Color, min: [f32; 2], max: [f32; 2]) -> (Vec<Vertex>, Vec<u16>) {
-    let mut tessellator = FillTessellator::new();
-    let mut buffers: VertexBuffers<Vertex, u16> = VertexBuffers::new();
+fn tessellate_filled(
+    path: &Path,
+    color: &Color,
+    min: [f32; 2],
+    max: [f32; 2],
+    tessellator: &mut FillTessellator,
+) -> (Vec<Vertex>, Vec<u32>) {
+    let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
     let ctor = ColorAtPosition { color, min, max };
     let mut buf_builder = BuffersBuilder::new(&mut buffers, ctor);
     // Tolerance is in pixels here (unlike the old NDC-scale tessellation
@@ -1130,7 +1215,8 @@ fn tessellate_rectangle(
     size: [f32; 2],
     color: &Color,
     rounding: &Rounding,
-) -> (Vec<Vertex>, Vec<u16>) {
+    tessellator: &mut FillTessellator,
+) -> (Vec<Vertex>, Vec<u32>) {
     let min = path::geom::point(top_left[0], top_left[1]);
     let max = path::geom::point(top_left[0] + size[0], top_left[1] + size[1]);
 
@@ -1156,6 +1242,7 @@ fn tessellate_rectangle(
         color,
         top_left,
         [top_left[0] + size[0], top_left[1] + size[1]],
+        tessellator,
     )
 }
 
@@ -1178,7 +1265,11 @@ fn bounding_box(vertices: &[[f32; 2]]) -> ([f32; 2], [f32; 2]) {
     (min, max)
 }
 
-fn tessellate_polygon(vertices: &[[f32; 2]], color: &Color) -> (Vec<Vertex>, Vec<u16>) {
+fn tessellate_polygon(
+    vertices: &[[f32; 2]],
+    color: &Color,
+    tessellator: &mut FillTessellator,
+) -> (Vec<Vertex>, Vec<u32>) {
     let mut builder = Path::builder();
     let mut points = vertices.iter();
     if let Some(first) = points.next() {
@@ -1190,10 +1281,15 @@ fn tessellate_polygon(vertices: &[[f32; 2]], color: &Color) -> (Vec<Vertex>, Vec
     }
 
     let (min, max) = bounding_box(vertices);
-    tessellate_filled(&builder.build(), color, min, max)
+    tessellate_filled(&builder.build(), color, min, max, tessellator)
 }
 
-fn tessellate_circle(center: [f32; 2], radius: f32, color: &Color) -> (Vec<Vertex>, Vec<u16>) {
+fn tessellate_circle(
+    center: [f32; 2],
+    radius: f32,
+    color: &Color,
+    tessellator: &mut FillTessellator,
+) -> (Vec<Vertex>, Vec<u32>) {
     let mut builder = Path::builder();
     builder.add_circle(
         path::geom::point(center[0], center[1]),
@@ -1203,7 +1299,7 @@ fn tessellate_circle(center: [f32; 2], radius: f32, color: &Color) -> (Vec<Verte
 
     let min = [center[0] - radius, center[1] - radius];
     let max = [center[0] + radius, center[1] + radius];
-    tessellate_filled(&builder.build(), color, min, max)
+    tessellate_filled(&builder.build(), color, min, max, tessellator)
 }
 
 /// A retained drawing surface with its own offscreen texture and pending
@@ -1483,6 +1579,7 @@ impl Layer {
 pub(super) fn render_layers(
     encoder: &mut wgpu::CommandEncoder,
     view: &wgpu::TextureView,
+    msaa_view: &wgpu::TextureView,
     order: &mut std::collections::VecDeque<std::rc::Weak<RefCell<LayerInner>>>,
     surface_size: (u32, u32),
 ) {
@@ -1493,7 +1590,7 @@ pub(super) fn render_layers(
         let mut inner = inner.borrow_mut();
         inner.resize_if_needed(surface_size);
         inner.rebuild_if_needed();
-        inner.render_to_texture(encoder);
+        inner.render_to_texture(encoder, msaa_view);
     }
 
     if live.is_empty() {

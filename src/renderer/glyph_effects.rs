@@ -20,6 +20,38 @@ use glyphon::{
 use swash::scale::{image::Image, Render, ScaleContext, Source};
 use swash::zeno::{Format, Transform};
 
+/// The synthetic per-glyph effect parameters carried by
+/// [`super::FontParameters`], in the form the placement/measurement code
+/// consumes: one value per *span* (or per whole buffer, for `draw_text`),
+/// applied to each of that span's glyphs.
+#[derive(Clone, Copy, Debug)]
+pub struct GlyphEffect {
+    /// Faux-bold outline dilation in pixels; `0.0` = none.
+    pub embolden: f32,
+    /// Faux condense/expand ratio; `1.0` = none.
+    pub condense: f32,
+    /// Tracking in EM units, mirroring `FontParameters::tracking` (and
+    /// cosmic-text's `letter_spacing`, which is where it's actually
+    /// applied). Carried here because glyph *placement* needs to know it —
+    /// see the tracking-recentering note in
+    /// [`EffectGlyphs::layout_to_custom_glyphs_with`].
+    pub tracking: f32,
+}
+
+impl GlyphEffect {
+    pub const NEUTRAL: Self = Self { embolden: 0.0, condense: 1.0, tracking: 0.0 };
+}
+
+impl From<&super::FontParameters> for GlyphEffect {
+    fn from(parameters: &super::FontParameters) -> Self {
+        Self {
+            embolden: parameters.weight,
+            condense: parameters.width,
+            tracking: parameters.tracking,
+        }
+    }
+}
+
 /// Identifies one distinct (font, glyph, size, weight, condense)
 /// combination. Floats are stored as bits so the key can derive `Eq`/`Hash`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -76,7 +108,7 @@ impl EffectGlyphs {
         font_system: &mut FontSystem,
         buffer: &Buffer,
         position: (f32, f32),
-        effect: (f32, f32), // (embolden, condense)
+        effect: GlyphEffect,
         color: [u8; 4],
     ) -> Vec<CustomGlyph> {
         let uniform_color = Color::rgba(color[0], color[1], color[2], color[3]);
@@ -98,10 +130,10 @@ impl EffectGlyphs {
         font_system: &mut FontSystem,
         buffer: &Buffer,
         position: (f32, f32),
-        span_effects: &[(f32, f32)],
+        span_effects: &[GlyphEffect],
     ) -> Vec<CustomGlyph> {
         self.layout_to_custom_glyphs_with(font_system, buffer, position, |glyph| {
-            let effect = span_effects.get(glyph.metadata).copied().unwrap_or((0.0, 1.0));
+            let effect = span_effects.get(glyph.metadata).copied().unwrap_or(GlyphEffect::NEUTRAL);
             let color = glyph.color_opt.unwrap_or(Color::rgba(0xFF, 0xFF, 0xFF, 0xFF));
             (effect, color)
         })
@@ -117,15 +149,57 @@ impl EffectGlyphs {
         font_system: &mut FontSystem,
         buffer: &Buffer,
         position: (f32, f32),
-        mut effect_and_color: impl FnMut(&LayoutGlyph) -> ((f32, f32), Color),
+        mut effect_and_color: impl FnMut(&LayoutGlyph) -> (GlyphEffect, Color),
     ) -> Vec<CustomGlyph> {
         let (left, top) = position;
         let mut glyphs = Vec::new();
         for run in buffer.layout_runs() {
+            // `weight`/`width` are rasterization-time effects cosmic-text's
+            // shaper never sees, so it reserves each glyph only its
+            // *unmodified* advance. The pen corrections here mirror what
+            // FreeType documents for its own faux bold
+            // (`FT_Outline_Embolden`): dilation pushes ink outward by
+            // `embolden` px on *every* side, so each emboldened glyph is
+            // offset right by `embolden` (re-centering the ink in its
+            // slot) and its advance grows by `2 * embolden`; faux-condense
+            // scales ink toward the glyph origin by `condense`, so its
+            // advance scales by `condense` too (a compensating-only-one-
+            // side `+embolden` was tried first: bold still clipped its
+            // left neighbor, and condensed spans still gapped).
+            // `pen_delta` accumulates corrected-minus-natural advances —
+            // pure per-glyph arithmetic from the shaped `glyph.w`, never
+            // inference from rasterized bitmap edges (also tried: normal
+            // antialiased glyphs routinely overhang their advance, which
+            // compounded into runaway gaps on plain text). Measurement
+            // applies these same deltas — see
+            // `text_stack::measure_shaped_buffer_with`. Reset per run,
+            // since each run is an independent visual line.
+            let mut pen_delta: f32 = 0.0;
             for glyph in run.glyphs {
                 let (effect, color) = effect_and_color(glyph);
-                let (embolden, condense) = effect;
+                let embolden = effect.embolden.max(0.0);
+                let condense = effect.condense;
                 let physical = glyph.physical((left, top + run.line_y), 1.0);
+                // cosmic-text applies letter-spacing CSS-style: the whole
+                // track is appended *after* each glyph's advance (see its
+                // shape.rs), which makes a tracked span cram flush against
+                // whatever precedes it while leaving a full orphan track
+                // dangling after its last glyph. Shifting every tracked
+                // glyph right by half a track recenters it: interior gaps
+                // are untouched (all glyphs shift equally), and each span
+                // boundary ends up with half a track instead of
+                // zero-then-full — how professional layout engines treat
+                // tracking (space *between* letters, not after them).
+                // Scaled by `condense` because the track rides inside
+                // `glyph.w`, which `pen_delta` condenses along with
+                // everything else.
+                let track_shift = 0.5 * effect.tracking * glyph.font_size * condense;
+                // Updated before the whitespace `continue`s below — a
+                // space inside a condensed/bold span adjusts the pen the
+                // same way an inked glyph does.
+                let render_x = physical.x as f32 + pen_delta + embolden + track_shift;
+                pen_delta += effect_advance_delta(embolden, condense, glyph.w);
+
                 let key = EffectGlyphKey {
                     font_id: physical.cache_key.font_id,
                     glyph_id: physical.cache_key.glyph_id,
@@ -165,7 +239,7 @@ impl EffectGlyphs {
 
                 glyphs.push(CustomGlyph {
                     id,
-                    left: physical.x as f32 + image.placement.left as f32,
+                    left: render_x + image.placement.left as f32,
                     top: physical.y as f32 - image.placement.top as f32,
                     width: image.placement.width as f32,
                     height: image.placement.height as f32,
@@ -190,6 +264,20 @@ impl EffectGlyphs {
             content_type: ContentType::Mask,
         })
     }
+}
+
+/// How much wider (or narrower, for condense) a glyph's advance becomes
+/// once its synthetic effects are applied, relative to the `natural_advance`
+/// cosmic-text shaped it with: `2 * embolden` for faux bold (ink dilates by
+/// `embolden` px on each side — FreeType's documented advance correction
+/// for its equivalent `FT_Outline_Embolden`), and the advance scales by
+/// `condense` for faux condense/expand, exactly as the ink does. Used by
+/// both glyph placement ([`EffectGlyphs::layout_to_custom_glyphs_with`]'s
+/// `pen_delta`) and text measurement
+/// (`text_stack::measure_shaped_buffer_with`) so rendered and measured
+/// widths always agree. `embolden` is expected pre-clamped to `>= 0.0`.
+pub fn effect_advance_delta(embolden: f32, condense: f32, natural_advance: f32) -> f32 {
+    (condense - 1.0) * natural_advance + 2.0 * embolden
 }
 
 /// Rasterize one glyph via swash directly, applying `embolden` (continuous
