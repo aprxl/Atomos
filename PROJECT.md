@@ -54,9 +54,9 @@ The rendering stack was evaluated during the project's inception against three c
 
 The renderer is hand-rolled on top of these: a `Renderer` struct that owns the wgpu state and exposes a high-level draw API (`draw_rect`, `draw_text`, `draw_path`, `draw_image`). Callers — including the Lua layer — never touch wgpu directly. The wgpu boilerplate is written once, wrapped, and invisible to the rest of the project.
 
-### The subpixel decision
+### The subpixel decision *(revised during Phase 0)*
 
-True RGB ClearType-style subpixel AA and arbitrary GPU vector compositing are fundamentally in tension on a shared surface. The chosen position: **subpixel AA via the glyph atlas** (what glyphon provides) is the default for text, and this composes correctly with vector decoration because the blending happens at the atlas/shader level rather than relying on LCD surface assumptions. Vello's grayscale-only path is not a regression here; it was simply not chosen as the base.
+True RGB ClearType-style subpixel AA and arbitrary GPU vector compositing are fundamentally in tension on a shared surface. The position as actually built: **grayscale coverage-mask AA with hinting and physical-pixel snapping**, rendered through Atomos's own swash-driven glyph rasterizer (`glyph_effects.rs`) rather than glyphon's built-in path — which is what enables the continuous faux-bold/condense effects and color emoji. This matches where modern GPU-composited renderers landed (VS Code, Chrome, and macOS all dropped true RGB subpixel AA for the same reasons: it breaks under scaling, rotation, and compositing). Crispness comes from rasterizing at native physical-pixel density (DPI-aware sizing) plus hinting, not from LCD subpixel structure. Vello's grayscale-only path is not a regression here; it was simply not chosen as the base.
 
 ### Vello as a future compositing layer
 
@@ -69,11 +69,12 @@ Vello is not dead to this project — it is the right tool for richly decorated 
 | Subsystem | Primary crate(s) | Notes |
 |---|---|---|
 | **Windowing & event loop** | `winit` | Cross-platform: Windows (DX12/Vulkan), Linux (X11/Wayland), macOS (Metal) |
+| **Input, frame scheduling, animation** | *(none — stdlib + `winit`)* | Hand-rolled in `src/input.rs`, `src/frame.rs`, `src/animation.rs`. Frame-state input over winit's event stream, demand-driven redraw, and 0..1 animation weights; no crate earns its keep here |
 | **GPU backend** | `wgpu` | Owns the device, queue, swap chain, and all render passes |
 | **Path tessellation** | `lyon` | Bézier paths and polygons → triangle meshes for wgpu |
 | **Text shaping & layout** | `cosmic-text` | Built on `rustybuzz` (shaping) + `fontdb` (discovery); part of glyphon's stack |
-| **Glyph rasterization** | `swash` | Per-glyph bitmaps including subpixel; used by glyphon |
-| **Text rendering** | `glyphon` | Assembles cosmic-text + swash + etagere into a ready-made wgpu text pipeline; use as a reference and/or starting point — replace with custom atlas code when ownership requires it |
+| **Glyph rasterization** | `swash` | Driven directly by Atomos's own rasterizer (`glyph_effects.rs`) since Phase 0 — enables faux-bold/condense and color emoji that glyphon's built-in path can't do |
+| **Text rendering** | `glyphon` | Provides the atlas + GPU pipeline (via its custom-glyph extension point); shaping stays cosmic-text, rasterization is already custom — full replacement remains an option if atlas ownership requires it |
 | **Rope / text storage** | `ropey` | The buffer's spine; all edits go through it |
 | **Incremental parsing** | `tree-sitter` + `tree-sitter-highlight` + grammar crates | Syntax highlighting, folding, structural edits; incremental re-parse on edit |
 | **Search / replace** | `regex` | `fancy-regex` only if lookahead/backreferences are needed |
@@ -100,9 +101,21 @@ Each phase lists its **objective**, **why it matters**, **scope**, **key crates*
 
 ---
 
-### Phase 0 — Renderer Foundation
+### Phase 0 — Renderer Foundation ✅ **COMPLETE** (August 2026)
 
-**Objective.** Build the minimal wgpu renderer — window, event loop, text, and a colored rect — and prove the full stack compiles and runs correctly on Windows as the primary target, before any editor logic is written on top of it.
+**Objective.** Build the minimal wgpu renderer — window, event loop, text, and a colored rect — and prove the full stack compiles and runs correctly, before any editor logic is written on top of it. *(Development happened on Linux/Pop!_OS rather than the originally-assumed Windows target; wgpu's Vulkan backend made this a non-event.)*
+
+**What was actually delivered** — substantially past the original scope. The renderer that exists in `src/renderer/`:
+
+- **Layer architecture.** The core abstraction is a retained [`Layer`], not bare draw calls: each layer owns an offscreen texture and a queue of draw commands, rebuilt only when content changes (`Automatic` layers hash-diff their content per frame; `Manual` layers persist until `clear()`), then composited bottom-to-top. Layer order doubles as z-order — an app puts chrome above content by putting it on a higher layer.
+- **Draw API.** `draw_rectangle` (per-corner rounding), `draw_polygon`, `draw_circle`, `draw_path`/`draw_path_from_file` (full SVG `d` grammar including arcs; fill with nonzero/evenodd rules, stroke with width/cap/join/miter, or both), `draw_svg_icon` (viewBox-aware icon rendering — handles nonstandard boxes like Material Symbols' `0 -960 960 960`), `draw_image`/`draw_image_from_file`, `draw_text`, `draw_styled_text` (multi-span rich text, one shape pass per call), plus `get_text_size`/`get_styled_text_size` for caller-side layout.
+- **Text stack.** cosmic-text shaping (full Unicode/BiDi/complex scripts, system-font fallback) + a custom swash rasterizer providing continuous faux-bold/faux-condense on any static font, tracking with professional half-track centering, and color emoji (bitmap + COLR). Shaped-buffer caching keyed by shaping inputs; per-layer skip-prepare when text is unchanged; periodic atlas trim bounding memory.
+- **DPI scaling.** Public API is logical pixels everywhere; internals are physical pixels — text and paths rasterize/tessellate at native display density. `ScaleFactorChanged` handled live.
+- **Shader effects.** `Layer::set_effect`: built-in Gaussian blur and 4×5 color-matrix (grayscale/invert/sepia/saturate/brightness/contrast/tint presets), plus a custom-WGSL hook compiled against a fixed contract, error-scope-guarded so bad shader source degrades gracefully instead of panicking.
+- **Quality/perf plumbing.** Adaptive MSAA (8x where the adapter grants `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`, 4x floor everywhere else); one shared MSAA scratch texture across layers; non-blocking GPU frame timing (`get_gpu_frametime`) split from wall-clock animation timing (`get_frametime`); u32 index buffers; reused tessellators.
+- **Verification practice.** Compile-check alone proved insufficient for wgpu code (two real validation-error bugs shipped past `cargo check`/`clippy` and were only caught at runtime) — every renderer change now gets a bounded `cargo run` smoke test before it's called done.
+
+**Not built, deliberately deferred:** dash patterns for strokes (needs a hand-rolled path-walk decomposition; `lyon_algorithms::walk` is the primitive when needed), per-primitive shaders within a shared batch (effects apply per-layer — the compositor-style unit; give a shape its own layer to shade it), image-upload caching for large/frequently-redrawn images (fine for icons, revisit when big images appear), and eviction for the effect-glyph bitmap cache (unbounded; a later problem at real-document scale).
 
 **Why it matters.** The renderer is the highest-uncertainty, highest-rework-cost part of the project. Every subsequent phase assumes a working draw layer. A rendering dead-end discovered in Phase 0 costs days; discovered in Phase 3 it costs months. This phase also forces the wgpu boilerplate to be written and wrapped once, so it is never seen again.
 
@@ -122,16 +135,44 @@ The rendering decision is already made (Section 3), so Phase 0 is not a survey �
 
 **Architecture notes.** Keep spike code disposable up until the `Renderer` API crystallises — then that API is permanent. Do not expose wgpu types across the module boundary. The `Renderer` is the only thing the rest of the codebase ever calls; if a future phase needs a new draw primitive, it is added to `Renderer`'s interface, not worked around. Write the wgpu boilerplate (device setup, swap chain, render pass structure) once inside this module, then never look at it again.
 
-**Exit criteria.**
-- [ ] A winit window opens on Windows and renders without errors.
-- [ ] A colored rounded rectangle is drawn via `lyon` tessellation through a wgpu pipeline.
-- [ ] The string `"Hello!"` read from a `ropey` buffer renders with correct glyph metrics and subpixel AA via `glyphon`.
-- [ ] The rect and text appear in the same frame with no z-ordering artifacts.
-- [ ] Window resize is handled correctly with no blank frames or panics.
-- [ ] All wgpu types are private to the renderer module; callers only see `Renderer` and its draw methods.
-- [ ] Frame time is measured and logged; rendering meets 60fps at 1080p on the development machine.
+**Exit criteria.** All met (with two noted amendments to the original wording):
+- [x] A winit window opens and renders without errors *(on Linux — see objective note)*.
+- [x] A colored rounded rectangle is drawn via `lyon` tessellation through a wgpu pipeline.
+- [x] Text renders with correct glyph metrics and crisp AA *(grayscale coverage AA via the custom swash path, not glyphon subpixel — see Section 3's revised subpixel decision; the `ropey`-sourced-string detail moved to Phase 1, where the rope actually arrives)*.
+- [x] Rect and text appear in the same frame with no z-ordering artifacts *(and cross-layer z-order is now an explicit, controlled thing)*.
+- [x] Window resize (and DPI scale-factor change) handled correctly with no blank frames or panics.
+- [x] All wgpu types are private to the renderer module; callers only see `Renderer`/`Layer` and vocabulary types.
+- [x] Frame time is measured (wall-clock + optional GPU-timestamp) and displayed; vsync-capped 60fps holds with thousands of styled-text draw calls after the skip-prepare caching work.
 
-**Risks.** wgpu ↔ glyphon version lock (mitigated by pinning and using glyphon's re-exported wgpu types). Lyon tessellation edge cases on anti-aliased borders. First-time wgpu boilerplate taking longer than expected — time-box it to one week and use `learn-wgpu` as the reference.
+**Validation beyond the criteria:** a full editor-UI mockup (tab bar, file tree with SVG icons, syntax-highlighted code view with relative line numbers and a block cursor, status bar — a Neovide screenshot recreation) was built entirely against the `Layer` API as a throwaway, and looked native-crisp. The API held up without needing renderer changes beyond `draw_svg_icon`. The mockup was deleted after review; `src/main.rs` is back to a minimal window + renderer + event-loop shell, and `src/bin/input_demo.rs` is the live capability demo.
+
+**Risks.** *(Retrospective: version-lock was real but managed by pinning wgpu to glyphon's version; the actual recurring hazard was wgpu **runtime validation errors invisible to the type system** — hence the smoke-test practice above.)*
+
+---
+
+### Platform Layer — Input, Frame Scheduling, Animation ✅ **COMPLETE** (August 2026)
+
+Built between Phase 0 and Phase 1 rather than as a numbered phase: these are the OS-facing systems that aren't rendering and aren't editor logic, and every one of them is cheaper to establish before there is a buffer than to retrofit around one. No new dependencies — all three are stdlib plus what `winit` already exposes.
+
+**Input** (`src/input.rs`). Frame-based state over winit's event stream, because almost every caller wants to ask *state* questions ("is Ctrl held?", "where is the mouse?") at an arbitrary point in a frame rather than react to a one-shot event. Level-triggered (`is_key_down`) and edge-triggered (`is_key_pressed`) queries are distinct, as is `is_key_typed` — which includes OS auto-repeat, and is the correct question for held-key actions like backspace. Physical `KeyCode` identity (layout-independent, right for keybinds) is deliberately separated from `text()` (layout- and modifier-resolved, right for typing); a French layout's `KeyCode::KeyQ` types "a", and only one of those two answers is ever the one wanted. Also: exact-modifier chord matching (`Ctrl+S` must not fire on `Ctrl+Shift+S`), mouse position in logical pixels (directly comparable against drawn geometry, no conversion at the call site), cursor-space and raw device deltas, scroll normalized to lines across both wheel and touchpad units, and focus/cursor-presence flags.
+
+*Stuck-input safety* is the one hard guarantee: losing focus mid-chord is the classic way input state desyncs, since the OS delivers the press but the release goes to whoever has focus next. `Focused(false)` force-releases every held key, button, and modifier, reporting each as a release edge so press/release pairing unwinds instead of hanging. Cursor exit and scale-factor changes drop the delta anchor so re-entry reports a teleport as zero movement rather than one enormous drag.
+
+**Frame scheduling** (`src/frame.rs`). Frames are demand-driven. The naive loop — `ControlFlow::Poll` plus an unconditional `request_redraw()` — renders at display refresh rate forever whether or not anything changed; with vsync that isn't a runaway spin, but it is a full CPU frame and GPU composite every vblank for a window showing a static buffer, and an editor is idle almost all of the time. `FrameScheduler` inverts the default: sleep on `ControlFlow::Wait` until something asks. Input that changed state asks (which is why `Input::handle_event` returns a bool rather than `()`). A running animation asks, every frame, for as long as it runs. Resize and rescale ask explicitly, since neither flows through input. **Measured: idle CPU drops to 0.0%.**
+
+"Dirty" and "animating" are the same concept here — animating is just asking again every frame — so the only thing that differs is pacing, which is why the scheduler owns a target-FPS knob (`WaitUntil`) rather than a separate animation clock. The knob is what makes deliberate sub-display-rate operation possible later (30 fps on battery, say); `None` follows the display and lets vsync do the pacing.
+
+**Animation** (`src/animation.rs`). A timer producing a 0..1 weight over wall-clock time — the primitive everything else interpolates against. Two ownership patterns, deliberately: **caller-owned** `Animation` values are the default (a cursor's blink belongs to the cursor), with an **opt-in keyed registry** (`Animations`) for animations that must be addressable from code that doesn't own them — the shape Lua plugins will need in Phase 2, where a string key crosses the FFI boundary and a Rust reference does not. Easing covers the CSS named curves plus arbitrary `cubic-bezier`, sharing one Newton-solved implementation rather than polynomial lookalikes. `Repeat::{Once, Loop, PingPong}`.
+
+**Architecture notes.** Three ordering/lifetime decisions that are load-bearing and non-obvious:
+- `advance()` returns *whether the animation still wants frames*. That return value is the scheduler's signal; it is the entire coupling between the two systems, and it is why neither module depends on the other's types.
+- `begin_frame()` is called at the **top** of `RedrawRequested`, not the bottom. Clearing the pending request at the end of a frame swallows the "still animating" request the frame itself just made, and the animation stalls after exactly one frame.
+- The delta fed to `advance()` **must be clamped** (`FrameScheduler::animation_delta`, 100 ms). Under `Wait` the gap between frames is unbounded, so a window left alone for a minute reports a 60-second frame delta on the next keystroke; stepping animations by that teleports every one of them to its end state, and presents as "animations randomly don't play."
+- Finished animations are never auto-evicted from the registry — `weight()` on a completed fade must keep returning 1.0, or the element it drives snaps back to invisible on the very frame the fade lands. Keys (not generational IDs) are what keeps the set bounded: replaying a key replaces rather than accumulates.
+
+**Testing.** Unlike the renderer, all three are pure state machines with no GPU dependency, so they are covered by ordinary unit tests (21 at time of writing) rather than smoke runs — including the stuck-key guarantee, the request-survives-the-frame ordering, and the idle-gap clamp. The renderer's smoke-test practice still applies to anything that touches wgpu.
+
+**Deferred:** IME (see `TODO.md` — needs the rope and caret to attach preedit to); keyframes, springs, and sequenced timelines (all build on the 0..1 weight, none need to exist for it to be useful); per-window scheduling, which becomes a question only if multiple windows land.
 
 ---
 
@@ -265,6 +306,8 @@ The rendering decision is already made (Section 3), so Phase 0 is not a survey �
 
 **Observability.** `tracing` + `tracing-subscriber` throughout. A command execution log is useful both for debugging and as the foundation of a future macro/replay system.
 
+**Frame budget.** Frames are demand-driven (see the Platform Layer section), which makes "does this need a redraw?" a question every feature has to answer rather than something the loop papers over. Anything that changes what is on screen must reach `FrameScheduler::request_redraw`, and anything that changes it *over time* should do so by returning `true` from an `Animation::advance` rather than by unconditionally requesting frames — an unconditional request re-introduces the always-drawing default one feature at a time. Time-based state that isn't animation (a status-bar clock, a blinking caret between blinks) is a timer that requests a redraw, not a reason to poll.
+
 ---
 
 ## 7. Risk Register
@@ -276,6 +319,7 @@ The rendering decision is already made (Section 3), so Phase 0 is not a survey �
 | Undo designed as snapshots instead of a transaction log | 1 | Enforce the transaction type from day one; reject any snapshot-style shortcut in review |
 | Multiple-cursor model deferred and then expensive to retrofit | 1 | Design the cursor model for multiple cursors in Phase 1 even if only one is active |
 | Lua owning buffer state or in the per-frame hot path | 2 | Narrow, transaction-oriented boundary; Rust owns the rope; profile early |
+| A feature unconditionally requesting redraws, quietly restoring the always-drawing default | 1–3 | Redraw requests come from input-state changes and `Animation::advance` returning `true`; treat any unconditional per-frame request as a bug |
 | Leaky Rust↔Lua API stabilized before Phase 3 batters it | 2–3 | Explicitly defer stabilization; treat Phase 3 feature needs as API revision signals |
 | Feature special-cased into core | 3 | Every needed core change is an API-gap bug; fix the API, not the feature |
 | Markdown span-mapping more complex than expected | 3 | Front-load it as the first Phase 3 feature; use `comrak`/`markdown-rs` with source spans |

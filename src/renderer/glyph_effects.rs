@@ -17,7 +17,7 @@ use glyphon::{
     fontdb, Buffer, Color, ContentType, CustomGlyph, CustomGlyphId, FontSystem, LayoutGlyph,
     RasterizeCustomGlyphRequest, RasterizedCustomGlyph,
 };
-use swash::scale::{image::Image, Render, ScaleContext, Source};
+use swash::scale::{image::Content, image::Image, Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Format, Transform};
 
 /// The synthetic per-glyph effect parameters carried by
@@ -237,13 +237,20 @@ impl EffectGlyphs {
                     id
                 };
 
+                // A color glyph (bitmap or COLR emoji) already carries its
+                // own full RGBA — glyphon's shader ignores `CustomGlyph`'s
+                // `color` entirely for `ContentType::Color` content (see
+                // `rasterize`'s doc), so `None` here just documents that
+                // rather than changing behavior.
+                let glyph_color = if image.content == Content::Color { None } else { Some(color) };
+
                 glyphs.push(CustomGlyph {
                     id,
                     left: render_x + image.placement.left as f32,
                     top: physical.y as f32 - image.placement.top as f32,
                     width: image.placement.width as f32,
                     height: image.placement.height as f32,
-                    color: Some(color),
+                    color: glyph_color,
                     snap_to_physical_pixel: true,
                     metadata: 0,
                 });
@@ -259,10 +266,17 @@ impl EffectGlyphs {
     pub fn rasterize(&self, request: RasterizeCustomGlyphRequest) -> Option<RasterizedCustomGlyph> {
         let key = *self.keys_by_id.get(&request.id)?;
         let image = self.cache.get(&key)?;
-        Some(RasterizedCustomGlyph {
-            data: image.data.clone(),
-            content_type: ContentType::Mask,
-        })
+        // `Content::Color` (bitmap/COLR emoji) carries full RGBA and is
+        // drawn as-is; `Mask`/`SubpixelMask` (plain outline glyphs — always
+        // `Mask` here, since rasterization always requests `Format::Alpha`)
+        // carry single-channel coverage, tinted by the text's own color —
+        // see glyphon's `shader.wgsl` `fs_main` for exactly how each
+        // `content_type` is interpreted.
+        let content_type = match image.content {
+            Content::Color => ContentType::Color,
+            Content::Mask | Content::SubpixelMask => ContentType::Mask,
+        };
+        Some(RasterizedCustomGlyph { data: image.data.clone(), content_type })
     }
 }
 
@@ -300,9 +314,23 @@ fn rasterize_glyph(
     } else {
         None
     };
-    Render::new(&[Source::Outline])
-        .format(Format::Alpha)
-        .embolden(embolden)
-        .transform(transform)
-        .render(&mut scaler, key.glyph_id)
+    // Color sources first (embedded-bitmap emoji, then COLR layered-outline
+    // emoji), falling back to the plain monochrome outline every other
+    // glyph uses. Each source is a no-op fallthrough when the font doesn't
+    // have it (`has_color_bitmaps`/`has_color_outlines`/`has_outlines`,
+    // checked internally by swash's `render_into`) — so this is exactly
+    // the previous behavior for every non-emoji glyph. `embolden`/
+    // `transform` only apply where swash's own `render_into` applies them
+    // (`Outline` unconditionally, `ColorOutline` for `transform` only) —
+    // harmlessly ignored for the embedded-bitmap source, which has no
+    // outline to dilate/skew in the first place.
+    Render::new(&[
+        Source::ColorBitmap(StrikeWith::BestFit),
+        Source::ColorOutline(0),
+        Source::Outline,
+    ])
+    .format(Format::Alpha)
+    .embolden(embolden)
+    .transform(transform)
+    .render(&mut scaler, key.glyph_id)
 }

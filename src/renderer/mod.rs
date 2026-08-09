@@ -31,8 +31,10 @@ mod font;
 mod font_parameters;
 mod glyph_effects;
 mod layer;
+mod path_paint;
 mod pixels;
 mod rounding;
+mod shader;
 mod text_span;
 mod text_stack;
 
@@ -47,25 +49,63 @@ pub use color::Rgba;
 pub use font::Font;
 pub use font_parameters::FontParameters;
 pub use layer::{Layer, LayerInvalidation};
+// Same story as `PathFileError` below: only bins that actually clip by
+// shape touch it.
+#[allow(unused_imports)]
+pub use layer::ClipShape;
 // Only needed by callers that pattern-match the error instead of just
 // `.expect()`/`?`-propagating it (like the current demo does).
 #[allow(unused_imports)]
 pub use layer::PathFileError;
+pub use path_paint::{FillRule, LineCap, LineJoin, PathPaint, Stroke};
 pub use pixels::Pixels;
 pub use rounding::Rounding;
+pub use shader::{ColorMatrix, ShaderEffect};
 pub use text_span::TextSpan;
 
 /// MSAA sample count for every layer's own render pass (the solid, image,
 /// and text pipelines all draw into a multisampled offscreen target,
 /// resolved down to the layer's actual single-sample texture — the same
-/// technique the old Phase-0 spike used for the swap chain directly). 4x
-/// is standard and near-universally supported on desktop Vulkan/Metal/DX12
-/// for a render-attachment-only colour texture. Without this, only
-/// axis-aligned edges (rectangles) look clean — anything with a diagonal
-/// or curved edge (`draw_polygon`, `draw_circle`, glyph outlines) shows
-/// visible aliasing. Shared by `layer.rs` and `text_stack.rs`, which is why
-/// it lives here rather than in either one.
-const MSAA_SAMPLE_COUNT: u32 = 4;
+/// technique the old Phase-0 spike used for the swap chain directly).
+/// Without this, only axis-aligned edges (rectangles) look clean —
+/// anything with a diagonal or curved edge (`draw_path`, `draw_circle`,
+/// glyph outlines) shows visible aliasing, and 4x specifically still looks
+/// noticeably stair-stepped on longer diagonal edges (a straight line has
+/// far fewer, more visually regular "steps" to hide behind than a
+/// continuously-curving edge does, at the same sample count) — hence
+/// preferring 8x when the adapter actually supports it, picked at runtime
+/// by [`pick_msaa_sample_count`] rather than assumed. Shared by
+/// `layer.rs` and `text_stack.rs`, which is why the *value* still lives
+/// here (as a `Renderer` field, not a `const`) rather than in either one.
+///
+/// `MULTISAMPLE_X4` is guaranteed for every renderable format by the
+/// WebGPU/wgpu spec, so this is always a safe floor; `X8` (and higher) is
+/// adapter/format-dependent and must be queried, not assumed — asking for
+/// an unsupported sample count is a validation error, and this renderer
+/// needs to keep working on adapters that only offer 4x.
+const MSAA_SAMPLE_COUNT_FALLBACK: u32 = 4;
+/// Ceiling on the preferred sample count — doubling sample count doubles
+/// MSAA texture memory/bandwidth for a visual return that flattens out
+/// well before 16x on UI-sized geometry, so 8x is where this stops
+/// climbing even if an adapter offers more.
+const MSAA_SAMPLE_COUNT_MAX: u32 = 8;
+
+/// Pick the highest MSAA sample count (up to [`MSAA_SAMPLE_COUNT_MAX`])
+/// this adapter actually supports for `format`, including
+/// `resolve_target` support at that count (every layer's render pass
+/// resolves its multisampled target automatically, so a sample count the
+/// format can't resolve wouldn't help even if multisampling itself were
+/// supported at it). Falls back to [`MSAA_SAMPLE_COUNT_FALLBACK`], which
+/// every renderable format is required to support.
+fn pick_msaa_sample_count(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> u32 {
+    let flags = adapter.get_texture_format_features(format).flags;
+    let can_resolve = flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE);
+    if can_resolve && flags.sample_count_supported(MSAA_SAMPLE_COUNT_MAX) {
+        MSAA_SAMPLE_COUNT_MAX
+    } else {
+        MSAA_SAMPLE_COUNT_FALLBACK
+    }
+}
 
 /// Errors that can escape [`Renderer::render`]. These are the cases the
 /// renderer could not recover from internally; recoverable per-frame surface
@@ -114,6 +154,11 @@ pub struct Renderer {
     msaa_texture: wgpu::Texture,
     msaa_view: wgpu::TextureView,
     msaa_size: (u32, u32),
+    // Resolved once in `new` via `pick_msaa_sample_count` — every layer's
+    // solid/image/text pipeline and the shared MSAA texture above all use
+    // this same value, so it's threaded through their constructors rather
+    // than assumed as a fixed constant.
+    msaa_sample_count: u32,
     // The glyphon/cosmic-text stack every `Layer`'s `draw_text` shares —
     // see `text_stack.rs`'s module doc for why it's one shared instance,
     // not one per layer.
@@ -140,6 +185,16 @@ pub struct Renderer {
     // Wall-clock instant the renderer was created — `get_render_time`
     // reports elapsed time against this.
     start_time: Instant,
+    // Current window scale factor (OS DPI setting; 1.0 = 96 DPI, 2.0 = a
+    // typical "Retina"/HiDPI display). Every `Layer::draw_*` call takes
+    // *logical* pixels and multiplies by this at the call boundary to get
+    // the *physical* pixels `DrawCommand`s (and everything downstream —
+    // tessellation, glyph rasterization) actually store and render in.
+    // Physical-pixel internals means text/paths rasterize at native
+    // display density (crisp, no blur from upscaling a logical-resolution
+    // render) while callers never have to think about DPI themselves — the
+    // same contract CSS px/SwiftUI points/Android dp give their callers.
+    scale_factor: f64,
 }
 
 /// How many timestamp readback buffers are kept in flight. Each is tiny
@@ -333,6 +388,7 @@ impl Renderer {
     /// completion with `pollster::block_on` or a runtime.
     pub async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
+        let scale_factor = window.scale_factor();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
 
@@ -361,14 +417,33 @@ impl Renderer {
             | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
         let timestamps_supported = adapter.features().contains(timestamp_features);
 
+        // `TextureFormatFeatureFlags`/`get_texture_format_features` reports
+        // what the adapter's hardware can *physically* do, but wgpu only
+        // permits actually using sample counts beyond the WebGPU-guaranteed
+        // baseline (4x, for a standard renderable format like this
+        // srgb-encoded one) once this feature is explicitly requested and
+        // granted — a real error hit while smoke-testing this: "Sample
+        // count 8 is not supported by format Rgba8UnormSrgb on this
+        // device... With the TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+        // feature your device supports [1, 2, 4, 8]." Same optional-
+        // feature shape as `timestamp_features` above: request it only if
+        // the adapter actually offers it, and gate any use of >4x MSAA on
+        // whether it was actually granted, not just adapter-capable.
+        let extended_msaa_supported =
+            adapter.features().contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
+
+        let mut required_features = wgpu::Features::empty();
+        if timestamps_supported {
+            required_features |= timestamp_features;
+        }
+        if extended_msaa_supported {
+            required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("atomos-device"),
-                required_features: if timestamps_supported {
-                    timestamp_features
-                } else {
-                    wgpu::Features::empty()
-                },
+                required_features,
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::default(),
                 memory_hints: wgpu::MemoryHints::default(),
@@ -404,15 +479,30 @@ impl Renderer {
         };
         surface.configure(&device, &surface_config);
 
-        let layer_pipelines = layer::LayerPipelines::new(&device, surface_config.format);
+        // Only consider going past the guaranteed 4x floor if the device
+        // was actually granted `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`
+        // above — querying `get_texture_format_features` without that
+        // feature enabled would still report the adapter's raw hardware
+        // capability, but *using* a sample count beyond 4x without the
+        // feature granted is a validation error regardless of what the
+        // hardware can physically do.
+        let msaa_sample_count = if extended_msaa_supported {
+            pick_msaa_sample_count(&adapter, surface_config.format)
+        } else {
+            MSAA_SAMPLE_COUNT_FALLBACK
+        };
+
+        let layer_pipelines =
+            layer::LayerPipelines::new(&device, surface_config.format, msaa_sample_count);
         let msaa_size = (surface_config.width, surface_config.height);
         let (msaa_texture, msaa_view) =
-            layer::create_msaa_texture(&device, surface_config.format, msaa_size);
+            layer::create_msaa_texture(&device, surface_config.format, msaa_size, msaa_sample_count);
         let text_stack = Rc::new(RefCell::new(text_stack::TextStack::new(
             &device,
             &queue,
             surface_config.format,
             (surface_config.width, surface_config.height),
+            msaa_sample_count,
         )));
         let layers = VecDeque::new();
 
@@ -428,13 +518,25 @@ impl Renderer {
             msaa_texture,
             msaa_view,
             msaa_size,
+            msaa_sample_count,
             text_stack,
             layers,
             timestamps,
             previous_frame_at: None,
             frame_delta: Duration::ZERO,
             start_time: Instant::now(),
+            scale_factor,
         }
+    }
+
+    /// Update the window scale factor — call this from
+    /// `WindowEvent::ScaleFactorChanged`. Layers pick up the new value
+    /// lazily (same pattern as [`Renderer::resize`]/surface size), so this
+    /// is just a cheap field write; no GPU resources need rebuilding here
+    /// (a `ScaleFactorChanged` is virtually always paired with a `Resized`
+    /// carrying the new physical size, which `resize` already handles).
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        self.scale_factor = scale_factor;
     }
 
     /// Reconfigure the swap chain for a new window size. No-op on zero-sized
@@ -460,6 +562,7 @@ impl Renderer {
             self.text_stack.clone(),
             self.surface_config.format,
             (self.surface_config.width, self.surface_config.height),
+            self.scale_factor as f32,
             invalidation,
         );
         self.layers.push_back(Rc::downgrade(&layer.0));
@@ -477,6 +580,7 @@ impl Renderer {
             self.text_stack.clone(),
             self.surface_config.format,
             (self.surface_config.width, self.surface_config.height),
+            self.scale_factor as f32,
             invalidation,
         );
         self.layers.push_front(Rc::downgrade(&layer.0));
@@ -494,12 +598,19 @@ impl Renderer {
     pub fn render(&mut self) -> Result<(), RenderError> {
         let frame = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => frame,
-            CurrentSurfaceTexture::Suboptimal(frame) => {
-                // Format/size no longer matches the surface; reconfigure and
-                // use the frame anyway.
-                self.surface.configure(&self.device, &self.surface_config);
-                frame
-            }
+            // Still a valid, presentable frame — just not ideally sized.
+            // Reconfiguring *here* would be the bug that produced "wgpu
+            // error: SurfaceOutput must be dropped before a new Surface is
+            // made": `frame` is already an acquired, unpresented
+            // `SurfaceTexture`, and wgpu requires any such texture to be
+            // presented/dropped *before* `configure` runs again — calling
+            // it while still holding `frame` is exactly what's invalid. An
+            // actual size change already reaches this renderer correctly
+            // through `Renderer::resize` (called from
+            // `WindowEvent::Resized`), which runs between frames, never
+            // while one is held — so there's nothing to do here but use
+            // the frame as given.
+            CurrentSurfaceTexture::Suboptimal(frame) => frame,
             CurrentSurfaceTexture::Outdated => {
                 // The surface has changed; reconfigure and skip this frame.
                 self.surface.configure(&self.device, &self.surface_config);
@@ -561,6 +672,14 @@ impl Renderer {
 
         // Once per frame (not per layer — every layer shares this stack):
         // tick the shaped-text cache clock and evict stale entries.
+        //
+        // This clock counts *frames*, not seconds, and frames are demand-
+        // driven (see `frame::FrameScheduler`) — so an idle editor stretches
+        // the atlas-trim interval out over arbitrary wall-clock time. That's
+        // deliberate rather than a bug waiting to happen: idle frames add no
+        // new glyphs, so there is nothing accumulating that a time-based
+        // trim would catch earlier. Revisit only if atlas growth ever shows
+        // up in a profile.
         self.text_stack.borrow_mut().advance_frame();
 
         // Layers resize lazily against the current surface size (see
@@ -568,8 +687,12 @@ impl Renderer {
         // the same here rather than in `resize()`.
         let surface_size = (self.surface_config.width, self.surface_config.height);
         if self.msaa_size != surface_size {
-            let (msaa_texture, msaa_view) =
-                layer::create_msaa_texture(&self.device, self.surface_config.format, surface_size);
+            let (msaa_texture, msaa_view) = layer::create_msaa_texture(
+                &self.device,
+                self.surface_config.format,
+                surface_size,
+                self.msaa_sample_count,
+            );
             self.msaa_texture = msaa_texture;
             self.msaa_view = msaa_view;
             self.msaa_size = surface_size;
@@ -581,6 +704,7 @@ impl Renderer {
             &self.msaa_view,
             &mut self.layers,
             surface_size,
+            self.scale_factor as f32,
         );
 
         let map_slot = self
@@ -636,6 +760,11 @@ impl Renderer {
     /// Wall-clock time elapsed since this `Renderer` was created.
     pub fn get_render_time(&self) -> Duration {
         self.start_time.elapsed()
+    }
+
+    /// Current window scale factor — see [`Renderer::set_scale_factor`].
+    pub fn scale_factor(&self) -> f64 {
+        self.scale_factor
     }
 
     /// Reserved for future per-window state. Currently a no-op.

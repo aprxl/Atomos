@@ -37,4 +37,17 @@ impl FontParameters {
             tracking: 0.0,
         }
     }
+
+    /// Convert a caller's logical-pixel `size`/`weight` to physical pixels
+    /// at the given DPI scale factor. `width` (a ratio) and `tracking` (EM
+    /// units, relative to `size`) are already scale-independent and left
+    /// untouched.
+    pub(super) fn scaled(&self, factor: f32) -> Self {
+        Self {
+            size: self.size * factor,
+            weight: self.weight * factor,
+            width: self.width,
+            tracking: self.tracking,
+        }
+    }
 }

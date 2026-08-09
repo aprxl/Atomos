@@ -45,7 +45,7 @@ use super::font::Font;
 use super::font_parameters::FontParameters;
 use super::glyph_effects::{effect_advance_delta, EffectGlyphs, GlyphEffect};
 use super::text_span::TextSpan;
-use super::{Alignment, HorizontalAlign, VerticalAlign, MSAA_SAMPLE_COUNT};
+use super::{Alignment, HorizontalAlign, VerticalAlign};
 
 /// Line height as a multiple of font size — matches the ratio the
 /// original Phase-0 text spike used.
@@ -125,6 +125,12 @@ pub(super) struct TextStack {
     // re-prepare even if its own text content hasn't changed. See
     // `LayerInner::rebuild_if_needed`'s skip-prepare logic.
     atlas_generation: u64,
+    // The MSAA sample count every `Layer`'s pipelines use — resolved once
+    // by `Renderer::new` via `pick_msaa_sample_count` and threaded in here
+    // so `create_text_renderer` (called later, per layer) can match it;
+    // glyphon's `TextRenderer` must be built against the same sample count
+    // as the render pass it draws into.
+    msaa_sample_count: u32,
 }
 
 impl TextStack {
@@ -133,6 +139,7 @@ impl TextStack {
         queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
         size: (u32, u32),
+        msaa_sample_count: u32,
     ) -> Self {
         // `FontSystem::new` walks the system font database; on cold caches
         // it can take a second — paid once, here, not per layer.
@@ -160,6 +167,7 @@ impl TextStack {
             shape_cache: HashMap::new(),
             frame: 0,
             atlas_generation: 0,
+            msaa_sample_count,
         }
     }
 
@@ -214,7 +222,7 @@ impl TextStack {
             &mut self.atlas,
             device,
             wgpu::MultisampleState {
-                count: MSAA_SAMPLE_COUNT,
+                count: self.msaa_sample_count,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },

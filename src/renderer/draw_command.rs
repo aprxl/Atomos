@@ -8,6 +8,7 @@ use super::Color;
 use super::Pixels;
 use super::Rounding;
 use super::TextSpan;
+use super::path_paint::{PathPaint, Stroke};
 use super::{Alignment, Font, FontParameters};
 
 /// One `Layer::draw_*` call, queued until the layer is next (re)built.
@@ -33,11 +34,15 @@ pub(super) enum DrawCommand {
     /// `d` is kept as the original SVG path-data string (not a pre-parsed
     /// geometry) so this variant stays trivially `Hash`/`PartialEq`/`Clone`
     /// — it's re-parsed on every rebuild, same cost model as re-tessellating
-    /// every other variant on every rebuild.
+    /// every other variant on every rebuild. `scale` is the DPI scale
+    /// factor at `draw_path` call time (baked in here, rather than scaling
+    /// `d`'s parsed coordinates up front, for the same "re-derive from the
+    /// source string every rebuild" reason `d` itself isn't pre-parsed).
     Path {
         d: String,
         position: [f32; 2],
-        color: Color,
+        scale: f32,
+        paint: PathPaint,
     },
     /// Re-uploaded to the GPU on every rebuild, same as every other
     /// variant is re-tessellated — for a large, frequently-redrawn
@@ -112,11 +117,12 @@ impl Hash for DrawCommand {
                 state.write_u32(radius.to_bits());
                 color.hash_bits(state);
             }
-            DrawCommand::Path { d, position, color } => {
+            DrawCommand::Path { d, position, scale, paint } => {
                 state.write_u8(3);
                 d.hash(state);
                 hash_f32_pair(position, state);
-                color.hash_bits(state);
+                state.write_u32(scale.to_bits());
+                hash_path_paint(paint, state);
             }
             DrawCommand::Image { pixels, top_left, size, tint } => {
                 state.write_u8(4);
@@ -168,4 +174,32 @@ impl Hash for DrawCommand {
 fn hash_f32_pair<H: Hasher>(pair: &[f32; 2], state: &mut H) {
     state.write_u32(pair[0].to_bits());
     state.write_u32(pair[1].to_bits());
+}
+
+fn hash_stroke<H: Hasher>(stroke: &Stroke, state: &mut H) {
+    stroke.color.hash_bits(state);
+    state.write_u32(stroke.width.to_bits());
+    state.write_u8(stroke.cap as u8);
+    state.write_u8(stroke.join as u8);
+    state.write_u32(stroke.miter_limit.to_bits());
+}
+
+fn hash_path_paint<H: Hasher>(paint: &PathPaint, state: &mut H) {
+    match paint {
+        PathPaint::Fill { color, rule } => {
+            state.write_u8(0);
+            color.hash_bits(state);
+            state.write_u8(*rule as u8);
+        }
+        PathPaint::Stroke(stroke) => {
+            state.write_u8(1);
+            hash_stroke(stroke, state);
+        }
+        PathPaint::FillAndStroke { fill_color, fill_rule, stroke } => {
+            state.write_u8(2);
+            fill_color.hash_bits(state);
+            state.write_u8(*fill_rule as u8);
+            hash_stroke(stroke, state);
+        }
+    }
 }

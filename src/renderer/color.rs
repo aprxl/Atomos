@@ -69,7 +69,7 @@ impl Color {
     pub const fn gradient(first: Rgba, second: Rgba, direction: GradientDirection) -> Self {
         Self::Gradient {
             stops: [first, second],
-            direction
+            direction,
         }
     }
 

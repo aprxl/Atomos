@@ -38,6 +38,18 @@ impl Rounding {
             && self.bottom_right == 0.0
             && self.bottom_left == 0.0
     }
+
+    /// Every radius multiplied by `factor` — used to convert a caller's
+    /// logical-pixel [`Rounding`] to physical pixels at the DPI scale
+    /// factor in effect when `draw_rectangle` was called.
+    pub(super) fn scaled(&self, factor: f32) -> Self {
+        Self {
+            top_left: self.top_left * factor,
+            top_right: self.top_right * factor,
+            bottom_right: self.bottom_right * factor,
+            bottom_left: self.bottom_left * factor,
+        }
+    }
 }
 
 impl Default for Rounding {
