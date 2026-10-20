@@ -290,7 +290,7 @@ fn animating_effect_parameters_reuses_the_effect_textures() {
 
 mod text_layout {
     use super::*;
-    use crate::renderer::{Font, FontParameters, TextLayout};
+    use crate::renderer::{Alignment, Font, FontParameters, TextLayout};
 
     /// Lay out `text` with a system font, or `None` on a machine with no
     /// adapter or no usable font (the tests then pass vacuously).
@@ -374,6 +374,117 @@ mod text_layout {
         };
         let (start, end) = (layout.caret_rect(0).x, layout.caret_rect(6).x);
         assert!(start > end, "logical start is on the right: {start} {end}");
+    }
+
+    const WRAP_TEXT: &str = "alpha beta gamma delta epsilon zeta eta theta";
+
+    /// Wrap [`WRAP_TEXT`] at half its natural width. `None` on a machine
+    /// with no adapter or font.
+    fn wrapped() -> Option<(TextLayout, TextLayout, f32)> {
+        let mut scene = scene()?;
+        let layer = scene.layer();
+        let font = Font::Named("sans-serif".into());
+        let params = FontParameters::new(20.0);
+        let natural = layer.layout_text(WRAP_TEXT, &font, &params);
+        if natural.size().0 <= 0.0 {
+            return None;
+        }
+        let max = natural.size().0 / 2.0;
+        let wrapped = layer.layout_wrapped_text(WRAP_TEXT, max, &font, &params);
+        let size = layer.get_wrapped_text_size(WRAP_TEXT, max, &font, &params);
+        assert_eq!(size, wrapped.size());
+        Some((natural, wrapped, max))
+    }
+
+    #[test]
+    fn wrapping_breaks_a_long_line_within_the_width() {
+        let Some((natural, wrapped, max)) = wrapped() else {
+            return;
+        };
+        let lines = wrapped.lines();
+        assert!(lines.len() >= 2, "{} lines", lines.len());
+        assert!(lines.iter().all(|l| l.width <= max + 0.5));
+        assert!(wrapped.size().1 > natural.size().1);
+        // Lines tile the text and stack downwards.
+        assert_eq!(lines[0].range.start, 0);
+        assert_eq!(lines.last().unwrap().range.end, WRAP_TEXT.len());
+        for pair in lines.windows(2) {
+            assert_eq!(pair[0].range.end, pair[1].range.start);
+            assert!(pair[1].top > pair[0].top);
+        }
+    }
+
+    #[test]
+    fn carets_and_hit_tests_follow_wrapped_lines() {
+        let Some((_, wrapped, _)) = wrapped() else {
+            return;
+        };
+        let second = wrapped.lines()[1].clone();
+        // A wrap boundary is the start of the next line.
+        let at_wrap = wrapped.caret_rect(second.range.start);
+        assert_eq!(at_wrap.y, second.top);
+        assert_eq!(at_wrap.x, 0.0);
+        for byte in [second.range.start + 1, second.range.end - 1] {
+            let rect = wrapped.caret_rect(byte);
+            assert_eq!(rect.y, second.top);
+            let y = rect.y + rect.height / 2.0;
+            assert_eq!(wrapped.hit_test((rect.x, y)), byte, "{rect:?} {second:?}");
+        }
+        // A click far right of a wrapped line stays on it.
+        let y = second.top + second.height / 2.0;
+        let end = wrapped.hit_test((5000.0, y));
+        assert!(
+            second.range.contains(&end),
+            "{end} not in {:?}",
+            second.range
+        );
+        assert_eq!(wrapped.hit_test((5000.0, 10_000.0)), WRAP_TEXT.len());
+    }
+
+    #[test]
+    fn a_selection_across_a_wrap_has_a_rect_per_line() {
+        let Some((_, wrapped, _)) = wrapped() else {
+            return;
+        };
+        let (a, b) = (wrapped.lines()[0].range.start, wrapped.lines()[1].range.end);
+        let rects = wrapped.selection_rects(a + 1..b - 1);
+        assert_eq!(rects.len(), 2, "{rects:?}");
+        assert!(rects[1].y > rects[0].y);
+    }
+
+    #[test]
+    fn wrapped_text_draws_on_every_line() {
+        let Some(mut scene) = scene() else { return };
+        let layer = scene.layer();
+        let font = Font::Named("sans-serif".into());
+        let params = FontParameters::new(10.0);
+        let text = "MMM MMM MMM";
+        let natural = layer.layout_text(text, &font, &params);
+        if natural.size().0 <= 0.0 {
+            return;
+        }
+        let max = natural.size().0 / 2.0;
+        let wrapped = layer.layout_wrapped_text(text, max, &font, &params);
+        assert!(wrapped.lines().len() >= 3);
+        layer.draw_wrapped_text(
+            text,
+            (0.0, 0.0),
+            max,
+            Color::rgb(255, 255, 255),
+            Alignment::default(),
+            font,
+            params,
+        );
+        scene.frame(1.0);
+        let mut inked_rows = 0;
+        for line in wrapped.lines() {
+            let rows = (line.top as u32)..((line.top + line.height) as u32);
+            let inked = rows
+                .clone()
+                .any(|y| (0..(max as u32 + 1)).any(|x| scene.pixel(x, y)[0] > 128));
+            inked_rows += usize::from(inked);
+        }
+        assert_eq!(inked_rows, wrapped.lines().len());
     }
 }
 

@@ -105,11 +105,18 @@ or keep `Custom` groups surface-sized.
 
 ## Text
 
-### Wrapped text layout and drawing
-**Trigger:** the first app that needs text wrapped to a width.
+### Wrapping for styled text and wrap options
+**Trigger:** an app needs wrapped `draw_styled_text` (e.g. wrapped,
+syntax-highlighted lines), or hanging indents / `Wrap::Glyph`-only /
+justified lines.
 
-`Layer::layout_text` breaks lines only at `\n`. Wrapping needs the width in the
-layout and `draw_text` to draw the wrapped result with the same geometry.
+`draw_wrapped_text`, `get_wrapped_text_size` and `layout_wrapped_text` wrap
+plain text to a logical-pixel width (word boundaries, glyph breaks for an
+over-long word); `draw_styled_text` and its size query still never wrap. Wrapped
+text is left-aligned inside its block, and each distinct width is its own
+shape-cache entry (animating the width re-shapes every frame). A wrapped line's
+swallowed trailing whitespace has no glyph, so selection rectangles stop at the
+last visible glyph.
 
 ### Shaped-glyph data and appearance effects from the fork
 **Trigger:** PDF/export or an interaction effect is needed.

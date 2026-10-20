@@ -1034,7 +1034,7 @@ fn build_custom_effect_pipeline(
         bind_group_layout,
     );
     if let Some(error) = pollster::block_on(scope.pop()) {
-        eprintln!("Atomos: custom shader effect failed to compile, layer left unaffected: {error}");
+        log::error!("custom shader effect failed to compile, layer left unaffected: {error}");
         return None;
     }
     Some(pipeline)
@@ -1871,9 +1871,7 @@ impl LayerInner {
                     Err(e) => {
                         // Left unprepared so the next frame tries again
                         // instead of treating stale glyphs as current.
-                        eprintln!(
-                            "Atomos: text glyph atlas full, text will retry next frame: {e:?}"
-                        );
+                        log::warn!("text glyph atlas full, text will retry next frame: {e:?}");
                         batch.prepared = None;
                     }
                 }
@@ -2236,7 +2234,7 @@ impl LayerInner {
                         .borrow()
                         .render(&self.text_batches[*batch].renderer, rpass)
                     {
-                        eprintln!("Atomos: text render error: {e:?}");
+                        log::error!("text render error: {e:?}");
                     }
                 }
             }
@@ -3382,6 +3380,63 @@ impl Layer {
         font: Font,
         font_parameters: FontParameters,
     ) {
+        self.push_text(
+            text,
+            position,
+            color,
+            alignment,
+            font,
+            font_parameters,
+            None,
+        );
+    }
+
+    /// [`Layer::draw_text`], with lines wrapped to `max_width` (logical
+    /// pixels): a line too long for it breaks at the last word boundary
+    /// that fits (or, for a single word wider than `max_width`, between
+    /// characters). `\n` still breaks unconditionally.
+    ///
+    /// `position`/`alignment` apply to the wrapped block's measured size
+    /// ([`Layer::get_wrapped_text_size`]), which is at most `max_width`
+    /// wide except for an unbreakable glyph wider than it. Lines are
+    /// left-aligned within the block. Use [`Layer::layout_wrapped_text`]
+    /// with the same arguments for carets, hit-testing and selections.
+    ///
+    /// Each distinct `max_width` is shaped (and cached) separately, so
+    /// animating it re-shapes every frame; resize in steps if that shows up.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_wrapped_text(
+        &self,
+        text: &str,
+        position: (f32, f32),
+        max_width: f32,
+        color: Color,
+        alignment: Alignment,
+        font: Font,
+        font_parameters: FontParameters,
+    ) {
+        self.push_text(
+            text,
+            position,
+            color,
+            alignment,
+            font,
+            font_parameters,
+            Some(max_width),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_text(
+        &self,
+        text: &str,
+        position: (f32, f32),
+        color: Color,
+        alignment: Alignment,
+        font: Font,
+        font_parameters: FontParameters,
+        wrap_width: Option<f32>,
+    ) {
         debug_assert!(
             matches!(color, Color::Solid(_)),
             "draw_text only supports Color::Solid"
@@ -3393,6 +3448,7 @@ impl Layer {
             font_parameters,
             alignment,
             color,
+            wrap_width,
         });
     }
 
@@ -3408,14 +3464,36 @@ impl Layer {
         font: &Font,
         font_parameters: &FontParameters,
     ) -> (f32, f32) {
+        self.text_size(text, font, font_parameters, None)
+    }
+
+    /// [`Layer::get_text_size`] for [`Layer::draw_wrapped_text`] with the
+    /// same `max_width`.
+    pub fn get_wrapped_text_size(
+        &self,
+        text: &str,
+        max_width: f32,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> (f32, f32) {
+        self.text_size(text, font, font_parameters, Some(max_width))
+    }
+
+    fn text_size(
+        &self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+        wrap_width: Option<f32>,
+    ) -> (f32, f32) {
         let s = self.scale_factor();
         let scaled = font_parameters.scaled(s);
-        let (width, height) = self
-            .0
-            .borrow()
-            .text_stack
-            .borrow_mut()
-            .measure(text, font, &scaled);
+        let (width, height) = self.0.borrow().text_stack.borrow_mut().measure(
+            text,
+            font,
+            &scaled,
+            wrap_width.map(|w| w * s),
+        );
         (width / s, height / s)
     }
 
@@ -3461,13 +3539,38 @@ impl Layer {
         font: &Font,
         font_parameters: &FontParameters,
     ) -> TextLayout {
+        self.text_layout(text, font, font_parameters, None)
+    }
+
+    /// [`Layer::layout_text`] for [`Layer::draw_wrapped_text`] with the same
+    /// `max_width`: one [`TextLine`](super::TextLine) per *wrapped* line, so
+    /// carets, hit-testing and selection rectangles follow what is drawn. A
+    /// byte offset at a soft wrap belongs to the line it starts, as the
+    /// caret there is shown at the start of the next line.
+    pub fn layout_wrapped_text(
+        &self,
+        text: &str,
+        max_width: f32,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> TextLayout {
+        self.text_layout(text, font, font_parameters, Some(max_width))
+    }
+
+    fn text_layout(
+        &self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+        wrap_width: Option<f32>,
+    ) -> TextLayout {
         let s = self.scale_factor();
         let scaled = font_parameters.scaled(s);
         self.0
             .borrow()
             .text_stack
             .borrow_mut()
-            .layout(text, font, &scaled)
+            .layout(text, font, &scaled, wrap_width.map(|w| w * s))
             .unscaled(s)
     }
 

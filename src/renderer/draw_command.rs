@@ -78,6 +78,9 @@ pub(super) enum DrawCommand {
         font_parameters: FontParameters,
         alignment: Alignment,
         color: Color,
+        /// Width to wrap lines to, if any. Part of the shape-cache key:
+        /// changing it re-shapes.
+        wrap_width: Option<f32>,
     },
     /// Multiple independently-styled [`TextSpan`]s shaped together as one
     /// unit — see `Layer::draw_styled_text`. Same "always re-shaped every
@@ -156,6 +159,7 @@ impl DrawCommand {
                 font_parameters,
                 alignment,
                 color,
+                wrap_width,
             } => DrawCommand::Text {
                 text: text.clone(),
                 position: pair(position),
@@ -163,6 +167,7 @@ impl DrawCommand {
                 font_parameters: font_parameters.scaled(s),
                 alignment: *alignment,
                 color: color.clone(),
+                wrap_width: wrap_width.map(|w| w * s),
             },
             DrawCommand::StyledText {
                 spans,
@@ -259,6 +264,7 @@ impl Hash for DrawCommand {
                 font_parameters,
                 alignment,
                 color,
+                wrap_width,
             } => {
                 state.write_u8(5);
                 text.hash(state);
@@ -271,6 +277,7 @@ impl Hash for DrawCommand {
                 state.write_u32(font_parameters.slant.to_bits());
                 alignment.hash(state);
                 color.hash_bits(state);
+                state.write_u32(wrap_width.map_or(u32::MAX, f32::to_bits));
             }
             DrawCommand::PushClip(shape) => {
                 state.write_u8(7);
