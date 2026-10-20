@@ -77,6 +77,10 @@ const MAX_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 #[derive(Debug)]
 pub struct FrameScheduler {
     redraw_requested: bool,
+    /// A frame owed at a future instant (a caret blink's next step). Kept
+    /// as the earliest of everything asked for; it becomes an ordinary owed
+    /// frame once due.
+    wake_at: Option<Instant>,
     /// The window is not visible: a frame may be owed, but drawing it would
     /// show nothing. Cleared when the OS reports the window visible again.
     occluded: bool,
@@ -101,6 +105,7 @@ impl FrameScheduler {
             // frame never paints at all, so the first frame has to be owed
             // from the outset.
             redraw_requested: true,
+            wake_at: None,
             occluded: false,
             retries: 0,
             target_fps: None,
@@ -114,10 +119,29 @@ impl FrameScheduler {
         self.redraw_requested = true;
     }
 
+    /// Ask for a frame once `delay` has passed, without waking the loop
+    /// before then. For state that changes on a schedule rather than in
+    /// response to input, such as [`crate::timing::Stepped::wake_in`]: the
+    /// loop sleeps until the deadline instead of redrawing identical frames.
+    /// The earliest of several requests wins.
+    pub fn request_redraw_in(&mut self, delay: Duration) {
+        self.request_redraw_at(Instant::now() + delay);
+    }
+
+    /// [`request_redraw_in`](Self::request_redraw_in) with an absolute
+    /// instant.
+    pub fn request_redraw_at(&mut self, at: Instant) {
+        self.wake_at = Some(self.wake_at.map_or(at, |existing| existing.min(at)));
+    }
+
+    fn wake_due(&self) -> bool {
+        self.wake_at.is_some_and(|at| Instant::now() >= at)
+    }
+
     /// Is a frame owed *at all*? This ignores pacing — for the
     /// `about_to_wait` decision use [`should_draw_now`](Self::should_draw_now).
     pub fn wants_redraw(&self) -> bool {
-        self.redraw_requested
+        self.redraw_requested || self.wake_due()
     }
 
     /// Should `window.request_redraw()` be called right now?
@@ -128,7 +152,7 @@ impl FrameScheduler {
     /// deadline below purely decorative and the target FPS a no-op. The
     /// request has to be withheld until the deadline actually passes.
     pub fn should_draw_now(&self) -> bool {
-        self.redraw_requested
+        self.wants_redraw()
             && !self.occluded
             && self.deadline().is_none_or(|at| Instant::now() >= at)
     }
@@ -197,6 +221,9 @@ impl FrameScheduler {
     /// this frame requests counts toward the *next* frame.
     pub fn begin_frame(&mut self) {
         self.redraw_requested = false;
+        if self.wake_due() {
+            self.wake_at = None;
+        }
         self.last_frame_at = Some(Instant::now());
     }
 
@@ -208,8 +235,13 @@ impl FrameScheduler {
     ///   which is the only way to run *slower* than the display (battery
     ///   throttling, a deliberate 30 fps cap).
     pub fn control_flow(&self) -> ControlFlow {
-        if !self.redraw_requested || self.occluded {
+        if self.occluded {
             return ControlFlow::Wait;
+        }
+        if !self.wants_redraw() {
+            return self
+                .wake_at
+                .map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
         }
         match self.deadline() {
             Some(at) => ControlFlow::WaitUntil(at),
@@ -376,5 +408,36 @@ mod tests {
             scheduler.request_redraw();
             assert_eq!(scheduler.control_flow(), ControlFlow::Poll, "fps {fps}");
         }
+    }
+
+    #[test]
+    fn a_scheduled_wake_sleeps_until_due_then_owes_a_frame() {
+        let mut scheduler = FrameScheduler::new();
+        scheduler.begin_frame();
+        scheduler.request_redraw_in(Duration::from_secs(60));
+        assert!(!scheduler.wants_redraw());
+        assert!(matches!(
+            scheduler.control_flow(),
+            ControlFlow::WaitUntil(_)
+        ));
+
+        scheduler.request_redraw_at(Instant::now() - Duration::from_millis(1));
+        assert!(scheduler.wants_redraw(), "a due wake is an owed frame");
+        assert!(scheduler.should_draw_now());
+
+        scheduler.begin_frame();
+        assert!(!scheduler.wants_redraw(), "consumed by the frame it woke");
+        assert_eq!(scheduler.control_flow(), ControlFlow::Wait);
+    }
+
+    #[test]
+    fn the_earliest_scheduled_wake_wins() {
+        let mut scheduler = FrameScheduler::new();
+        scheduler.begin_frame();
+        let soon = Instant::now() + Duration::from_secs(1);
+        scheduler.request_redraw_at(soon + Duration::from_secs(10));
+        scheduler.request_redraw_at(soon);
+        scheduler.request_redraw_at(soon + Duration::from_secs(5));
+        assert_eq!(scheduler.control_flow(), ControlFlow::WaitUntil(soon));
     }
 }

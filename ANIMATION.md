@@ -257,3 +257,19 @@ cargo run --bin input_demo
 ## Deferred
 
 Keyframe tracks, spring physics, and animation sequencing/chaining. All build on `Animation` without changing it. Not needed until something asks for them.
+
+## Timing primitives (`atomos::timing`)
+
+`Animation` says "still running"; that is the wrong question for two common cases.
+
+- **`Stepped`** — a value with a few visible states (a caret blink is two). `advance()` returns whether the *step changed*, so the loop can sleep through the flat middle of a step. `wake_in()` says when the next step is due; hand it to `FrameScheduler::request_redraw_in` so the loop sleeps until then instead of redrawing identical frames. `restart()` resumes lit (call it when the user types).
+- **`Glide`** — a number that eases toward a target that may move mid-travel (scroll offset). `aim(to)` re-aims from wherever the value is now and does nothing if it is already heading there. `advance()` reports the landing frame as a change. `settle(to)` jumps without travel.
+
+Both keep their own wall clock rather than the clamped frame delta, so a target aimed on the first frame after an idle window is not charged the idle time. Each method has an `*_at(now)` form taking the instant explicitly, for tests and replay.
+
+```rust
+if blink.advance() { scheduler.request_redraw(); }
+scheduler.request_redraw_in(blink.wake_in());
+```
+
+`FrameScheduler::request_redraw_in(Duration)` / `request_redraw_at(Instant)` owe a frame at a future instant (the earliest request wins) and let `control_flow()` return `WaitUntil` for it.
