@@ -370,3 +370,180 @@ mod text_layout {
         assert!(start > end, "logical start is on the right: {start} {end}");
     }
 }
+
+mod painter_order {
+    use super::*;
+    use crate::renderer::{Alignment, Font, FontParameters, Pixels};
+
+    fn text(layer: &super::super::Layer, at: (f32, f32), size: f32) {
+        layer.draw_text(
+            "MMMM",
+            at,
+            Color::rgb(255, 255, 255),
+            Alignment::default(),
+            Font::Named("sans-serif".into()),
+            FontParameters::new(size),
+        );
+    }
+
+    #[test]
+    fn an_image_then_a_covering_rect_shows_the_rect() {
+        let Some(mut scene) = scene() else { return };
+        let layer = scene.layer();
+        layer.draw_image(
+            Pixels::new(1, 1, vec![255; 4]),
+            (0.0, 0.0),
+            (20.0, 20.0),
+            Color::rgb(255, 255, 255),
+        );
+        layer.draw_rectangle(
+            (0.0, 0.0),
+            (20.0, 20.0),
+            Color::rgb(0, 0, 255),
+            Rounding::NONE,
+        );
+        scene.frame(1.0);
+        assert_near(scene.pixel(4, 4), [0, 0, 255, 255], 1);
+    }
+
+    #[test]
+    fn a_rect_then_an_image_shows_the_image() {
+        let Some(mut scene) = scene() else { return };
+        let layer = scene.layer();
+        layer.draw_rectangle(
+            (0.0, 0.0),
+            (20.0, 20.0),
+            Color::rgb(0, 0, 255),
+            Rounding::NONE,
+        );
+        layer.draw_image(
+            Pixels::new(1, 1, vec![255; 4]),
+            (0.0, 0.0),
+            (20.0, 20.0),
+            Color::rgb(255, 255, 255),
+        );
+        scene.frame(1.0);
+        assert_near(scene.pixel(4, 4), [255, 255, 255, 255], 1);
+    }
+
+    /// First pixel inside the glyph run that is clearly inked, if any.
+    fn inked(scene: &Scene) -> Option<(u32, u32)> {
+        (0..40u32)
+            .flat_map(|y| (0..64u32).map(move |x| (x, y)))
+            .find(|&(x, y)| scene.pixel(x, y)[0] > 200)
+    }
+
+    #[test]
+    fn text_then_a_covering_rect_hides_the_text() {
+        let Some(mut scene) = scene() else { return };
+        let layer = scene.layer();
+        text(&layer, (0.0, 0.0), 30.0);
+        scene.frame(1.0);
+        let Some((x, y)) = inked(&scene) else { return };
+
+        layer.clear();
+        text(&layer, (0.0, 0.0), 30.0);
+        layer.draw_rectangle(
+            (0.0, 0.0),
+            (64.0, 64.0),
+            Color::rgb(0, 0, 255),
+            Rounding::NONE,
+        );
+        scene.frame(1.0);
+        assert_near(scene.pixel(x, y), [0, 0, 255, 255], 1);
+    }
+
+    #[test]
+    fn a_rect_text_rect_sandwich_keeps_the_text_between() {
+        let Some(mut scene) = scene() else { return };
+        let layer = scene.layer();
+        text(&layer, (0.0, 0.0), 30.0);
+        scene.frame(1.0);
+        let Some((x, y)) = inked(&scene) else { return };
+
+        layer.clear();
+        layer.draw_rectangle(
+            (0.0, 0.0),
+            (64.0, 64.0),
+            Color::rgb(255, 0, 0),
+            Rounding::NONE,
+        );
+        text(&layer, (0.0, 0.0), 30.0);
+        layer.draw_rectangle(
+            (60.0, 60.0),
+            (4.0, 4.0),
+            Color::rgb(0, 0, 255),
+            Rounding::NONE,
+        );
+        scene.frame(1.0);
+        assert_near(scene.pixel(x, y), [255, 255, 255, 255], 60);
+        assert_near(scene.pixel(62, 62), [0, 0, 255, 255], 1);
+        assert_near(scene.pixel(1, 63), [255, 0, 0, 255], 1);
+    }
+
+    #[test]
+    fn two_text_layers_in_one_frame_both_draw() {
+        let Some(mut scene) = scene() else { return };
+        let first = scene.layer();
+        text(&first, (0.0, 0.0), 30.0);
+        scene.frame(1.0);
+        let Some((x, y)) = inked(&scene) else { return };
+
+        let second = scene.layer();
+        text(&second, (0.0, 30.0), 30.0);
+        first.clear();
+        text(&first, (0.0, 0.0), 30.0);
+        scene.frame(1.0);
+        assert!(scene.pixel(x, y)[0] > 200, "first layer text survived");
+        assert!(
+            (30..64u32)
+                .flat_map(|y| (0..64u32).map(move |x| (x, y)))
+                .any(|(x, y)| scene.pixel(x, y)[0] > 200),
+            "second layer text drew"
+        );
+    }
+
+    #[test]
+    fn an_atlas_reset_mid_prepare_keeps_earlier_text() {
+        let Some(mut scene) = scene() else { return };
+        let layer = scene.layer();
+        // Two text runs separated by a shape: two batches in one layer.
+        text(&layer, (0.0, 0.0), 30.0);
+        layer.draw_rectangle(
+            (60.0, 60.0),
+            (2.0, 2.0),
+            Color::rgb(0, 0, 255),
+            Rounding::NONE,
+        );
+        text(&layer, (0.0, 32.0), 30.0);
+        scene.frame(1.0);
+        let Some((x, y)) = inked(&scene) else { return };
+
+        // Force the next prepare to reset the shared atlas partway through.
+        layer.clear();
+        scene.text().set_glyph_ids_in_use_for_test(62_000);
+        text(&layer, (0.0, 0.0), 30.0);
+        layer.draw_rectangle(
+            (60.0, 60.0),
+            (2.0, 2.0),
+            Color::rgb(0, 0, 255),
+            Rounding::NONE,
+        );
+        text(&layer, (0.0, 32.0), 31.0);
+        scene.frame(1.0);
+        assert!(scene.pixel(x, y)[0] > 100, "first batch survived a reset");
+    }
+
+    #[test]
+    fn an_unchanged_text_batch_is_not_prepared_again() {
+        let Some(mut scene) = scene() else { return };
+        let layer = scene.layer();
+        text(&layer, (0.0, 0.0), 30.0);
+        scene.frame(1.0);
+        let prepared = layer.0.borrow().text_batch_states_for_test();
+        assert_eq!(prepared.len(), 1);
+        scene.frame(1.0);
+        assert_eq!(layer.0.borrow().text_batch_states_for_test(), prepared);
+        assert_eq!(layer.0.borrow().content_passes, 1);
+    }
+}

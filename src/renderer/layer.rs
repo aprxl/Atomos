@@ -1087,6 +1087,30 @@ fn run_fullscreen_pass(
 
 /// The GPU/CPU state shared by every clone of a [`Layer`]. See the module
 /// doc for the overall design.
+/// One step of a layer's draw order. See `LayerInner::ops`.
+#[derive(Clone, Debug, PartialEq)]
+enum ReplayOp {
+    /// A sub-range of the layer's one solid index buffer.
+    Solid(std::ops::Range<u32>),
+    /// A range of `image_draws`, each with its own bind group.
+    Images(std::ops::Range<usize>),
+    /// Index into `text_batches`.
+    Text(usize),
+}
+
+/// A run of consecutive text commands with its own glyphon renderer.
+struct TextBatch {
+    renderer: glyphon::TextRenderer,
+    /// The run's commands, in physical pixels (built against the scale
+    /// factor current at the last rebuild).
+    commands: Vec<DrawCommand>,
+    hash: u64,
+    /// `(hash, atlas generation)` as of the last successful prepare. A
+    /// mismatch with either means the renderer's vertices are stale: the
+    /// content changed, or the shared atlas was trimmed or reset since.
+    prepared: Option<(u64, u64)>,
+}
+
 pub(super) struct LayerInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1121,33 +1145,16 @@ pub(super) struct LayerInner {
     // texture/bind group, so unlike the solid batch above these can't share
     // one buffer.
     image_draws: Vec<ImageDraw>,
-    // `FontSystem`/`TextAtlas`/etc. are shared by every layer; the
-    // `TextRenderer` below is not — see `text_stack.rs`'s module doc.
+    // `FontSystem`/`TextAtlas`/etc. are shared by every layer; text
+    // renderers are not — see `text_stack.rs`'s module doc.
     text_stack: Rc<RefCell<TextStack>>,
-    text_renderer: glyphon::TextRenderer,
-    // Whether the most recent `prepare_layer` call had any text commands.
-    // Lets `rebuild_if_needed` skip the per-frame prepare entirely for
-    // text-free layers (a cursor layer, a selection layer): when this
-    // frame has no text AND the last prepared batch was already empty,
-    // `text_renderer` is guaranteed empty, so there is nothing to refresh
-    // — and `TextStack::render` on an empty renderer is already a no-op.
-    had_text: bool,
-    // Hash of this layer's text `DrawCommand`s as of the last successful
-    // `prepare_layer` call (`None` when `had_text` is false). Lets
-    // `rebuild_if_needed` skip re-preparing when text content is
-    // byte-for-byte unchanged from last time — the expensive part of text
-    // handling (walking every glyph into `CustomGlyph`s, both here and
-    // inside glyphon's own `prepare_with_custom`) happens regardless of
-    // the shape cache, so this is what actually avoids redoing it for
-    // static text.
-    last_text_hash: Option<u64>,
-    // `TextStack::atlas_generation` as of the last successful
-    // `prepare_layer` call. A mismatch means the shared atlas may have
-    // been trimmed (and evicted glyphs this layer depends on) since then,
-    // so a re-prepare is needed even if `last_text_hash` still matches —
-    // see `TextStack::advance_frame`'s doc for why trimming makes this
-    // necessary.
-    text_prepared_generation: Option<u64>,
+    // The layer's draw order: consecutive commands of one kind share an op,
+    // so a later shape paints over earlier text and images, not under them.
+    ops: Vec<ReplayOp>,
+    // One glyphon renderer per run of consecutive text commands. glyphon
+    // can only draw everything it prepared in one call, so a text run that
+    // must sit between other ops needs a renderer of its own.
+    text_batches: Vec<TextBatch>,
 
     // Shared, pre-built effect pipelines/layouts, cloned in from
     // `LayerPipelines` the same way `solid_pipeline`/`image_pipeline`/
@@ -1292,11 +1299,6 @@ impl LayerInner {
             LayerInvalidation::Manual => InvalidationState::Manual { dirty: false },
         };
 
-        // Own `TextRenderer` per layer, registered against the shared
-        // `TextAtlas` — see `TextStack::create_text_renderer`'s doc for why
-        // sharing one `TextRenderer` across layers is unsound.
-        let text_renderer = text_stack.borrow_mut().create_text_renderer(device);
-
         Self {
             device: device.clone(),
             queue: queue.clone(),
@@ -1323,10 +1325,8 @@ impl LayerInner {
             num_indices: 0,
             image_draws: Vec::new(),
             text_stack,
-            text_renderer,
-            had_text: false,
-            last_text_hash: None,
-            text_prepared_generation: None,
+            ops: Vec::new(),
+            text_batches: Vec::new(),
             blur_pipeline: pipelines.blur_pipeline.clone(),
             blur_bind_group_layout: pipelines.blur_bind_group_layout.clone(),
             colormatrix_pipeline: pipelines.colormatrix_pipeline.clone(),
@@ -1699,7 +1699,6 @@ impl LayerInner {
                 InvalidationState::Automatic { last_hash } => *last_hash = None,
                 InvalidationState::Manual { dirty } => *dirty = true,
             }
-            self.last_text_hash = None;
             // The scissor and a blur radius are in logical units too.
             self.content_texture_dirty = true;
             if let Some(effect) = self.effect.clone()
@@ -1853,78 +1852,14 @@ impl LayerInner {
             self.build_buffers();
         }
 
-        // Text re-prepares whenever its content changed, or unconditionally
-        // once per atlas trim cycle — never simply "every frame" (see
-        // `TextStack::advance_frame`'s doc and `LayerInner::last_text_hash`/
-        // `text_prepared_generation`'s field docs for why both checks are
-        // needed for correctness, not just the hash). Must happen before
-        // `pending` is cleared below (an `Automatic` layer's text commands
-        // wouldn't survive to `render_to_texture` otherwise).
-        // Commands convert to physical pixels only here, against the scale
-        // factor current right now.
-        let mut text_hasher = DefaultHasher::new();
-        let mut has_text = false;
-        for command in &self.pending {
-            if matches!(
-                command,
-                DrawCommand::Text { .. } | DrawCommand::StyledText { .. }
-            ) {
-                has_text = true;
-                command.hash(&mut text_hasher);
-            }
-        }
-        let text_hash = has_text.then(|| text_hasher.finish());
+        // Text re-prepares whenever a batch's content changed, or once per
+        // atlas trim or reset (see `TextStack::advance_frame`). This must
+        // finish for every batch before anything is recorded: preparing a
+        // renderer after its draw was recorded would replace the buffer the
+        // recorded draw reads.
+        let prepared = self.prepare_text_batches();
 
-        let atlas_generation = self.text_stack.borrow().atlas_generation();
-        let needs_prepare = if has_text {
-            text_hash != self.last_text_hash
-                || self.text_prepared_generation != Some(atlas_generation)
-        } else {
-            // No text this frame — the only reason to prepare is to clear
-            // out a previous frame's glyphs (see the `had_text` field doc);
-            // an atlas trim can't have invalidated anything since an empty
-            // `text_renderer` has no glyphs for it to have evicted.
-            self.had_text
-        };
-
-        if needs_prepare {
-            let physical = self.physical_commands();
-            let mut result = self.text_stack.borrow_mut().prepare_layer(
-                &self.device,
-                &self.queue,
-                &physical,
-                &mut self.text_renderer,
-            );
-            if result.is_err() {
-                // The atlas is full of glyphs nothing is using any more:
-                // start it afresh and try once more.
-                let mut stack = self.text_stack.borrow_mut();
-                stack.reset_glyph_atlas(&self.device, &self.queue);
-                result = stack.prepare_layer(
-                    &self.device,
-                    &self.queue,
-                    &physical,
-                    &mut self.text_renderer,
-                );
-            }
-            match result {
-                Ok(()) => {
-                    self.last_text_hash = text_hash;
-                    self.text_prepared_generation =
-                        Some(self.text_stack.borrow().atlas_generation());
-                }
-                Err(e) => {
-                    // Leave the layer marked unprepared so the next frame
-                    // tries again instead of treating stale glyphs as current.
-                    eprintln!("Atomos: text glyph atlas full, text will retry next frame: {e:?}");
-                    self.last_text_hash = None;
-                    self.text_prepared_generation = None;
-                }
-            }
-        }
-        self.had_text = has_text;
-
-        if should_rebuild || needs_prepare {
+        if should_rebuild || prepared {
             self.content_texture_dirty = true;
         }
 
@@ -1945,6 +1880,59 @@ impl LayerInner {
             .collect()
     }
 
+    /// Prepare every text batch whose content or atlas generation is stale.
+    /// Returns whether anything was prepared.
+    fn prepare_text_batches(&mut self) -> bool {
+        let mut prepared_any = false;
+        // A second sweep covers the one case where the first goes wrong: a
+        // later batch's prepare reset the shared atlas, which invalidates
+        // every batch prepared earlier in the sweep. A reset during the
+        // second sweep is not retried; those batches retry next frame.
+        for _ in 0..2 {
+            let generation_at_start = self.text_stack.borrow().atlas_generation();
+            for batch in &mut self.text_batches {
+                let generation = self.text_stack.borrow().atlas_generation();
+                if batch.prepared == Some((batch.hash, generation)) {
+                    continue;
+                }
+                prepared_any = true;
+                let mut stack = self.text_stack.borrow_mut();
+                let mut result = stack.prepare_layer(
+                    &self.device,
+                    &self.queue,
+                    &batch.commands,
+                    &mut batch.renderer,
+                );
+                if result.is_err() {
+                    // The atlas is full of glyphs nothing uses any more:
+                    // start it afresh and try once more.
+                    stack.reset_glyph_atlas(&self.device, &self.queue);
+                    result = stack.prepare_layer(
+                        &self.device,
+                        &self.queue,
+                        &batch.commands,
+                        &mut batch.renderer,
+                    );
+                }
+                match result {
+                    Ok(()) => batch.prepared = Some((batch.hash, stack.atlas_generation())),
+                    Err(e) => {
+                        // Left unprepared so the next frame tries again
+                        // instead of treating stale glyphs as current.
+                        eprintln!(
+                            "Atomos: text glyph atlas full, text will retry next frame: {e:?}"
+                        );
+                        batch.prepared = None;
+                    }
+                }
+            }
+            if self.text_stack.borrow().atlas_generation() == generation_at_start {
+                break;
+            }
+        }
+        prepared_any
+    }
+
     fn build_buffers(&mut self) {
         let mut vertices: Vec<Vertex> = Vec::new();
         // u32 indices, not u16 — a busy layer (an editor viewport's worth of
@@ -1959,16 +1947,39 @@ impl LayerInner {
         let mut tessellator = FillTessellator::new();
         let mut stroke_tessellator = StrokeTessellator::new();
         self.image_draws.clear();
+        let mut ops: Vec<ReplayOp> = Vec::new();
+        let mut text_runs: Vec<Vec<DrawCommand>> = Vec::new();
+        // Whether the previous command was text, so a run of them shares
+        // one batch.
+        let mut in_text_run = false;
         let physical = self.physical_commands();
-        for command in &physical {
+        for command in physical {
+            let is_text = matches!(
+                command,
+                DrawCommand::Text { .. } | DrawCommand::StyledText { .. }
+            );
+            if is_text {
+                if !in_text_run {
+                    text_runs.push(Vec::new());
+                    ops.push(ReplayOp::Text(text_runs.len() - 1));
+                }
+                text_runs
+                    .last_mut()
+                    .expect("a run was just started")
+                    .push(command);
+                in_text_run = true;
+                continue;
+            }
+            in_text_run = false;
+
             // `Image` needs its own texture/bind group, not a shared
-            // vertex/index buffer — built separately below.
+            // vertex/index buffer.
             if let DrawCommand::Image {
                 pixels,
                 top_left,
                 size,
                 tint,
-            } = command
+            } = &command
             {
                 self.image_draws.push(build_image_draw(
                     &self.device,
@@ -1980,12 +1991,28 @@ impl LayerInner {
                     *size,
                     tint,
                 ));
+                let at = self.image_draws.len() - 1;
+                match ops.last_mut() {
+                    Some(ReplayOp::Images(range)) => range.end = at + 1,
+                    _ => ops.push(ReplayOp::Images(at..at + 1)),
+                }
                 continue;
             }
+
+            let before = indices.len() as u32;
             let (cmd_vertices, cmd_indices) =
-                tessellate_command(command, &mut tessellator, &mut stroke_tessellator);
+                tessellate_command(&command, &mut tessellator, &mut stroke_tessellator);
             append_geometry(&mut vertices, &mut indices, cmd_vertices, cmd_indices);
+            let after = indices.len() as u32;
+            if after > before {
+                match ops.last_mut() {
+                    Some(ReplayOp::Solid(range)) => range.end = after,
+                    _ => ops.push(ReplayOp::Solid(before..after)),
+                }
+            }
         }
+        self.ops = ops;
+        self.assign_text_batches(text_runs);
 
         self.num_indices = indices.len() as u32;
         // Fresh GPU buffers on every rebuild rather than `write_buffer`
@@ -2017,6 +2044,45 @@ impl LayerInner {
                     }),
             )
         };
+    }
+
+    /// Give each text run a batch, reusing batches (and their glyphon
+    /// renderers) by position so an unchanged run keeps its prepared state.
+    #[cfg(test)]
+    pub(super) fn text_batch_states_for_test(&self) -> Vec<Option<(u64, u64)>> {
+        self.text_batches
+            .iter()
+            .map(|batch| batch.prepared)
+            .collect()
+    }
+
+    fn assign_text_batches(&mut self, runs: Vec<Vec<DrawCommand>>) {
+        self.text_batches.truncate(runs.len());
+        for (index, commands) in runs.into_iter().enumerate() {
+            let mut hasher = DefaultHasher::new();
+            for command in &commands {
+                command.hash(&mut hasher);
+            }
+            let hash = hasher.finish();
+            match self.text_batches.get_mut(index) {
+                Some(batch) => {
+                    batch.commands = commands;
+                    batch.hash = hash;
+                }
+                None => {
+                    let renderer = self
+                        .text_stack
+                        .borrow_mut()
+                        .create_text_renderer(&self.device);
+                    self.text_batches.push(TextBatch {
+                        renderer,
+                        commands,
+                        hash,
+                        prepared: None,
+                    });
+                }
+            }
+        }
     }
 
     /// Render this layer's cached geometry into its own offscreen texture.
@@ -2084,32 +2150,39 @@ impl LayerInner {
             rpass.set_scissor_rect(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
         }
 
-        if let (Some(vbuf), Some(ibuf)) = (&self.vertex_buffer, &self.index_buffer) {
-            rpass.set_pipeline(&self.solid_pipeline);
-            rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
-            rpass.set_vertex_buffer(0, vbuf.slice(..));
-            rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            rpass.draw_indexed(0..self.num_indices, 0, 0..1);
-        }
-
-        if !self.image_draws.is_empty() {
-            rpass.set_pipeline(&self.image_pipeline);
-            rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
-            for image_draw in &self.image_draws {
-                rpass.set_bind_group(1, &image_draw.bind_group, &[]);
-                rpass.set_vertex_buffer(0, image_draw.vertex_buffer.slice(..));
-                rpass.draw(0..6, 0..1);
+        // Replay in draw order, so later commands paint over earlier ones
+        // whatever their kind.
+        for op in &self.ops {
+            match op {
+                ReplayOp::Solid(range) => {
+                    let (Some(vbuf), Some(ibuf)) = (&self.vertex_buffer, &self.index_buffer) else {
+                        continue;
+                    };
+                    rpass.set_pipeline(&self.solid_pipeline);
+                    rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+                    rpass.set_vertex_buffer(0, vbuf.slice(..));
+                    rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.draw_indexed(range.clone(), 0, 0..1);
+                }
+                ReplayOp::Images(range) => {
+                    rpass.set_pipeline(&self.image_pipeline);
+                    rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+                    for image_draw in &self.image_draws[range.clone()] {
+                        rpass.set_bind_group(1, &image_draw.bind_group, &[]);
+                        rpass.set_vertex_buffer(0, image_draw.vertex_buffer.slice(..));
+                        rpass.draw(0..6, 0..1);
+                    }
+                }
+                ReplayOp::Text(batch) => {
+                    if let Err(e) = self
+                        .text_stack
+                        .borrow()
+                        .render(&self.text_batches[*batch].renderer, &mut rpass)
+                    {
+                        eprintln!("Atomos: text render error: {e:?}");
+                    }
+                }
             }
-        }
-
-        // Drawn last, on top of this layer's shapes/images — whatever
-        // `prepare_layer` uploaded moments ago in `rebuild_if_needed`.
-        if let Err(e) = self
-            .text_stack
-            .borrow()
-            .render(&self.text_renderer, &mut rpass)
-        {
-            eprintln!("Atomos: text render error: {e:?}");
         }
     }
 
