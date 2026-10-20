@@ -102,6 +102,9 @@ pub(super) struct TextStack {
     atlas: TextAtlas,
     viewport: Viewport,
     effect_glyphs: EffectGlyphs,
+    // Kept to rebuild `atlas` when the glyph-ID space is recycled.
+    glyph_cache: Cache,
+    format: wgpu::TextureFormat,
     // Resolved family name for each not-yet-seen `Font::Bytes`/`Font::File`
     // — `None` means registration failed (logged once, at registration
     // time). `Font::Named` never needs an entry; it's already a name.
@@ -169,6 +172,8 @@ impl TextStack {
             atlas,
             viewport,
             effect_glyphs: EffectGlyphs::new(),
+            glyph_cache,
+            format,
             registered_fonts: HashMap::new(),
             blank_buffer,
             shape_cache: HashMap::new(),
@@ -194,6 +199,25 @@ impl TextStack {
             self.atlas.trim();
             self.atlas_generation += 1;
         }
+    }
+
+    /// Discard every rasterized glyph and the atlas holding them, then
+    /// bump `atlas_generation` so every layer re-prepares its text. The IDs
+    /// and the atlas are only ever dropped together; see [`EffectGlyphs`].
+    pub(super) fn reset_glyph_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.effect_glyphs.reset();
+        self.atlas = TextAtlas::new(device, queue, &self.glyph_cache, self.format);
+        self.atlas_generation += 1;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_glyph_ids_in_use_for_test(&mut self, in_use: usize) {
+        self.effect_glyphs.set_next_id_for_test(in_use);
+    }
+
+    #[cfg(test)]
+    pub(super) fn glyph_ids_in_use_for_test(&self) -> usize {
+        self.effect_glyphs.next_id_for_test()
     }
 
     /// Current atlas protection epoch — see the `atlas_generation` field
@@ -441,6 +465,14 @@ impl TextStack {
         commands: &[DrawCommand],
         text_renderer: &mut TextRenderer,
     ) -> Result<(), glyphon::PrepareError> {
+        // Recycle the glyph-ID space (and the bitmaps behind it) before it
+        // can run out. glyphon keys atlas entries by these `u16` IDs, so IDs
+        // are only reusable if the atlas is rebuilt in the same step; bumping
+        // the generation makes every layer re-prepare against the new one.
+        if self.effect_glyphs.needs_reset() {
+            self.reset_glyph_atlas(device, queue);
+        }
+
         let mut all_glyphs = Vec::new();
         for command in commands {
             match command {

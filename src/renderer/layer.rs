@@ -1792,18 +1792,38 @@ impl LayerInner {
 
         if needs_prepare {
             let physical = self.physical_commands();
-            if let Err(e) = self.text_stack.borrow_mut().prepare_layer(
+            let mut result = self.text_stack.borrow_mut().prepare_layer(
                 &self.device,
                 &self.queue,
                 &physical,
                 &mut self.text_renderer,
-            ) {
-                eprintln!(
-                    "Atomos: text glyph atlas full, some text may not render this frame: {e:?}"
+            );
+            if result.is_err() {
+                // The atlas is full of glyphs nothing is using any more:
+                // start it afresh and try once more.
+                let mut stack = self.text_stack.borrow_mut();
+                stack.reset_glyph_atlas(&self.device, &self.queue);
+                result = stack.prepare_layer(
+                    &self.device,
+                    &self.queue,
+                    &physical,
+                    &mut self.text_renderer,
                 );
             }
-            self.last_text_hash = text_hash;
-            self.text_prepared_generation = Some(atlas_generation);
+            match result {
+                Ok(()) => {
+                    self.last_text_hash = text_hash;
+                    self.text_prepared_generation =
+                        Some(self.text_stack.borrow().atlas_generation());
+                }
+                Err(e) => {
+                    // Leave the layer marked unprepared so the next frame
+                    // tries again instead of treating stale glyphs as current.
+                    eprintln!("Atomos: text glyph atlas full, text will retry next frame: {e:?}");
+                    self.last_text_hash = None;
+                    self.text_prepared_generation = None;
+                }
+            }
         }
         self.had_text = has_text;
 

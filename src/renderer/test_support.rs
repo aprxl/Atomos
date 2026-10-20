@@ -81,6 +81,10 @@ impl Scene {
         })
     }
 
+    pub(super) fn text(&self) -> std::cell::RefMut<'_, TextStack> {
+        self.text.borrow_mut()
+    }
+
     /// A new top layer; `Manual` so tests control when content changes.
     pub(super) fn layer(&mut self) -> Layer {
         let layer = Layer::new(

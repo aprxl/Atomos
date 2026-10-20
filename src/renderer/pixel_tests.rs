@@ -174,3 +174,23 @@ fn a_matrix_can_generate_alpha_from_nothing() {
     scene.frame(1.0);
     assert_near(scene.pixel(32, 32), [0, 0, 255, 255], 0);
 }
+
+#[test]
+fn the_glyph_id_space_is_recycled_before_it_runs_out() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    scene.text().set_glyph_ids_in_use_for_test(62_000);
+    layer.draw_text(
+        "hi",
+        (0.0, 0.0),
+        Color::rgb(255, 255, 255),
+        super::Alignment::default(),
+        super::Font::Named("sans-serif".into()),
+        super::FontParameters::new(16.0),
+    );
+    scene.frame(1.0);
+    assert!(
+        scene.text().glyph_ids_in_use_for_test() < 1_000,
+        "IDs should restart from zero after the reset"
+    );
+}

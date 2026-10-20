@@ -56,6 +56,22 @@ impl From<&super::FontParameters> for GlyphEffect {
     }
 }
 
+/// glyphon identifies a custom glyph by a `u16` ([`CustomGlyphId`]), so at
+/// most this many distinct glyph variants can be live at once.
+const MAX_GLYPH_IDS: usize = u16::MAX as usize;
+
+/// Once this many IDs are handed out the owner is asked to [`reset`]
+/// (see [`EffectGlyphs::needs_reset`]) before the next preparation, leaving
+/// headroom for the variants a single preparation can add.
+///
+/// [`reset`]: EffectGlyphs::reset
+const RESET_AT_IDS: usize = MAX_GLYPH_IDS - 4096;
+
+/// Ceiling on rasterized bitmap memory before a reset is requested. Glyph
+/// bitmaps are cheap to regenerate, so the cache is a working set, not an
+/// archive.
+const BITMAP_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
 /// Identifies one distinct (font, glyph, size, weight, condense)
 /// combination. Floats are stored as bits so the key can derive `Eq`/`Hash`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -69,15 +85,22 @@ struct EffectGlyphKey {
 
 /// Rasterizes text through swash directly instead of cosmic-text's built-in
 /// `SwashCache`, so `embolden` (faux bold) and `transform` (faux condense)
-/// can be applied on any font. A simple map keyed by [`EffectGlyphKey`] is
-/// the honest scale for a Phase 0 spike (a handful of demo lines) — no
-/// eviction; real documents with thousands of glyphs are a later problem.
+/// can be applied on any font.
+///
+/// A map keyed by [`EffectGlyphKey`] holds each rasterized bitmap and the
+/// `u16` ID glyphon knows it by. Both are bounded together: past
+/// [`RESET_AT_IDS`] IDs or [`BITMAP_BUDGET_BYTES`] of bitmaps,
+/// [`EffectGlyphs::needs_reset`] turns true and the owner must call
+/// [`EffectGlyphs::reset`] **together with discarding the glyph atlas**,
+/// because the atlas is keyed by these IDs and a recycled ID would alias an
+/// old bitmap. Doing it as one coordinated step is what makes reuse safe.
 pub struct EffectGlyphs {
     scale_context: ScaleContext,
     cache: HashMap<EffectGlyphKey, Image>,
     ids: HashMap<EffectGlyphKey, CustomGlyphId>,
     keys_by_id: HashMap<CustomGlyphId, EffectGlyphKey>,
-    next_id: u16,
+    next_id: usize,
+    bitmap_bytes: usize,
 }
 
 impl Default for EffectGlyphs {
@@ -94,7 +117,36 @@ impl EffectGlyphs {
             ids: HashMap::new(),
             keys_by_id: HashMap::new(),
             next_id: 0,
+            bitmap_bytes: 0,
         }
+    }
+
+    /// Whether the ID space or bitmap budget is close enough to exhausted
+    /// that the owner should [`reset`](Self::reset) before preparing more
+    /// text.
+    pub fn needs_reset(&self) -> bool {
+        self.next_id >= RESET_AT_IDS || self.bitmap_bytes > BITMAP_BUDGET_BYTES
+    }
+
+    /// Forget every bitmap and ID. Only sound when the glyph atlas holding
+    /// the old IDs' bitmaps is discarded in the same step, and every layer
+    /// re-prepares its text afterwards.
+    pub fn reset(&mut self) {
+        self.cache.clear();
+        self.ids.clear();
+        self.keys_by_id.clear();
+        self.next_id = 0;
+        self.bitmap_bytes = 0;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_next_id_for_test(&mut self, next_id: usize) {
+        self.next_id = next_id;
+    }
+
+    #[cfg(test)]
+    pub(super) fn next_id_for_test(&self) -> usize {
+        self.next_id
     }
 
     /// Convert a shaped `Buffer`'s glyphs into `CustomGlyph` entries, with
@@ -229,6 +281,7 @@ impl EffectGlyphs {
                         condense,
                     )
                 {
+                    self.bitmap_bytes += image.data.len();
                     self.cache.insert(key, image);
                 }
                 let Some(image) = self.cache.get(&key) else {
@@ -241,7 +294,12 @@ impl EffectGlyphs {
                 let id = if let Some(&id) = self.ids.get(&key) {
                     id
                 } else {
-                    let id: CustomGlyphId = self.next_id;
+                    // Unreachable in practice: `needs_reset` fires well
+                    // before. If one preparation still outgrows the
+                    // headroom, drop the glyph rather than alias an ID.
+                    let Ok(id) = CustomGlyphId::try_from(self.next_id) else {
+                        continue;
+                    };
                     self.next_id += 1;
                     self.ids.insert(key, id);
                     self.keys_by_id.insert(id, key);
