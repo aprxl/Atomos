@@ -234,3 +234,18 @@ popup.set_clip_shape(Some(ClipShape::Rectangle {
 
 See `examples/clip_demo.rs` for a full walkthrough of both clip paths,
 including a per-frame animated mask.
+
+## Text layout for editing (`Layer::layout_text`)
+
+```rust
+let layout = layer.layout_text(&text, &font, &params); // same inputs as draw_text
+layout.size();                       // == get_text_size
+layout.caret_rect(byte) -> TextRect  // zero-width caret box at a byte offset
+layout.hit_test((x, y)) -> usize     // nearest caret stop to a click
+layout.selection_rects(a..b) -> Vec<TextRect>
+layout.lines() -> &[TextLine]        // byte range, top, height, width per line
+```
+
+Geometry comes from the shaped layout, not prefix measurement, so it stays correct across ligatures (a boundary inside one is interpolated), combining marks (carets stop only at grapheme boundaries) and right-to-left runs (x is not monotonic in byte order; `selection_rects` can return several rectangles per line). It includes the same advance corrections the synthetic weight/width effects apply when drawing, so a caret never drifts from the ink.
+
+Everything is logical pixels relative to the text's top-left; add the position (and any `Alignment` shift derived from `size()`) you gave `draw_text`. Offsets are UTF-8 byte offsets on character boundaries. Lines break only at `\n`: wrapping to a width is not part of this layout yet.

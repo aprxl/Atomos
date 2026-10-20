@@ -288,6 +288,19 @@ impl TextStack {
         measure_shaped_buffer_with(&self.shape_cache[&key].buffer, |_| effect)
     }
 
+    /// The interaction geometry of one `draw_text`-style string, in
+    /// physical pixels (the caller converts to logical).
+    pub(super) fn layout(
+        &mut self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> super::text_layout::TextLayout {
+        let key = self.ensure_shaped(text, font, font_parameters);
+        let effect = GlyphEffect::from(font_parameters);
+        super::text_layout::TextLayout::from_buffer(&self.shape_cache[&key].buffer, text, effect)
+    }
+
     /// Look up (or shape and insert) the cached buffer for one
     /// `draw_text`-style string, returning its cache key. The entry is
     /// stamped with the current frame either way.

@@ -173,6 +173,7 @@ dependencies = [
  "pollster",
  "ropey",
  "swash",
+ "unicode-segmentation",
  "wgpu",
  "winit",
 ]

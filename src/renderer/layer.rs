@@ -37,7 +37,7 @@ use super::pixels::Pixels;
 use super::rounding::Rounding;
 use super::shader::ShaderEffect;
 use super::text_stack::TextStack;
-use super::{Alignment, Font, FontParameters, TextSpan, Vertex};
+use super::{Alignment, Font, FontParameters, TextLayout, TextSpan, Vertex};
 
 use lyon::tessellation::{
     FillRule as LyonFillRule, LineCap as LyonLineCap, LineJoin as LyonLineJoin, StrokeOptions,
@@ -3133,6 +3133,29 @@ impl Layer {
     /// [`Layer::get_text_size`], for a [`Layer::draw_styled_text`] call —
     /// the combined bounding box every span in `spans` would occupy
     /// shaped together, before any [`Alignment`] offset.
+    /// Shape `text` exactly as [`Layer::draw_text`] would and return where
+    /// everything lands, for editing and interaction: caret rectangles,
+    /// click hit-testing and selection rectangles that stay correct across
+    /// ligatures, combining marks and right-to-left runs. See
+    /// [`TextLayout`]. Coordinates are logical pixels relative to the text's
+    /// top-left; offset them by the position given to `draw_text` (after any
+    /// [`Alignment`] shift computed from [`TextLayout::size`]).
+    pub fn layout_text(
+        &self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> TextLayout {
+        let s = self.scale_factor();
+        let scaled = font_parameters.scaled(s);
+        self.0
+            .borrow()
+            .text_stack
+            .borrow_mut()
+            .layout(text, font, &scaled)
+            .unscaled(s)
+    }
+
     pub fn get_styled_text_size(&self, spans: &[TextSpan]) -> (f32, f32) {
         let s = self.scale_factor();
         let scaled_spans: Vec<TextSpan> = spans

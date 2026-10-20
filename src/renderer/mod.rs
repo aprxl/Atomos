@@ -35,6 +35,7 @@ mod path_paint;
 mod pixels;
 mod rounding;
 mod shader;
+mod text_layout;
 mod text_span;
 mod text_stack;
 
@@ -63,6 +64,7 @@ pub use path_paint::{FillRule, LineCap, LineJoin, PathPaint, Stroke};
 pub use pixels::Pixels;
 pub use rounding::Rounding;
 pub use shader::{ColorMatrix, ShaderEffect};
+pub use text_layout::{TextLayout, TextLine, TextRect};
 pub use text_span::TextSpan;
 
 /// MSAA sample count for every layer's own render pass (the solid, image,

@@ -281,3 +281,92 @@ fn animating_effect_parameters_reuses_the_effect_textures() {
     assert_eq!(layer.0.borrow().effect_rebuilds, before);
     assert_near(scene.pixel(4, 4), [0, 255, 255, 255], 1);
 }
+
+mod text_layout {
+    use super::*;
+    use crate::renderer::{Font, FontParameters, TextLayout};
+
+    /// Lay out `text` with a system font, or `None` on a machine with no
+    /// adapter or no usable font (the tests then pass vacuously).
+    fn laid_out(text: &str) -> Option<TextLayout> {
+        let mut scene = scene()?;
+        let layer = scene.layer();
+        let layout = layer.layout_text(
+            text,
+            &Font::Named("sans-serif".into()),
+            &FontParameters::new(20.0),
+        );
+        (layout.size().0 > 0.0).then_some(layout)
+    }
+
+    #[test]
+    fn carets_advance_across_a_line_and_end_at_its_width() {
+        let Some(layout) = laid_out("hello") else {
+            return;
+        };
+        let xs: Vec<f32> = (0..=5).map(|b| layout.caret_rect(b).x).collect();
+        assert_eq!(xs[0], 0.0);
+        assert!(xs.windows(2).all(|w| w[1] > w[0]), "{xs:?}");
+        assert!((xs[5] - layout.size().0).abs() < 0.5, "{xs:?}");
+    }
+
+    #[test]
+    fn hit_testing_inverts_caret_positions() {
+        let Some(layout) = laid_out("hello") else {
+            return;
+        };
+        for byte in 0..=5 {
+            let rect = layout.caret_rect(byte);
+            let y = rect.y + rect.height / 2.0;
+            assert_eq!(layout.hit_test((rect.x, y)), byte);
+        }
+        assert_eq!(layout.hit_test((-50.0, 5.0)), 0);
+        assert_eq!(layout.hit_test((5000.0, 5.0)), 5);
+    }
+
+    #[test]
+    fn a_selection_spans_its_carets() {
+        let Some(layout) = laid_out("hello") else {
+            return;
+        };
+        let rects = layout.selection_rects(1..4);
+        assert_eq!(rects.len(), 1);
+        let (a, b) = (layout.caret_rect(1).x, layout.caret_rect(4).x);
+        assert!((rects[0].x - a).abs() < 0.5);
+        assert!((rects[0].x + rects[0].width - b).abs() < 0.5);
+        assert!(layout.selection_rects(2..2).is_empty());
+    }
+
+    #[test]
+    fn lines_split_at_newlines_including_empty_ones() {
+        let Some(layout) = laid_out("ab\n\ncd") else {
+            return;
+        };
+        assert_eq!(layout.lines().len(), 3);
+        assert_eq!(layout.lines()[2].range, 4..6);
+        let (first, third) = (layout.caret_rect(0), layout.caret_rect(4));
+        assert!(third.y > first.y);
+        assert_eq!(layout.hit_test((5000.0, 10_000.0)), 6);
+        let across = layout.selection_rects(1..5);
+        assert_eq!(across.len(), 2, "the empty line paints nothing: {across:?}");
+    }
+
+    #[test]
+    fn a_combining_mark_is_not_a_caret_stop() {
+        // "e" + combining acute shapes as one cluster of 3 bytes.
+        let Some(layout) = laid_out("e\u{301}x") else {
+            return;
+        };
+        assert_eq!(layout.caret_rect(1).x, layout.caret_rect(0).x);
+        assert!(layout.caret_rect(3).x > layout.caret_rect(0).x);
+    }
+
+    #[test]
+    fn right_to_left_text_runs_leftward() {
+        let Some(layout) = laid_out("\u{5d0}\u{5d1}\u{5d2}") else {
+            return;
+        };
+        let (start, end) = (layout.caret_rect(0).x, layout.caret_rect(6).x);
+        assert!(start > end, "logical start is on the right: {start} {end}");
+    }
+}
