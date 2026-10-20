@@ -481,7 +481,9 @@ struct App {
 impl App {
     fn new() -> Self {
         let mut scheduler = FrameScheduler::new();
-        scheduler.set_target_fps(Some(5.0));
+        // 30 fps while animating: slow enough to see the pacing work, fast
+        // enough not to look broken. Input is never throttled by this.
+        scheduler.set_target_fps(Some(30.0));
 
         Self {
             window: None,
