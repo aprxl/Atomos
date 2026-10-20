@@ -581,13 +581,20 @@ impl Renderer {
     }
 
     /// Update the window scale factor — call this from
-    /// `WindowEvent::ScaleFactorChanged`. Layers pick up the new value
-    /// lazily (same pattern as [`Renderer::resize`]/surface size), so this
-    /// is just a cheap field write; no GPU resources need rebuilding here
-    /// (a `ScaleFactorChanged` is virtually always paired with a `Resized`
-    /// carrying the new physical size, which `resize` already handles).
+    /// `WindowEvent::ScaleFactorChanged`, before drawing that frame. Every
+    /// live layer switches immediately and rebuilds its retained content at
+    /// the new density on its next render (a `ScaleFactorChanged` is
+    /// virtually always paired with a `Resized` carrying the new physical
+    /// size, which `resize` already handles).
     pub fn set_scale_factor(&mut self, scale_factor: f64) {
         self.scale_factor = scale_factor;
+        // Pushed to every live layer now, not at the next render, so a
+        // `Layer::scale_factor` or text measurement taken before the next
+        // frame already reflects the new density. Layers store logical
+        // commands, so retained content follows without being redrawn.
+        for layer in self.layers.iter().filter_map(std::rc::Weak::upgrade) {
+            layer.borrow_mut().set_scale_factor(scale_factor as f32);
+        }
     }
 
     /// Record a new window size. The swap chain is reconfigured at the top

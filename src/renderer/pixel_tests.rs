@@ -90,3 +90,38 @@ fn a_clip_shape_cuts_the_layer_outside_it() {
     assert_near(scene.pixel(32, 32), [255, 255, 255, 255], 1);
     assert_near(scene.pixel(2, 2), [0, 0, 0, 255], 0);
 }
+
+#[test]
+fn retained_content_follows_a_dpi_change() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (8.0, 8.0),
+        Color::rgb(255, 0, 0),
+        Rounding::NONE,
+    );
+    scene.frame(1.0);
+    assert_near(scene.pixel(12, 4), [0, 0, 0, 255], 0);
+
+    // No redraw: the layer holds logical commands, so doubling the scale
+    // must double the rectangle to 16x16 physical pixels.
+    scene.frame(2.0);
+    assert_near(scene.pixel(12, 4), [255, 0, 0, 255], 1);
+    assert_near(scene.pixel(20, 4), [0, 0, 0, 255], 0);
+}
+
+#[test]
+fn content_drawn_before_the_first_render_uses_the_scale_it_renders_at() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (8.0, 8.0),
+        Color::rgb(255, 0, 0),
+        Rounding::NONE,
+    );
+    scene.frame(2.0);
+    // Drawn while the layer still reported scale 1, rendered at 2.
+    assert_near(scene.pixel(12, 4), [255, 0, 0, 255], 1);
+}

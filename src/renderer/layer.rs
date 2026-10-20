@@ -1581,19 +1581,26 @@ impl LayerInner {
         }
     }
 
-    /// Pick up a new DPI scale factor. Cached `DrawCommand`s/GPU buffers
-    /// are left alone — they're already baked to physical pixels at the
-    /// *old* scale, so nothing looks wrong until content is next redrawn
-    /// (`Automatic` layers redraw every frame anyway; a `Manual` layer's
-    /// static content simply stays crisp at whatever scale it was drawn
-    /// at, same as a raster image would, until the caller redraws it).
-    fn set_scale_factor(&mut self, scale_factor: f32) {
+    /// Pick up a new DPI scale factor. Pending commands are logical, so a
+    /// change just invalidates the built geometry and prepared text; the
+    /// next rebuild derives physical sizes from the new factor.
+    pub(super) fn set_scale_factor(&mut self, scale_factor: f32) {
         let changed = self.scale_factor != scale_factor;
         self.scale_factor = scale_factor;
-        // A clip mask's geometry is baked at physical scale (same as every
-        // `DrawCommand`), but unlike drawn content nothing re-issues it per
-        // frame — re-derive it from the logical-units shape here so a DPI
-        // change doesn't leave the mask at the old density.
+        if changed {
+            // Commands are stored in logical pixels, so retained content
+            // only needs rebuilding (and its text re-preparing) at the new
+            // density: nothing for the caller to redraw.
+            match &mut self.invalidation {
+                InvalidationState::Automatic { last_hash } => *last_hash = None,
+                InvalidationState::Manual { dirty } => *dirty = true,
+            }
+            self.last_text_hash = None;
+        }
+        // A clip mask's geometry is baked at physical scale and nothing
+        // re-issues it per frame, so re-derive it from the logical-units
+        // shape here; a DPI change must not leave the mask at the old
+        // density.
         if changed && self.clip_shape.is_some() {
             self.rebuild_mask();
         }
@@ -1742,6 +1749,8 @@ impl LayerInner {
         // needed for correctness, not just the hash). Must happen before
         // `pending` is cleared below (an `Automatic` layer's text commands
         // wouldn't survive to `render_to_texture` otherwise).
+        // Commands convert to physical pixels only here, against the scale
+        // factor current right now.
         let mut text_hasher = DefaultHasher::new();
         let mut has_text = false;
         for command in &self.pending {
@@ -1768,10 +1777,11 @@ impl LayerInner {
         };
 
         if needs_prepare {
+            let physical = self.physical_commands();
             if let Err(e) = self.text_stack.borrow_mut().prepare_layer(
                 &self.device,
                 &self.queue,
-                &self.pending,
+                &physical,
                 &mut self.text_renderer,
             ) {
                 eprintln!(
@@ -1792,6 +1802,14 @@ impl LayerInner {
         should_rebuild
     }
 
+    /// The pending commands at the current physical scale.
+    fn physical_commands(&self) -> Vec<DrawCommand> {
+        self.pending
+            .iter()
+            .map(|command| command.to_physical(self.scale_factor))
+            .collect()
+    }
+
     fn build_buffers(&mut self) {
         let mut vertices: Vec<Vertex> = Vec::new();
         // u32 indices, not u16 — a busy layer (an editor viewport's worth of
@@ -1806,7 +1824,8 @@ impl LayerInner {
         let mut tessellator = FillTessellator::new();
         let mut stroke_tessellator = StrokeTessellator::new();
         self.image_draws.clear();
-        for command in &self.pending {
+        let physical = self.physical_commands();
+        for command in &physical {
             // `Image` needs its own texture/bind group, not a shared
             // vertex/index buffer — built separately below.
             if let DrawCommand::Image {
@@ -2691,12 +2710,11 @@ impl Layer {
         color: Color,
         rounding: Rounding,
     ) {
-        let s = self.scale_factor();
         self.0.borrow_mut().push(DrawCommand::Rectangle {
-            top_left: [top_left.0 * s, top_left.1 * s],
-            size: [size.0 * s, size.1 * s],
+            top_left: [top_left.0, top_left.1],
+            size: [size.0, size.1],
             color,
-            rounding: rounding.scaled(s),
+            rounding,
         });
     }
 
@@ -2711,9 +2729,8 @@ impl Layer {
     /// deferred-work note on why (lyon vertex-identity guarantees for
     /// simple polygons need a closer look first).
     pub fn draw_polygon(&self, vertices: &[(f32, f32)], color: Color) {
-        let s = self.scale_factor();
         self.0.borrow_mut().push(DrawCommand::Polygon {
-            vertices: vertices.iter().map(|&(x, y)| [x * s, y * s]).collect(),
+            vertices: vertices.iter().map(|&(x, y)| [x, y]).collect(),
             color,
         });
     }
@@ -2730,10 +2747,9 @@ impl Layer {
             !matches!(color, Color::PerVertex(_)),
             "draw_circle doesn't support Color::PerVertex — use Solid or Gradient"
         );
-        let s = self.scale_factor();
         self.0.borrow_mut().push(DrawCommand::Circle {
-            center: [center.0 * s, center.1 * s],
-            radius: radius * s,
+            center: [center.0, center.1],
+            radius,
             color,
         });
     }
@@ -2762,8 +2778,7 @@ impl Layer {
         position: (f32, f32),
         paint: PathPaint,
     ) -> Result<(), lyon_extra::parser::ParseError> {
-        let s = self.scale_factor();
-        self.push_path_command(d, [position.0 * s, position.1 * s], s, paint)
+        self.push_path_command(d, [position.0, position.1], 1.0, paint)
     }
 
     /// Draw an SVG icon whose `d` was authored against `viewbox` (the
@@ -2790,14 +2805,12 @@ impl Layer {
         paint: PathPaint,
     ) -> Result<(), lyon_extra::parser::ParseError> {
         let (min_x, min_y, vb_width, _vb_height) = viewbox;
-        let dpi_s = self.scale_factor();
         let icon_scale = size.0 / vb_width;
-        let scale = icon_scale * dpi_s;
-        let position_physical = [
-            dpi_s * (position.0 - min_x * icon_scale),
-            dpi_s * (position.1 - min_y * icon_scale),
+        let position = [
+            position.0 - min_x * icon_scale,
+            position.1 - min_y * icon_scale,
         ];
-        self.push_path_command(d, position_physical, scale, paint)
+        self.push_path_command(d, position, icon_scale, paint)
     }
 
     /// Shared by [`Layer::draw_path`]/[`Layer::draw_svg_icon`] — both just
@@ -2855,11 +2868,10 @@ impl Layer {
     ///   4-cornered quad. [`Color::rgb(0xFF, 0xFF, 0xFF)`](Color::rgb) (or
     ///   any full-white solid color) leaves the image untinted.
     pub fn draw_image(&self, pixels: Pixels, top_left: (f32, f32), size: (f32, f32), tint: Color) {
-        let s = self.scale_factor();
         self.0.borrow_mut().push(DrawCommand::Image {
             pixels,
-            top_left: [top_left.0 * s, top_left.1 * s],
-            size: [size.0 * s, size.1 * s],
+            top_left: [top_left.0, top_left.1],
+            size: [size.0, size.1],
             tint,
         });
     }
@@ -2911,12 +2923,11 @@ impl Layer {
             matches!(color, Color::Solid(_)),
             "draw_text only supports Color::Solid"
         );
-        let s = self.scale_factor();
         self.0.borrow_mut().push(DrawCommand::Text {
             text: text.to_string(),
-            position: [position.0 * s, position.1 * s],
+            position: [position.0, position.1],
             font,
-            font_parameters: font_parameters.scaled(s),
+            font_parameters,
             alignment,
             color,
         });
@@ -2964,17 +2975,9 @@ impl Layer {
                 .all(|span| matches!(span.color, Color::Solid(_))),
             "draw_styled_text only supports Color::Solid per span"
         );
-        let s = self.scale_factor();
-        let scaled_spans = spans
-            .iter()
-            .map(|span| TextSpan {
-                font_parameters: span.font_parameters.scaled(s),
-                ..span.clone()
-            })
-            .collect();
         self.0.borrow_mut().push(DrawCommand::StyledText {
-            spans: scaled_spans,
-            position: [position.0 * s, position.1 * s],
+            spans: spans.to_vec(),
+            position: [position.0, position.1],
             alignment,
         });
     }

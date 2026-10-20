@@ -43,7 +43,7 @@ let layer = renderer.new_layer_top(LayerInvalidation::Automatic);
 | `new_layer_bottom(invalidation) -> Layer` | drawn first (below everything) |
 | `render() -> Result<FrameOutcome, RenderError>` | one frame. `Presented`: shown. `Retry`: nothing shown but a retry can succeed (timeout, outdated or lost surface, resize waiting on the GPU queue); ask for another frame. `Occluded`: window not visible; wait for `WindowEvent::Occluded(false)`. Report it with `FrameScheduler::finish_frame`. A lost surface is re-created internally; `Err(SurfaceLost)` only if that fails |
 | `resize(width: u32, height: u32)` | **physical** pixels, straight from `WindowEvent::Resized` |
-| `set_scale_factor(f64)` / `scale_factor() -> f64` | wire to `ScaleFactorChanged` |
+| `set_scale_factor(f64)` / `scale_factor() -> f64` | wire to `ScaleFactorChanged`. Layers store logical-pixel commands and convert at build time, so retained content re-renders at the new density with no redraw |
 | `get_frametime() -> Duration` | wall-clock frame-to-frame |
 | `get_render_time() -> Duration` | wall-clock time since the renderer was created (not a render cost) |
 | `get_gpu_frametime() -> Option<Duration>` | GPU timestamps; `None` if unsupported |

@@ -1,12 +1,16 @@
 //! [`Pixels`] — a raw RGBA8 image buffer for `draw_image`.
 
-/// A raw RGBA8 pixel buffer, row-major, no padding between rows.
+use std::rc::Rc;
+
+/// A raw RGBA8 pixel buffer, row-major, no padding between rows. The bytes
+/// are shared, so cloning (which the renderer does freely) never copies the
+/// image.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pixels {
     pub width: u32,
     pub height: u32,
     /// Length must be exactly `width * height * 4`.
-    pub data: Vec<u8>,
+    pub data: Rc<[u8]>,
 }
 
 impl Pixels {
@@ -23,7 +27,7 @@ impl Pixels {
         Self {
             width,
             height,
-            data,
+            data: data.into(),
         }
     }
 }

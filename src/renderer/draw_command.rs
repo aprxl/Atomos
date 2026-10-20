@@ -12,6 +12,12 @@ use super::path_paint::{PathPaint, Stroke};
 use super::{Alignment, Font, FontParameters};
 
 /// One `Layer::draw_*` call, queued until the layer is next (re)built.
+///
+/// Every length is in **logical** pixels, exactly as the caller supplied it.
+/// The layer converts to physical pixels with [`DrawCommand::to_physical`]
+/// at the moment it builds GPU geometry, against whatever scale factor is
+/// current then. Storing physical values instead baked the scale in at call
+/// time, so retained content stayed at the old density after a DPI change.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum DrawCommand {
     Rectangle {
@@ -82,6 +88,92 @@ pub(super) enum DrawCommand {
     },
 }
 
+impl DrawCommand {
+    /// This command with every logical length multiplied by `s`, ready to
+    /// tessellate or shape at the physical size.
+    pub(super) fn to_physical(&self, s: f32) -> DrawCommand {
+        let pair = |p: &[f32; 2]| [p[0] * s, p[1] * s];
+        match self {
+            DrawCommand::Rectangle {
+                top_left,
+                size,
+                color,
+                rounding,
+            } => DrawCommand::Rectangle {
+                top_left: pair(top_left),
+                size: pair(size),
+                color: color.clone(),
+                rounding: rounding.scaled(s),
+            },
+            DrawCommand::Polygon { vertices, color } => DrawCommand::Polygon {
+                vertices: vertices.iter().map(pair).collect(),
+                color: color.clone(),
+            },
+            DrawCommand::Circle {
+                center,
+                radius,
+                color,
+            } => DrawCommand::Circle {
+                center: pair(center),
+                radius: radius * s,
+                color: color.clone(),
+            },
+            DrawCommand::Path {
+                d,
+                position,
+                scale,
+                paint,
+            } => DrawCommand::Path {
+                d: d.clone(),
+                position: pair(position),
+                scale: scale * s,
+                paint: paint.clone(),
+            },
+            DrawCommand::Image {
+                pixels,
+                top_left,
+                size,
+                tint,
+            } => DrawCommand::Image {
+                pixels: pixels.clone(),
+                top_left: pair(top_left),
+                size: pair(size),
+                tint: tint.clone(),
+            },
+            DrawCommand::Text {
+                text,
+                position,
+                font,
+                font_parameters,
+                alignment,
+                color,
+            } => DrawCommand::Text {
+                text: text.clone(),
+                position: pair(position),
+                font: font.clone(),
+                font_parameters: font_parameters.scaled(s),
+                alignment: *alignment,
+                color: color.clone(),
+            },
+            DrawCommand::StyledText {
+                spans,
+                position,
+                alignment,
+            } => DrawCommand::StyledText {
+                spans: spans
+                    .iter()
+                    .map(|span| TextSpan {
+                        font_parameters: span.font_parameters.scaled(s),
+                        ..span.clone()
+                    })
+                    .collect(),
+                position: pair(position),
+                alignment: *alignment,
+            },
+        }
+    }
+}
+
 /// Manual `Hash`, since `f32` (in positions/sizes/colors) isn't `Hash` —
 /// every float is hashed by its bit pattern instead. Used by
 /// [`super::LayerInvalidation::Automatic`] layers to detect whether this
@@ -142,7 +234,11 @@ impl Hash for DrawCommand {
                 state.write_u8(4);
                 pixels.width.hash(state);
                 pixels.height.hash(state);
-                pixels.data.hash(state);
+                // Identity, not contents: the bytes are immutable and
+                // shared, and scanning a large image every frame is the
+                // cost this avoids. A fresh copy of equal pixels just
+                // rebuilds once.
+                std::ptr::hash(pixels.data.as_ptr(), state);
                 hash_f32_pair(top_left, state);
                 hash_f32_pair(size, state);
                 tint.hash_bits(state);
