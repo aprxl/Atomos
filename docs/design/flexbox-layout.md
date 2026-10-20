@@ -1,10 +1,20 @@
 # Flexbox layout for Atomos
 
-Status: **proposal, awaiting owner decisions (section 8)**. Nothing is implemented. Date: 2026-10-20.
+Status: **phase 1 implemented** (`src/layout/`, `examples/layout_demo.rs`); decisions in section 8 were approved. The declarative builder (3b) is phase 2 and not built. Date: 2026-10-20.
+
+## Implementation notes (what differs from the proposal below)
+
+- **Measured numbers** (release, `cargo test --release --lib layout::tests::numbers -- --ignored --nocapture`, fake text measurer, one Windows dev machine): `size_of::<taffy::Style>()` = 248 bytes with the chosen features; Atomos's per-node side entry = 80 bytes (+8 for an optional paint box); solver per-node data is on top of that (not measured separately). 201 nodes (20 rows, 20 wrapping text leaves): cold solve 177 us, whole-tree re-wrap on a width change 61 us per solve, one text leaf changed 7 us, an unchanged `compute` call 3 ns. These exclude real text shaping, which the renderer's shape cache owns.
+- **Min-content text** does not need a `text_stack.rs` change after all: `Measurer::min_content_width` defaults to the widest whitespace-separated word, measured with the existing `get_text_size`. A true word-only wrap measure can replace it later if CJK or hyphenation matters.
+- `Layer` implements `Measurer`; `compute` reads the scale factor from it.
+- `Style::fixed(x)` implements the Typewritter mapping (basis x, no grow or shrink, zero minimums); `Style::grow(w)` sets a zero basis.
+- Hit-testing is `hit(point)` (deepest node, later siblings on top, `overflow: hidden` honoured) and `hit_tag(point)` (nearest tagged ancestor).
+- Not done: virtualisation and scroll offsets, grid, the declarative builder, porting any Typewritter component.
+
 
 Goal: declare elements the way you declare `div`s (size, padding, gap, grow, align, position) and get their rects computed, then draw, clip and hit-test from the same rects. Top principles: performance, low memory, then developer experience.
 
-Anything marked **[estimate]** was not measured.
+Anything marked **[estimate]** was not measured; section-level measured numbers are under "Implementation notes".
 
 ---
 
@@ -22,7 +32,7 @@ So the missing piece is not the shell skeleton; it is a general solver for *comp
 | | Wrap `taffy` | Write our own |
 |---|---|---|
 | Correctness | Passes the CSS flexbox test suite (wrap, shrink, min/max, aspect ratio, baselines, align-content, absolute inset, percent). Used by Bevy UI, Dioxus, Zed's GPUI. | Each of those is a corner case we would re-discover. A correct subset is ~1.5-2k lines plus tests. |
-| Memory | Per-node style, two layouts and a 9-entry cache **[estimate: several hundred bytes to ~1 KB per node, to be measured with the chosen features]**. At hundreds of nodes that is irrelevant; at tens of thousands (a virtualised list gone wrong) it is not, see section 7. | Whatever we choose. |
+| Memory | Per-node style, two layouts and a 9-entry cache (248 bytes of style per node with these features; see the measured numbers above). At hundreds of nodes that is irrelevant; at tens of thousands (a virtualised list gone wrong) it is not, see section 7. | Whatever we choose. |
 | Speed | Per-node cache; a subtree whose inputs did not change is not re-solved. | We would build the same cache. |
 | Cost | One dependency (`slotmap`; `smallvec` only with `grid`). | Maintenance. |
 
