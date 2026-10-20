@@ -75,9 +75,13 @@ draw_image(pixels: Pixels, top_left: (f32,f32), size: (f32,f32), tint: Color)
 draw_image_from_file(path: &Path, top_left: (f32,f32), size: (f32,f32), tint: Color) -> Result<(), ImageError>
 draw_text(text: &str, position: (f32,f32), color: Color, alignment: Alignment,
           font: Font, font_parameters: FontParameters)      // Solid only
+draw_wrapped_text(text, position, max_width, color, alignment, font, font_parameters)
 draw_styled_text(spans: &[TextSpan], position: (f32,f32), alignment: Alignment)
+draw_wrapped_styled_text(spans: &[TextSpan], position, max_width, alignment)
 get_text_size(text, &Font, &FontParameters) -> (f32, f32)   // logical px, pre-alignment
+get_wrapped_text_size(text, max_width, &Font, &FontParameters) -> (f32, f32)
 get_styled_text_size(spans: &[TextSpan]) -> (f32, f32)
+get_wrapped_styled_text_size(spans: &[TextSpan], max_width: f32) -> (f32, f32)
 set_effect(effect: Option<ShaderEffect>)
 with_clip(shape: ClipShape, |layer| ..) -> Result<R, ParseError>   // clips what the closure draws
 set_clip(shape: Option<ClipShape>) -> Result<(), ParseError>      // clips the whole layer, after any effect

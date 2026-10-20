@@ -603,7 +603,8 @@ cleared to black).
 
 Implemented: stages 1 to 4 and the counters of stage 0/6 (`Renderer::stats`).
 Not implemented: stage 5 (bounded group textures and the scratch pool),
-stage 6 budgets and demotion, stage 7 (bounds-disjoint batch merging).
+stage 6 budgets and demotion. Stage 7 (bounds-disjoint batch merging) is
+implemented, see the end of this section.
 Decisions taken: direct replay by default (Q1), closure `with_clip` and the
 old setters removed (Q2), `Custom` effect `uv` stays surface-wide for now
 since groups are still surface-sized (Q3), stencil always attached (Q4),
@@ -639,3 +640,34 @@ Findings:
 - An adaptive sample count (4x above a pixel budget) would cut the 4K figure
   to 158 MiB; the pipelines are built for one count at startup, so this needs
   an owner decision on quality versus memory.
+
+### Stage 7: what was built and measured (2026-10-20)
+
+`batching.rs` groups the items between two clip changes (clips stay
+barriers). An item joins the nearest earlier group of its kind (solid, image,
+text) when its bounds overlap nothing in the groups it hops over; touching
+edges do not overlap, a NaN does. Bounds are exact where they can be: the
+tessellated vertices for geometry, the quad for images, and the glyph bitmap
+rectangles (plus 1 px) for text, so an editor's abutting line backgrounds do
+not block each other. Only the index buffer is reordered; vertices stay in
+command order. Placement is bounded (2048 rectangle checks per item).
+
+Text groups are split into batches of at most 16 commands (see
+`MAX_TEXT_COMMANDS_PER_BATCH`): an unchanged batch skips its glyphon prepare,
+so one giant batch made a one-line edit re-prepare the whole viewport.
+
+`editor_viewport_with_and_without_merging` (1080p, per line: background,
+4-span styled line; every 7th line a selection stripe; one cursor): median ms
+per frame, merging off / on.
+
+| Scene | ops off -> on | text batches off -> on | ms off | ms on (unbounded) | ms on (16/batch) |
+|---|---|---|---:|---:|---:|
+| 30 lines, one line edited | 61 -> 4 | 30 -> 2 | 0.281 | 0.282 | 0.263 |
+| 120 lines, one line edited | 241 -> 10 | 120 -> 8 | 0.578 | 0.747 | 0.581 |
+| 30 lines, all change (scroll) | 61 -> 4 | 30 -> 2 | 0.394 | 0.300 | 0.336 |
+| 120 lines, all change (scroll) | 241 -> 10 | 120 -> 8 | 1.099 | 0.827 | 0.881 |
+
+Same RTX 5070 Ti; an integrated GPU has not been measured. The randomized
+`merging_never_changes_a_pixel` test renders 48 scenes (shapes, text,
+styled text, images, clips) with merging on and off and requires identical
+pixels; with the overlap test disabled it fails on the first seed.

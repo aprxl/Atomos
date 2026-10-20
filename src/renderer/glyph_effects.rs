@@ -173,9 +173,52 @@ impl EffectGlyphs {
         color: [u8; 4],
     ) -> Vec<CustomGlyph> {
         let uniform_color = Color::rgba(color[0], color[1], color[2], color[3]);
-        self.layout_to_custom_glyphs_with(font_system, buffer, position, |_glyph| {
+        self.layout_to_custom_glyphs_with(font_system, buffer, position, true, |_glyph| {
             (effect, uniform_color)
         })
+    }
+
+    /// The rectangle (`[min_x, min_y, max_x, max_y]`) every glyph of
+    /// `buffer` inks, for ordering decisions made before text is prepared.
+    /// Rasterizes into the same cache [`Self::layout_to_custom_glyphs`]
+    /// reads, but assigns no atlas IDs, so it never moves the ID space
+    /// towards a reset. `None` when nothing is drawn.
+    pub fn ink_bounds(
+        &mut self,
+        font_system: &mut FontSystem,
+        buffer: &Buffer,
+        position: (f32, f32),
+        span_effects: Option<&[GlyphEffect]>,
+        uniform_effect: GlyphEffect,
+    ) -> Option<[f32; 4]> {
+        let glyphs =
+            self.layout_to_custom_glyphs_with(font_system, buffer, position, false, |glyph| {
+                let effect = span_effects.map_or(uniform_effect, |effects| {
+                    effects
+                        .get(glyph.metadata)
+                        .copied()
+                        .unwrap_or(GlyphEffect::NEUTRAL)
+                });
+                (effect, Color::rgba(0xFF, 0xFF, 0xFF, 0xFF))
+            });
+        let mut bounds: Option<[f32; 4]> = None;
+        for glyph in &glyphs {
+            let rect = [
+                glyph.left,
+                glyph.top,
+                glyph.left + glyph.width,
+                glyph.top + glyph.height,
+            ];
+            bounds = Some(bounds.map_or(rect, |b| {
+                [
+                    b[0].min(rect[0]),
+                    b[1].min(rect[1]),
+                    b[2].max(rect[2]),
+                    b[3].max(rect[3]),
+                ]
+            }));
+        }
+        bounds
     }
 
     /// Per-span variant, for `Layer::draw_styled_text`: every span in a
@@ -195,7 +238,7 @@ impl EffectGlyphs {
         position: (f32, f32),
         span_effects: &[GlyphEffect],
     ) -> Vec<CustomGlyph> {
-        self.layout_to_custom_glyphs_with(font_system, buffer, position, |glyph| {
+        self.layout_to_custom_glyphs_with(font_system, buffer, position, true, |glyph| {
             let effect = span_effects
                 .get(glyph.metadata)
                 .copied()
@@ -217,6 +260,7 @@ impl EffectGlyphs {
         font_system: &mut FontSystem,
         buffer: &Buffer,
         position: (f32, f32),
+        allocate_ids: bool,
         mut effect_and_color: impl FnMut(&LayoutGlyph) -> (GlyphEffect, Color),
     ) -> Vec<CustomGlyph> {
         let (left, top) = position;
@@ -298,7 +342,9 @@ impl EffectGlyphs {
                     continue;
                 }
 
-                let id = if let Some(&id) = self.ids.get(&key) {
+                let id = if !allocate_ids {
+                    0 // placeholder: the caller reads only the geometry
+                } else if let Some(&id) = self.ids.get(&key) {
                     id
                 } else {
                     // Unreachable in practice: `needs_reset` fires well

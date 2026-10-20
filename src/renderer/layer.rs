@@ -38,6 +38,7 @@ use lyon::tessellation::{
 };
 use lyon_extra::parser::{ParserOptions, PathParser, Source};
 
+use super::batching::{Batcher, Kind, Rect};
 use super::color::Color;
 use super::draw_command::DrawCommand;
 use super::path_paint::{FillRule, LineCap, LineJoin, PathPaint, Stroke};
@@ -1076,6 +1077,12 @@ fn run_fullscreen_pass(
 
 /// The GPU/CPU state shared by every clone of a [`Layer`]. See the module
 /// doc for the overall design.
+/// Most text commands one glyphon renderer prepares together. Merging text
+/// into one batch saves draw calls, buffers and per-batch overhead, but an
+/// edit re-prepares the whole batch; this bounds that (see the editor
+/// viewport benchmark in `bench.rs`).
+const MAX_TEXT_COMMANDS_PER_BATCH: usize = 16;
+
 /// One step of a layer's draw order. See `LayerInner::ops`.
 #[derive(Clone, Debug, PartialEq)]
 enum ReplayOp {
@@ -1161,6 +1168,9 @@ pub(super) struct LayerInner {
     // can only draw everything it prepared in one call, so a text run that
     // must sit between other ops needs a renderer of its own.
     text_batches: Vec<TextBatch>,
+    // Whether `build_buffers` may reorder non-overlapping items into fewer
+    // groups; tests turn it off to compare pixels.
+    merge_batches: bool,
 
     // Shared, pre-built effect pipelines/layouts, cloned in from
     // `LayerPipelines` the same way `solid_pipeline`/`image_pipeline`/
@@ -1319,6 +1329,7 @@ impl LayerInner {
             text_stack,
             ops: Vec::new(),
             text_batches: Vec::new(),
+            merge_batches: true,
             blur_pipeline: pipelines.blur_pipeline.clone(),
             blur_bind_group_layout: pipelines.blur_bind_group_layout.clone(),
             colormatrix_pipeline: pipelines.colormatrix_pipeline.clone(),
@@ -1890,7 +1901,13 @@ impl LayerInner {
         // each) can exceed 65,535 vertices, and a u16 `base` would then wrap
         // *silently* into corrupted geometry. The doubled index memory is
         // noise next to the vertex data itself.
+        //
+        // `indices` is the final buffer, in replay order. Solid items are
+        // tessellated into `item_indices` in command order first, then
+        // copied into `indices` in the order the batcher settled on; only
+        // indices are ever reordered, vertices stay where they were written.
         let mut indices: Vec<u32> = Vec::new();
+        let mut item_indices: Vec<u32> = Vec::new();
         // One tessellator (each) for the whole rebuild — lyon reuses its
         // internal allocations across `tessellate_path`/`tessellate_path`
         // calls, which fresh-per-command tessellators would throw away.
@@ -1899,14 +1916,19 @@ impl LayerInner {
         self.image_draws.clear();
         let mut ops: Vec<ReplayOp> = Vec::new();
         let mut text_runs: Vec<Vec<DrawCommand>> = Vec::new();
-        // Whether the previous command was text, so a run of them shares
-        // one batch.
-        let mut in_text_run = false;
+        let mut epoch = Epoch::new(self.merge_batches);
         let physical = self.physical_commands();
         for command in physical {
             match &command {
                 DrawCommand::PushClip(shape) => {
-                    in_text_run = false;
+                    let finished = std::mem::replace(&mut epoch, Epoch::new(self.merge_batches));
+                    self.flush_epoch(
+                        finished,
+                        &item_indices,
+                        &mut indices,
+                        &mut ops,
+                        &mut text_runs,
+                    );
                     if let Some(rect) = scissor_for_clip(shape, self.scale_factor, self.size) {
                         ops.push(ReplayOp::ClipScissor(rect));
                     } else {
@@ -1923,69 +1945,52 @@ impl LayerInner {
                     continue;
                 }
                 DrawCommand::PopClip => {
-                    in_text_run = false;
+                    let finished = std::mem::replace(&mut epoch, Epoch::new(self.merge_batches));
+                    self.flush_epoch(
+                        finished,
+                        &item_indices,
+                        &mut indices,
+                        &mut ops,
+                        &mut text_runs,
+                    );
                     ops.push(ReplayOp::ClipPop);
                     continue;
                 }
                 _ => {}
             }
-            let is_text = matches!(
-                command,
-                DrawCommand::Text { .. } | DrawCommand::StyledText { .. }
-            );
-            if is_text {
-                if !in_text_run {
-                    text_runs.push(Vec::new());
-                    ops.push(ReplayOp::Text(text_runs.len() - 1));
+            match &command {
+                DrawCommand::Text { .. } | DrawCommand::StyledText { .. } => {
+                    let bounds = self.text_stack.borrow_mut().ink_bounds(&command);
+                    // Glyph bitmaps are placed on whole pixels; one pixel of
+                    // slack keeps a neighbour's edge out of the ink's box.
+                    let bounds = bounds.map(|b| [b[0] - 1.0, b[1] - 1.0, b[2] + 1.0, b[3] + 1.0]);
+                    epoch.add(Kind::Text, bounds, Payload::Command(command));
                 }
-                text_runs
-                    .last_mut()
-                    .expect("a run was just started")
-                    .push(command);
-                in_text_run = true;
-                continue;
-            }
-            in_text_run = false;
-
-            // `Image` needs its own texture/bind group, not a shared
-            // vertex/index buffer.
-            if let DrawCommand::Image {
-                pixels,
-                top_left,
-                size,
-                tint,
-            } = &command
-            {
-                self.image_draws.push(build_image_draw(
-                    &self.device,
-                    &self.queue,
-                    &self.composite_bind_group_layout,
-                    &self.composite_sampler,
-                    pixels,
-                    *top_left,
-                    *size,
-                    tint,
-                ));
-                let at = self.image_draws.len() - 1;
-                match ops.last_mut() {
-                    Some(ReplayOp::Images(range)) => range.end = at + 1,
-                    _ => ops.push(ReplayOp::Images(at..at + 1)),
+                DrawCommand::Image { top_left, size, .. } => {
+                    // `Image` needs its own texture/bind group, not a shared
+                    // vertex/index buffer.
+                    let far = [top_left[0] + size[0], top_left[1] + size[1]];
+                    let bounds = rect_from_corners(*top_left, far);
+                    epoch.add(Kind::Image, Some(bounds), Payload::Command(command));
                 }
-                continue;
-            }
-
-            let before = indices.len() as u32;
-            let (cmd_vertices, cmd_indices) =
-                tessellate_command(&command, &mut tessellator, &mut stroke_tessellator);
-            append_geometry(&mut vertices, &mut indices, cmd_vertices, cmd_indices);
-            let after = indices.len() as u32;
-            if after > before {
-                match ops.last_mut() {
-                    Some(ReplayOp::Solid(range)) => range.end = after,
-                    _ => ops.push(ReplayOp::Solid(before..after)),
+                _ => {
+                    let (cmd_vertices, cmd_indices) =
+                        tessellate_command(&command, &mut tessellator, &mut stroke_tessellator);
+                    if cmd_indices.is_empty() {
+                        continue;
+                    }
+                    let bounds = vertex_bounds(&cmd_vertices);
+                    let before = item_indices.len();
+                    append_geometry(&mut vertices, &mut item_indices, cmd_vertices, cmd_indices);
+                    epoch.add(
+                        Kind::Solid,
+                        Some(bounds),
+                        Payload::Solid(before..item_indices.len()),
+                    );
                 }
             }
         }
+        self.flush_epoch(epoch, &item_indices, &mut indices, &mut ops, &mut text_runs);
         self.ops = ops;
         self.assign_text_batches(text_runs);
         #[cfg(test)]
@@ -2025,11 +2030,114 @@ impl LayerInner {
         };
     }
 
+    /// Turn the items of one clip-free stretch into ops: settle their groups
+    /// ([`Batcher`]), then write each group's geometry, images or text run
+    /// in that order.
+    fn flush_epoch(
+        &mut self,
+        epoch: Epoch,
+        item_indices: &[u32],
+        indices: &mut Vec<u32>,
+        ops: &mut Vec<ReplayOp>,
+        text_runs: &mut Vec<Vec<DrawCommand>>,
+    ) {
+        let Epoch { batcher, mut items } = epoch;
+        for group in batcher.finish() {
+            match group.kind {
+                Kind::Solid => {
+                    let start = indices.len() as u32;
+                    for id in group.items {
+                        let Payload::Solid(range) = &items[id] else {
+                            unreachable!("a solid group holds solid items");
+                        };
+                        indices.extend_from_slice(&item_indices[range.clone()]);
+                    }
+                    ops.push(ReplayOp::Solid(start..indices.len() as u32));
+                }
+                Kind::Image => {
+                    let first = self.image_draws.len();
+                    for id in group.items {
+                        let Some(DrawCommand::Image {
+                            pixels,
+                            top_left,
+                            size,
+                            tint,
+                        }) = items[id].take_command()
+                        else {
+                            unreachable!("an image group holds image items");
+                        };
+                        self.image_draws.push(build_image_draw(
+                            &self.device,
+                            &self.queue,
+                            &self.composite_bind_group_layout,
+                            &self.composite_sampler,
+                            &pixels,
+                            top_left,
+                            size,
+                            &tint,
+                        ));
+                    }
+                    ops.push(ReplayOp::Images(first..self.image_draws.len()));
+                }
+                Kind::Text => {
+                    let commands: Vec<DrawCommand> = group
+                        .items
+                        .into_iter()
+                        .filter_map(|id| items[id].take_command())
+                        .collect();
+                    // Split into consecutive chunks (still in painter
+                    // order): a batch is re-prepared whole when any of its
+                    // commands changes, so one edited line should not
+                    // re-prepare a whole viewport.
+                    let mut commands = commands.into_iter().peekable();
+                    while commands.peek().is_some() {
+                        text_runs.push(
+                            commands
+                                .by_ref()
+                                .take(MAX_TEXT_COMMANDS_PER_BATCH)
+                                .collect(),
+                        );
+                        ops.push(ReplayOp::Text(text_runs.len() - 1));
+                    }
+                }
+            }
+        }
+    }
+
     /// Give each text run a batch, reusing batches (and their glyphon
     /// renderers) by position so an unchanged run keeps its prepared state.
     #[cfg(test)]
     pub(super) fn texture_size_for_test(&self) -> (u32, u32) {
         self.texture_size
+    }
+
+    #[cfg(test)]
+    pub(super) fn push_clip_for_test(&mut self, shape: ClipShape) {
+        self.push(DrawCommand::PushClip(shape));
+    }
+
+    #[cfg(test)]
+    pub(super) fn pop_clip_for_test(&mut self) {
+        self.push(DrawCommand::PopClip);
+    }
+
+    #[cfg(test)]
+    pub(super) fn op_kinds_for_test(&self) -> Vec<&'static str> {
+        self.ops
+            .iter()
+            .map(|op| match op {
+                ReplayOp::Solid(_) => "solid",
+                ReplayOp::Images(_) => "images",
+                ReplayOp::Text(_) => "text",
+                ReplayOp::ClipScissor(_) | ReplayOp::ClipStencil(_) => "clip",
+                ReplayOp::ClipPop => "pop",
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_merge_batches_for_test(&mut self, merge: bool) {
+        self.merge_batches = merge;
     }
 
     #[cfg(test)]
@@ -2528,6 +2636,70 @@ pub(super) fn create_msaa_texture(
 /// `top_left + size`, no index buffer) with `tint` resolved per-corner via
 /// [`Color::resolve`] against that same rectangle.
 ///
+/// One draw item of a clip-free stretch of commands, waiting to be placed.
+enum Payload {
+    /// A range of the solid items' index buffer (command order).
+    Solid(std::ops::Range<usize>),
+    /// An image or text command, taken when its group is written.
+    Command(DrawCommand),
+    Taken,
+}
+
+impl Payload {
+    fn take_command(&mut self) -> Option<DrawCommand> {
+        match std::mem::replace(self, Payload::Taken) {
+            Payload::Command(command) => Some(command),
+            _ => None,
+        }
+    }
+}
+
+/// The commands between two clip changes and how they are grouped.
+struct Epoch {
+    batcher: Batcher,
+    items: Vec<Payload>,
+}
+
+impl Epoch {
+    fn new(merge: bool) -> Self {
+        Self {
+            batcher: Batcher::new(merge),
+            items: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, kind: Kind, bounds: Option<Rect>, payload: Payload) {
+        self.batcher.place(kind, bounds, self.items.len());
+        self.items.push(payload);
+    }
+}
+
+fn rect_from_corners(a: [f32; 2], b: [f32; 2]) -> Rect {
+    [
+        a[0].min(b[0]),
+        a[1].min(b[1]),
+        a[0].max(b[0]),
+        a[1].max(b[1]),
+    ]
+}
+
+/// The box around tessellated geometry, exactly what it can paint.
+fn vertex_bounds(vertices: &[Vertex]) -> Rect {
+    let mut bounds = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    for v in vertices {
+        bounds[0] = bounds[0].min(v.position[0]);
+        bounds[1] = bounds[1].min(v.position[1]);
+        bounds[2] = bounds[2].max(v.position[0]);
+        bounds[3] = bounds[3].max(v.position[1]);
+    }
+    bounds
+}
+
 /// Eight params, all distinct types except `top_left`/`size` — a params
 /// struct here would exist for this one private function alone, so the
 /// lint is silenced rather than worked around (same call this codebase
@@ -3510,6 +3682,36 @@ impl Layer {
     ///   every span together, the same way [`Layer::draw_text`]'s do for
     ///   its one string.
     pub fn draw_styled_text(&self, spans: &[TextSpan], position: (f32, f32), alignment: Alignment) {
+        self.push_styled_text(spans, position, alignment, None);
+    }
+
+    /// [`Layer::draw_styled_text`], with lines wrapped to `max_width`
+    /// (logical pixels), exactly as [`Layer::draw_wrapped_text`] wraps plain
+    /// text: at the last word boundary that fits, between characters for a
+    /// single over-long word, and unconditionally at `\n`. A wrap point may
+    /// fall inside a span; each glyph keeps its span's style.
+    ///
+    /// `position`/`alignment` apply to the wrapped block's measured size
+    /// ([`Layer::get_wrapped_styled_text_size`]). Lines are left-aligned
+    /// within the block. Each distinct `max_width` is shaped (and cached)
+    /// separately.
+    pub fn draw_wrapped_styled_text(
+        &self,
+        spans: &[TextSpan],
+        position: (f32, f32),
+        max_width: f32,
+        alignment: Alignment,
+    ) {
+        self.push_styled_text(spans, position, alignment, Some(max_width));
+    }
+
+    fn push_styled_text(
+        &self,
+        spans: &[TextSpan],
+        position: (f32, f32),
+        alignment: Alignment,
+        wrap_width: Option<f32>,
+    ) {
         debug_assert!(
             spans
                 .iter()
@@ -3520,6 +3722,7 @@ impl Layer {
             spans: spans.to_vec(),
             position: [position.0, position.1],
             alignment,
+            wrap_width,
         });
     }
 
@@ -3610,6 +3813,16 @@ impl Layer {
     }
 
     pub fn get_styled_text_size(&self, spans: &[TextSpan]) -> (f32, f32) {
+        self.styled_text_size(spans, None)
+    }
+
+    /// [`Layer::get_styled_text_size`] for
+    /// [`Layer::draw_wrapped_styled_text`] with the same `max_width`.
+    pub fn get_wrapped_styled_text_size(&self, spans: &[TextSpan], max_width: f32) -> (f32, f32) {
+        self.styled_text_size(spans, Some(max_width))
+    }
+
+    fn styled_text_size(&self, spans: &[TextSpan], wrap_width: Option<f32>) -> (f32, f32) {
         let s = self.scale_factor();
         let scaled_spans: Vec<TextSpan> = spans
             .iter()
@@ -3623,7 +3836,7 @@ impl Layer {
             .borrow()
             .text_stack
             .borrow_mut()
-            .measure_spans(&scaled_spans);
+            .measure_spans(&scaled_spans, wrap_width.map(|w| w * s));
         (width / s, height / s)
     }
 

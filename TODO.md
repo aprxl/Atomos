@@ -69,15 +69,18 @@ budget, `Always` groups without an effect demote to direct, least-recently
 dirty first; `RenderStats` gains an overrun counter. Skip layers whose bounds
 miss the surface.
 
-### Text-batch merging (design stage 7)
-**Trigger:** `RenderStats::text_batches` is large in a real app's profile
-(an editor interleaving line backgrounds with text), or a profile shows
-glyphon prepare/draw overhead.
+### Text-batch merging follow-ups
+**Trigger:** a profile of a real app shows the remaining ops or prepare cost,
+or an integrated-GPU run disagrees with the discrete-GPU numbers.
 
-Each run of consecutive text commands is its own glyphon renderer. 64 batches
-cost 0.27 ms per frame in release, so this is not urgent. Plan: a command may
-join an earlier batch of its kind if its physical bounds intersect nothing
-drawn in between; overlapping commands are never reordered.
+Merging (design stage 7) is done: disjoint items hop to the nearest earlier
+group of their kind and text groups are cut at 16 commands. Not done: text
+bounds are computed by laying glyphs out once at build time and again at
+prepare (the shape and bitmap caches make the second cheap, but it is two
+walks); `MAX_TEXT_COMMANDS_PER_BATCH` was tuned on one discrete GPU, and
+tuning it per GPU class is open; items are only ever moved to the *nearest*
+earlier group of their kind, so a pathological alternation can leave extra
+ops that a smarter schedule would remove.
 
 ### Opaque-rect skipping
 **Trigger:** profiling shows overdraw from covered full-screen direct layers.
@@ -105,18 +108,19 @@ or keep `Custom` groups surface-sized.
 
 ## Text
 
-### Wrapping for styled text and wrap options
-**Trigger:** an app needs wrapped `draw_styled_text` (e.g. wrapped,
-syntax-highlighted lines), or hanging indents / `Wrap::Glyph`-only /
-justified lines.
+### Wrap options and layout for wrapped styled text
+**Trigger:** an app needs caret/selection geometry for a wrapped, syntax-
+highlighted line, or hanging indents / `Wrap::Glyph`-only / justified lines.
 
-`draw_wrapped_text`, `get_wrapped_text_size` and `layout_wrapped_text` wrap
-plain text to a logical-pixel width (word boundaries, glyph breaks for an
-over-long word); `draw_styled_text` and its size query still never wrap. Wrapped
-text is left-aligned inside its block, and each distinct width is its own
-shape-cache entry (animating the width re-shapes every frame). A wrapped line's
-swallowed trailing whitespace has no glyph, so selection rectangles stop at the
-last visible glyph.
+`draw_wrapped_text`, `draw_wrapped_styled_text` and their size queries wrap to
+a logical-pixel width (word boundaries, glyph breaks for an over-long word).
+`layout_wrapped_text` returns carets, hit-testing and selection rectangles
+for plain text only; there is no layout query for styled spans (its
+`TextLayout` assumes one effect for the whole string, while spans each carry
+their own weight/width). Wrapped text is left-aligned inside its block, and
+each distinct width is its own shape-cache entry (animating the width
+re-shapes every frame). A wrapped line's swallowed trailing whitespace has no
+glyph, so selection rectangles stop at the last visible glyph.
 
 ### Shaped-glyph data and appearance effects from the fork
 **Trigger:** PDF/export or an interaction effect is needed.

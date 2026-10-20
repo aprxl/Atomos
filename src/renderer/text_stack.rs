@@ -289,6 +289,78 @@ impl TextStack {
         measure_shaped_buffer_with(&self.shape_cache[&key].buffer, |_| effect)
     }
 
+    /// The rectangle (`[min_x, min_y, max_x, max_y]`, physical pixels) a
+    /// text command's glyphs ink, or `None` for a command that draws nothing
+    /// (or is not text). Shares the shape cache and glyph bitmap cache with
+    /// [`TextStack::prepare_layer`], so a command bounded here and prepared
+    /// later is shaped and rasterized once.
+    pub(super) fn ink_bounds(&mut self, command: &DrawCommand) -> Option<[f32; 4]> {
+        match command {
+            DrawCommand::Text {
+                text,
+                position,
+                font,
+                font_parameters,
+                alignment,
+                wrap_width,
+                ..
+            } => {
+                let key = self.ensure_shaped(text, font, font_parameters, *wrap_width);
+                let effect = GlyphEffect::from(font_parameters);
+                let TextStack {
+                    shape_cache,
+                    font_system,
+                    effect_glyphs,
+                    ..
+                } = self;
+                let buffer = &shape_cache[&key].buffer;
+                let (width, height) = measure_shaped_buffer_with(buffer, |_| effect);
+                let anchored = apply_alignment(*position, *alignment, width, height);
+                effect_glyphs.ink_bounds(
+                    font_system,
+                    buffer,
+                    (anchored[0], anchored[1]),
+                    None,
+                    effect,
+                )
+            }
+            DrawCommand::StyledText {
+                spans,
+                position,
+                alignment,
+                wrap_width,
+            } => {
+                let key = self.ensure_shaped_spans(spans, *wrap_width);
+                let span_effects: Vec<GlyphEffect> = spans
+                    .iter()
+                    .map(|span| GlyphEffect::from(&span.font_parameters))
+                    .collect();
+                let TextStack {
+                    shape_cache,
+                    font_system,
+                    effect_glyphs,
+                    ..
+                } = self;
+                let buffer = &shape_cache[&key].buffer;
+                let (width, height) = measure_shaped_buffer_with(buffer, |glyph| {
+                    span_effects
+                        .get(glyph.metadata)
+                        .copied()
+                        .unwrap_or(GlyphEffect::NEUTRAL)
+                });
+                let anchored = apply_alignment(*position, *alignment, width, height);
+                effect_glyphs.ink_bounds(
+                    font_system,
+                    buffer,
+                    (anchored[0], anchored[1]),
+                    Some(&span_effects),
+                    GlyphEffect::NEUTRAL,
+                )
+            }
+            _ => None,
+        }
+    }
+
     /// The interaction geometry of one `draw_text`-style string, in
     /// physical pixels (the caller converts to logical).
     pub(super) fn layout(
@@ -332,14 +404,15 @@ impl TextStack {
     }
 
     /// [`TextStack::ensure_shaped`], for a `draw_styled_text` span list.
-    fn ensure_shaped_spans(&mut self, spans: &[TextSpan]) -> u64 {
-        let key = shaped_spans_key(spans);
+    fn ensure_shaped_spans(&mut self, spans: &[TextSpan], wrap_width: Option<f32>) -> u64 {
+        let wrap_width = sanitize_wrap(wrap_width);
+        let key = shaped_spans_key(spans, wrap_width);
         let frame = self.frame;
         if let Some(entry) = self.shape_cache.get_mut(&key) {
             entry.last_used = frame;
             return key;
         }
-        let buffer = self.shape_spans(spans);
+        let buffer = self.shape_spans(spans, wrap_width);
         self.shape_cache.insert(
             key,
             CachedShape {
@@ -402,8 +475,12 @@ impl TextStack {
     /// together, before any [`Alignment`] offset — the spans counterpart to
     /// [`TextStack::measure`], sharing the same shape cache. Exposed via
     /// [`super::Layer::get_styled_text_size`].
-    pub(super) fn measure_spans(&mut self, spans: &[TextSpan]) -> (f32, f32) {
-        let key = self.ensure_shaped_spans(spans);
+    pub(super) fn measure_spans(
+        &mut self,
+        spans: &[TextSpan],
+        wrap_width: Option<f32>,
+    ) -> (f32, f32) {
+        let key = self.ensure_shaped_spans(spans, wrap_width);
         let span_effects: Vec<GlyphEffect> = spans
             .iter()
             .map(|span| GlyphEffect::from(&span.font_parameters))
@@ -426,7 +503,7 @@ impl TextStack {
     /// themselves and recover a glyph's effect via the `Attrs::metadata`
     /// span index each span is tagged with below. Color, size, and
     /// tracking all have native per-span `Attrs` fields.
-    fn shape_spans(&mut self, spans: &[TextSpan]) -> Buffer {
+    fn shape_spans(&mut self, spans: &[TextSpan], wrap_width: Option<f32>) -> Buffer {
         // Resolved before building any `Attrs` below, since those borrow
         // the resolved family names by reference — `resolve_family` needs
         // `&mut self` and can't be called again once that borrow starts.
@@ -470,7 +547,7 @@ impl TextStack {
         );
         {
             let mut borrowed = buffer.borrow_with(&mut self.font_system);
-            borrowed.set_size(None, None);
+            borrowed.set_size(wrap_width, None);
             borrowed.set_rich_text(
                 spans
                     .iter()
@@ -556,8 +633,9 @@ impl TextStack {
                     spans,
                     position,
                     alignment,
+                    wrap_width,
                 } => {
-                    let key = self.ensure_shaped_spans(spans);
+                    let key = self.ensure_shaped_spans(spans, *wrap_width);
                     let span_effects: Vec<GlyphEffect> = spans
                         .iter()
                         .map(|span| GlyphEffect::from(&span.font_parameters))
@@ -652,9 +730,10 @@ fn shaped_text_key(
 /// because it's baked into the shaped buffer via `Attrs::color` (unlike
 /// `draw_text`'s color, which is applied at glyph emission) — so animating
 /// a styled span's color re-shapes. Weight/width stay excluded here too.
-fn shaped_spans_key(spans: &[TextSpan]) -> u64 {
+fn shaped_spans_key(spans: &[TextSpan], wrap_width: Option<f32>) -> u64 {
     let mut hasher = DefaultHasher::new();
     hasher.write_u8(1); // namespace tag vs. `shaped_text_key`
+    hasher.write_u32(wrap_width.map_or(u32::MAX, f32::to_bits));
     hasher.write_usize(spans.len());
     for span in spans {
         span.text.hash(&mut hasher);
