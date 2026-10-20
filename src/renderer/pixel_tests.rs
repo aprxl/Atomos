@@ -262,3 +262,22 @@ fn a_dpi_change_rerenders_a_retained_layer() {
     assert_eq!(passes(&layer).0, 2);
     assert_near(scene.pixel(12, 4), [255, 0, 0, 255], 1);
 }
+
+#[test]
+fn animating_effect_parameters_reuses_the_effect_textures() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (8.0, 8.0),
+        Color::rgb(255, 0, 0),
+        Rounding::NONE,
+    );
+    layer.set_effect(Some(ShaderEffect::ColorMatrix(ColorMatrix::IDENTITY)));
+    scene.frame(1.0);
+    let before = layer.0.borrow().effect_rebuilds;
+    layer.set_effect(Some(ShaderEffect::ColorMatrix(ColorMatrix::invert())));
+    scene.frame(1.0);
+    assert_eq!(layer.0.borrow().effect_rebuilds, before);
+    assert_near(scene.pixel(4, 4), [0, 255, 255, 255], 1);
+}

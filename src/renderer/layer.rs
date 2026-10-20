@@ -1212,6 +1212,10 @@ pub(super) struct LayerInner {
     pub(super) content_passes: u32,
     #[cfg(test)]
     pub(super) effect_passes: u32,
+    /// Full effect-resource rebuilds (texture allocations), as opposed to
+    /// uniform patches.
+    #[cfg(test)]
+    pub(super) effect_rebuilds: u32,
 }
 
 /// GPU state for one `DrawCommand::Image`, rebuilt whenever the layer
@@ -1341,6 +1345,8 @@ impl LayerInner {
             content_passes: 0,
             #[cfg(test)]
             effect_passes: 0,
+            #[cfg(test)]
+            effect_rebuilds: 0,
         }
     }
 
@@ -1443,7 +1449,61 @@ impl LayerInner {
     /// human-timescale resize rates. Split "rebuild textures/bind-groups"
     /// from "rebuild pipeline" if profiling ever shows resize hitching
     /// with a `Custom` effect active.
+    /// Patch the uniforms of the already-built effect to match `effect`
+    /// instead of reallocating its surface-sized textures. Only possible
+    /// when `effect` is the same built-in kind as the one in place; returns
+    /// whether it was, and the caller falls back to
+    /// [`LayerInner::rebuild_effect_gpu`] when not. Marks the effect output
+    /// stale on success.
+    fn update_effect_uniforms(&mut self, effect: &ShaderEffect) -> bool {
+        let Some(effect_gpu) = &self.effect_gpu else {
+            return false;
+        };
+        match (&effect_gpu.kind, effect) {
+            (EffectGpuKind::Blur(blur), ShaderEffect::Blur { radius }) => {
+                let texel_size = [
+                    1.0 / self.size.0.max(1) as f32,
+                    1.0 / self.size.1.max(1) as f32,
+                ];
+                for (buffer, direction) in [
+                    (&blur.params_buffer_h, [1.0, 0.0]),
+                    (&blur.params_buffer_v, [0.0, 1.0]),
+                ] {
+                    self.queue.write_buffer(
+                        buffer,
+                        0,
+                        bytemuck::bytes_of(&BlurParamsUniform {
+                            direction,
+                            texel_size,
+                            radius: radius * self.scale_factor,
+                            _pad: 0.0,
+                        }),
+                    );
+                }
+            }
+            (
+                EffectGpuKind::ColorMatrix { matrix_buffer, .. },
+                ShaderEffect::ColorMatrix(matrix),
+            ) => {
+                self.queue.write_buffer(
+                    matrix_buffer,
+                    0,
+                    bytemuck::bytes_of(&ColorMatrixUniform {
+                        cols: matrix.to_columns(),
+                    }),
+                );
+            }
+            _ => return false,
+        }
+        self.effect_texture_dirty = true;
+        true
+    }
+
     fn rebuild_effect_gpu(&mut self) {
+        #[cfg(test)]
+        {
+            self.effect_rebuilds += 1;
+        }
         self.effect_texture_dirty = true;
         let Some(effect) = self.effect.clone() else {
             self.effect_gpu = None;
@@ -1473,7 +1533,7 @@ impl LayerInner {
                                 radius: physical_radius,
                                 _pad: 0.0,
                             }),
-                            usage: wgpu::BufferUsages::UNIFORM,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         });
                 let params_buffer_v =
                     self.device
@@ -1485,7 +1545,7 @@ impl LayerInner {
                                 radius: physical_radius,
                                 _pad: 0.0,
                             }),
-                            usage: wgpu::BufferUsages::UNIFORM,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         });
                 let bind_group_h = create_effect_bind_group(
                     &self.device,
@@ -1518,7 +1578,7 @@ impl LayerInner {
                             contents: bytemuck::bytes_of(&ColorMatrixUniform {
                                 cols: matrix.to_columns(),
                             }),
-                            usage: wgpu::BufferUsages::UNIFORM,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                         });
                 let bind_group = create_effect_bind_group(
                     &self.device,
@@ -1642,7 +1702,9 @@ impl LayerInner {
             self.last_text_hash = None;
             // The scissor and a blur radius are in logical units too.
             self.content_texture_dirty = true;
-            if self.effect.is_some() {
+            if let Some(effect) = self.effect.clone()
+                && !self.update_effect_uniforms(&effect)
+            {
                 self.rebuild_effect_gpu();
             }
         }
@@ -3095,14 +3157,21 @@ impl Layer {
     /// effects apply at here (shade a specific shape/path/text run by
     /// giving it its own layer).
     ///
-    /// Rebuilds the effect's GPU resources immediately, not deferred to
-    /// the next frame — cheap relative to how rarely this is expected to
-    /// be called (an editor toggling a blur-behind-popup effect on/off,
-    /// say, not a per-frame call). [`ShaderEffect::Custom`]'s WGSL is
+    /// Switching to a different effect kind rebuilds its GPU resources
+    /// immediately, not deferred to the next frame. Changing only the
+    /// parameters of the effect already in place (a blur radius, a colour
+    /// matrix) just rewrites its uniforms, so animating them every frame
+    /// allocates nothing. [`ShaderEffect::Custom`]'s WGSL is
     /// compiled and validated here too; a bad shader logs and leaves this
     /// layer without an effect rather than panicking.
     pub fn set_effect(&self, effect: Option<ShaderEffect>) {
         let mut inner = self.0.borrow_mut();
+        if let Some(effect) = &effect
+            && inner.update_effect_uniforms(effect)
+        {
+            inner.effect = Some(effect.clone());
+            return;
+        }
         inner.effect = effect;
         inner.rebuild_effect_gpu();
     }
