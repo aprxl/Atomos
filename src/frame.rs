@@ -93,6 +93,9 @@ pub struct FrameScheduler {
     occluded: bool,
     /// Consecutive frames that came back [`FrameOutcome::Retry`].
     retries: u32,
+    /// Hard ceiling on presented frames per second (the display's refresh
+    /// rate), applied to every frame including input-driven ones.
+    max_fps: Option<f32>,
     /// `None` means "as fast as the display allows" — with `PresentMode::Fifo`
     /// that is already vsync-paced, so no deadline is needed.
     target_fps: Option<f32>,
@@ -118,6 +121,7 @@ impl FrameScheduler {
             wake_at: None,
             occluded: false,
             retries: 0,
+            max_fps: None,
             target_fps: None,
             last_frame_at: None,
         }
@@ -174,23 +178,27 @@ impl FrameScheduler {
     pub fn should_draw_now(&self) -> bool {
         self.wants_redraw()
             && !self.occluded
-            && (self.urgent || self.deadline().is_none_or(|at| Instant::now() >= at))
+            && self
+                .deadline(self.urgent)
+                .is_none_or(|at| Instant::now() >= at)
     }
 
     /// Earliest instant the next frame may start, or `None` when pacing is
-    /// left to the display.
-    fn deadline(&self) -> Option<Instant> {
-        let paced = match (self.target_fps, self.last_frame_at) {
-            (Some(fps), Some(last)) if fps.is_finite() && fps > 0.0 => {
-                Some(last + Duration::from_secs_f32(1.0 / fps).max(Duration::from_micros(100)))
-            }
-            _ => None,
+    /// left to the display. The display ceiling always applies; the
+    /// animation target and retry backoff only to non-`urgent` frames.
+    fn deadline(&self, urgent: bool) -> Option<Instant> {
+        let last = self.last_frame_at?;
+        let interval = |fps: Option<f32>| {
+            fps.filter(|fps| fps.is_finite() && *fps > 0.0).map(|fps| {
+                last + Duration::from_secs_f32(1.0 / fps).max(Duration::from_micros(100))
+            })
         };
-        let backoff = self
-            .last_frame_at
-            .zip(self.retry_backoff())
-            .map(|(last, wait)| last + wait);
-        paced.max(backoff)
+        let ceiling = interval(self.max_fps);
+        if urgent {
+            return ceiling;
+        }
+        let backoff = self.retry_backoff().map(|wait| last + wait);
+        ceiling.max(interval(self.target_fps)).max(backoff)
     }
 
     /// How long to wait before the next retry, or `None` while retries are
@@ -266,20 +274,48 @@ impl FrameScheduler {
                 .wake_at
                 .map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
         }
-        if self.urgent {
-            return ControlFlow::Poll;
-        }
-        match self.deadline() {
+        match self.deadline(self.urgent) {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Poll,
         }
     }
 
-    /// Cap the frame rate while animating. `None` (the default) follows the
-    /// display. A target *above* the refresh rate has no effect — vsync
-    /// still gates presentation.
+    /// Cap the frame rate while *animating* (input still answers at once;
+    /// see [`request_redraw`](Self::request_redraw)). `None` (the default)
+    /// follows the display. For a ceiling on all frames use
+    /// [`set_max_fps`](Self::set_max_fps).
     pub fn set_target_fps(&mut self, fps: Option<f32>) {
         self.target_fps = fps;
+    }
+
+    /// Never present faster than `fps`: set this to the display's refresh
+    /// rate. `PresentMode::Fifo` is supposed to pace presentation, but on
+    /// some platforms (measured on macOS at 120 Hz) the loop presented far
+    /// more frames than the display could show, which queues them in the
+    /// compositor and makes the image on screen lag the one just drawn:
+    /// felt as input lag with an idle-looking machine. Unlike
+    /// [`set_target_fps`](Self::set_target_fps) this also limits
+    /// input-driven frames. A value above the real refresh rate is harmless.
+    pub fn set_max_fps(&mut self, fps: Option<f32>) {
+        self.max_fps = fps;
+    }
+
+    pub fn max_fps(&self) -> Option<f32> {
+        self.max_fps
+    }
+
+    /// Set [`max_fps`](Self::max_fps) from the monitor the window is on.
+    /// Call it when the window is created and again on
+    /// `WindowEvent::Moved` / `ScaleFactorChanged`, since the window may
+    /// have changed displays. Leaves the ceiling unchanged if winit cannot
+    /// report a refresh rate.
+    pub fn sync_display(&mut self, window: &winit::window::Window) {
+        if let Some(millihertz) = window
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz())
+        {
+            self.max_fps = Some(millihertz as f32 / 1000.0);
+        }
     }
 
     pub fn target_fps(&self) -> Option<f32> {
@@ -494,5 +530,35 @@ mod tests {
         assert!(!scheduler.should_draw_now(), "retries back off");
         scheduler.request_redraw();
         assert!(scheduler.should_draw_now());
+    }
+
+    #[test]
+    fn the_display_ceiling_limits_even_input_frames() {
+        let mut scheduler = FrameScheduler::new();
+        scheduler.set_max_fps(Some(5.0));
+        scheduler.begin_frame();
+        scheduler.finish_frame(FrameOutcome::Presented);
+        scheduler.request_redraw(); // input, between frames
+        assert!(scheduler.wants_redraw());
+        assert!(
+            !scheduler.should_draw_now(),
+            "a frame past the refresh rate is overdraw"
+        );
+        assert!(matches!(
+            scheduler.control_flow(),
+            ControlFlow::WaitUntil(_)
+        ));
+    }
+
+    #[test]
+    fn a_bad_ceiling_is_ignored() {
+        for fps in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            let mut scheduler = FrameScheduler::new();
+            scheduler.set_max_fps(Some(fps));
+            scheduler.begin_frame();
+            scheduler.finish_frame(FrameOutcome::Presented);
+            scheduler.request_redraw();
+            assert!(scheduler.should_draw_now(), "fps {fps}");
+        }
     }
 }

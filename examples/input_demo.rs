@@ -514,6 +514,7 @@ impl ApplicationHandler for App {
         let layer = renderer.new_layer_top(LayerInvalidation::Automatic);
 
         self.input = Input::new(window.scale_factor());
+        self.scheduler.sync_display(&window);
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.layer = Some(layer);
@@ -528,6 +529,14 @@ impl ApplicationHandler for App {
             self.scheduler.request_redraw();
         }
         self.scheduler.handle_event(&event);
+        if matches!(
+            event,
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }
+        ) && let Some(w) = &self.window
+        {
+            // The window may have changed displays.
+            self.scheduler.sync_display(w);
+        }
         if let Some(r) = &mut self.renderer {
             r.handle_event(&event);
         }

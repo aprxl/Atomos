@@ -53,6 +53,7 @@ impl ApplicationHandler for App {
         let renderer = pollster::block_on(atomos::renderer::Renderer::new(window.clone()));
 
         self.input = atomos::input::Input::new(window.scale_factor());
+        self.scheduler.sync_display(&window);
         self.window = Some(window);
         self.renderer = Some(renderer);
         // The first frame is already owed — `FrameScheduler::new` starts
@@ -79,6 +80,14 @@ impl ApplicationHandler for App {
             self.scheduler.request_redraw();
         }
         self.scheduler.handle_event(&event);
+        if matches!(
+            event,
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }
+        ) && let Some(w) = &self.window
+        {
+            // The window may have changed displays.
+            self.scheduler.sync_display(w);
+        }
 
         // Forward to the renderer first so it can keep any per-window state
         // in sync (currently a no-op, but the seam is in place).

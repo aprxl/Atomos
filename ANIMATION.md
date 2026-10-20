@@ -277,3 +277,7 @@ scheduler.request_redraw_in(blink.wake_in());
 ### Pacing applies to animation, not input
 
 `set_target_fps` caps how fast an *animation* may ask for its next frame. A `request_redraw()` made outside a frame (an input event, a resize) is drawn at once, ignoring the cap and any retry backoff, so a 5 fps animation demo still answers the mouse immediately. "Inside a frame" means between `begin_frame()` and `finish_frame(outcome)`, so call `finish_frame` after rendering; a loop that never does falls back to treating every request as paced.
+
+### Display ceiling (`set_max_fps`, `sync_display`)
+
+`PresentMode::Fifo` is supposed to pace presentation, but it does not on every platform: on macOS at 120 Hz the fork measured 74-252 presented frames per second, queuing frames in the compositor so the image on screen lagged the one just drawn (felt as input lag on an idle-looking machine). `set_max_fps` is a hard ceiling on **all** presented frames, input-driven ones included; `sync_display(&window)` sets it from the monitor's refresh rate. Call `sync_display` when the window is created and on `WindowEvent::Moved` / `ScaleFactorChanged`, since the window may have changed displays. `set_target_fps` remains the animation-only cap.
