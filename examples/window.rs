@@ -78,6 +78,7 @@ impl ApplicationHandler for App {
         if self.input.handle_event(&event) {
             self.scheduler.request_redraw();
         }
+        self.scheduler.handle_event(&event);
 
         // Forward to the renderer first so it can keep any per-window state
         // in sync (currently a no-op, but the seam is in place).
@@ -108,8 +109,9 @@ impl ApplicationHandler for App {
                 self.scheduler.begin_frame();
 
                 if let Some(r) = &mut self.renderer {
-                    if let Err(e) = r.render() {
-                        eprintln!("render error: {e}");
+                    match r.render() {
+                        Ok(outcome) => self.scheduler.finish_frame(outcome),
+                        Err(e) => eprintln!("render error: {e}"),
                     }
                     if let Some(w) = &self.window {
                         w.set_title(&format!(

@@ -39,10 +39,20 @@
 //! anything the frame itself requests survives to the next `about_to_wait`.
 //! Clearing at the end would swallow it and the animation would stall after
 //! one frame.
+//!
+//! That same ordering means a frame that showed nothing has already spent
+//! its request. Report what `Renderer::render` returned with
+//! [`FrameScheduler::finish_frame`] and forward window events to
+//! [`FrameScheduler::handle_event`]: a [`FrameOutcome::Retry`] is asked
+//! for again, with backoff so a persistent failure cannot spin, and a
+//! [`FrameOutcome::Occluded`] frame stays owed but is not polled for until
+//! the window is visible again.
 
 use std::time::{Duration, Instant};
 
-use winit::event_loop::ControlFlow;
+use winit::{event::WindowEvent, event_loop::ControlFlow};
+
+use crate::renderer::FrameOutcome;
 
 /// Ceiling on the delta handed to animations, regardless of how long the
 /// process actually sat idle.
@@ -55,10 +65,23 @@ use winit::event_loop::ControlFlow;
 /// short of anything a user would perceive as a jump.
 pub const MAX_ANIMATION_DELTA: Duration = Duration::from_millis(100);
 
+/// Consecutive [`FrameOutcome::Retry`] results retried at full speed before
+/// backing off. A resize waiting on the GPU queue clears in a few frames; a
+/// failure that lasts longer should not burn a core.
+const RETRIES_BEFORE_BACKOFF: u32 = 4;
+
+/// Longest wait between retries once backing off.
+const MAX_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
 /// Decides whether the event loop sleeps or draws. See the module doc.
 #[derive(Debug)]
 pub struct FrameScheduler {
     redraw_requested: bool,
+    /// The window is not visible: a frame may be owed, but drawing it would
+    /// show nothing. Cleared when the OS reports the window visible again.
+    occluded: bool,
+    /// Consecutive frames that came back [`FrameOutcome::Retry`].
+    retries: u32,
     /// `None` means "as fast as the display allows" — with `PresentMode::Fifo`
     /// that is already vsync-paced, so no deadline is needed.
     target_fps: Option<f32>,
@@ -78,6 +101,8 @@ impl FrameScheduler {
             // frame never paints at all, so the first frame has to be owed
             // from the outset.
             redraw_requested: true,
+            occluded: false,
+            retries: 0,
             target_fps: None,
             last_frame_at: None,
         }
@@ -103,16 +128,68 @@ impl FrameScheduler {
     /// deadline below purely decorative and the target FPS a no-op. The
     /// request has to be withheld until the deadline actually passes.
     pub fn should_draw_now(&self) -> bool {
-        self.redraw_requested && self.deadline().is_none_or(|at| Instant::now() >= at)
+        self.redraw_requested
+            && !self.occluded
+            && self.deadline().is_none_or(|at| Instant::now() >= at)
     }
 
     /// Earliest instant the next frame may start, or `None` when pacing is
     /// left to the display.
     fn deadline(&self) -> Option<Instant> {
-        match (self.target_fps, self.last_frame_at) {
-            (Some(fps), Some(last)) if fps > 0.0 => Some(last + Duration::from_secs_f32(1.0 / fps)),
+        let paced = match (self.target_fps, self.last_frame_at) {
+            (Some(fps), Some(last)) if fps.is_finite() && fps > 0.0 => {
+                Some(last + Duration::from_secs_f32(1.0 / fps).max(Duration::from_micros(100)))
+            }
             _ => None,
+        };
+        let backoff = self
+            .last_frame_at
+            .zip(self.retry_backoff())
+            .map(|(last, wait)| last + wait);
+        paced.max(backoff)
+    }
+
+    /// How long to wait before the next retry, or `None` while retries are
+    /// still cheap enough to run at full speed.
+    fn retry_backoff(&self) -> Option<Duration> {
+        let over = self.retries.checked_sub(RETRIES_BEFORE_BACKOFF + 1)?;
+        Some((Duration::from_millis(16) * 2u32.saturating_pow(over)).min(MAX_RETRY_BACKOFF))
+    }
+
+    /// Report what `Renderer::render` returned for the frame that just
+    /// ran. Call once per frame, after `begin_frame`.
+    ///
+    /// - [`FrameOutcome::Presented`] resets retry tracking.
+    /// - [`FrameOutcome::Retry`] asks for another frame, backing off after
+    ///   a few consecutive failures.
+    /// - [`FrameOutcome::Occluded`] keeps the frame owed but stops polling
+    ///   until [`handle_event`](Self::handle_event) sees the window return.
+    pub fn finish_frame(&mut self, outcome: FrameOutcome) {
+        match outcome {
+            FrameOutcome::Presented => self.retries = 0,
+            FrameOutcome::Retry => {
+                self.retries = self.retries.saturating_add(1);
+                self.redraw_requested = true;
+            }
+            FrameOutcome::Occluded => {
+                self.occluded = true;
+                self.redraw_requested = true;
+            }
         }
+    }
+
+    /// Feed window events through so the scheduler can wake from an
+    /// occluded sleep. Returns whether a redraw was requested.
+    pub fn handle_event(&mut self, event: &WindowEvent) -> bool {
+        if let WindowEvent::Occluded(occluded) = event {
+            self.occluded = *occluded;
+            if !occluded {
+                self.retries = 0;
+                self.redraw_requested = true;
+                return true;
+            }
+        }
+        false
     }
 
     /// Call at the **top** of `RedrawRequested`, before per-frame logic:
@@ -131,7 +208,7 @@ impl FrameScheduler {
     ///   which is the only way to run *slower* than the display (battery
     ///   throttling, a deliberate 30 fps cap).
     pub fn control_flow(&self) -> ControlFlow {
-        if !self.redraw_requested {
+        if !self.redraw_requested || self.occluded {
             return ControlFlow::Wait;
         }
         match self.deadline() {
@@ -246,5 +323,58 @@ mod tests {
         );
         let normal = Duration::from_millis(16);
         assert_eq!(FrameScheduler::animation_delta(normal), normal);
+    }
+
+    #[test]
+    fn a_retry_is_asked_for_again() {
+        let mut scheduler = FrameScheduler::new();
+        scheduler.begin_frame();
+        scheduler.finish_frame(FrameOutcome::Retry);
+        assert!(scheduler.wants_redraw());
+    }
+
+    #[test]
+    fn persistent_retries_back_off_instead_of_spinning() {
+        let mut scheduler = FrameScheduler::new();
+        for _ in 0..RETRIES_BEFORE_BACKOFF {
+            scheduler.begin_frame();
+            scheduler.finish_frame(FrameOutcome::Retry);
+            assert_eq!(scheduler.control_flow(), ControlFlow::Poll);
+        }
+        scheduler.begin_frame();
+        scheduler.finish_frame(FrameOutcome::Retry);
+        assert!(matches!(
+            scheduler.control_flow(),
+            ControlFlow::WaitUntil(_)
+        ));
+        assert!(!scheduler.should_draw_now());
+
+        scheduler.begin_frame();
+        scheduler.finish_frame(FrameOutcome::Presented);
+        assert!(!scheduler.wants_redraw());
+    }
+
+    #[test]
+    fn an_occluded_frame_stays_owed_but_is_not_polled() {
+        let mut scheduler = FrameScheduler::new();
+        scheduler.begin_frame();
+        scheduler.finish_frame(FrameOutcome::Occluded);
+        assert!(scheduler.wants_redraw(), "the update is still unseen");
+        assert!(!scheduler.should_draw_now());
+        assert_eq!(scheduler.control_flow(), ControlFlow::Wait);
+
+        assert!(scheduler.handle_event(&WindowEvent::Occluded(false)));
+        assert!(scheduler.should_draw_now());
+    }
+
+    #[test]
+    fn a_nonfinite_target_fps_is_ignored() {
+        for fps in [f32::NAN, f32::INFINITY, 0.0, -5.0] {
+            let mut scheduler = FrameScheduler::new();
+            scheduler.set_target_fps(Some(fps));
+            scheduler.begin_frame();
+            scheduler.request_redraw();
+            assert_eq!(scheduler.control_flow(), ControlFlow::Poll, "fps {fps}");
+        }
     }
 }

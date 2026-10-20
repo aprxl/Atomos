@@ -607,6 +607,7 @@ impl ApplicationHandler for App {
         if self.input.handle_event(&event) {
             self.scheduler.request_redraw();
         }
+        self.scheduler.handle_event(&event);
         if let Some(r) = &mut self.renderer {
             r.handle_event(&event);
         }
@@ -651,8 +652,9 @@ impl ApplicationHandler for App {
                                 .draw_surface(&self.cells[row * COLS + col], row, col);
                         }
                     }
-                    if let Err(e) = r.render() {
-                        eprintln!("render error: {e}");
+                    match r.render() {
+                        Ok(outcome) => self.scheduler.finish_frame(outcome),
+                        Err(e) => eprintln!("render error: {e}"),
                     }
                 }
 

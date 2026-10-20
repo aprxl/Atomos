@@ -109,22 +109,53 @@ fn pick_msaa_sample_count(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) 
     }
 }
 
-/// Errors that can escape [`Renderer::render`]. These are the cases the
-/// renderer could not recover from internally; recoverable per-frame surface
-/// states (timeout, occlusion, suboptimal swap chain) are handled inside
-/// `render` and reported as `Ok(())`.
+/// Whether wgpu's legacy timestamp-query path is safe on this backend.
+///
+/// wgpu 29's Metal counter path is unusable on macOS 26: it returns zero
+/// timestamps and encoder-level writes can wedge the queue. Timing is
+/// optional diagnostics, so production rendering stays off that path until
+/// wgpu implements Metal 4's replacement.
+fn supports_timestamp_queries(backend: wgpu::Backend, features: wgpu::Features) -> bool {
+    backend != wgpu::Backend::Metal
+        && features.contains(
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+        )
+}
+
+/// What one call to [`Renderer::render`] achieved, and therefore what the
+/// caller must do next. Demand-driven loops consume their redraw request
+/// before drawing, so a frame that showed nothing has to say whether to
+/// try again or to wait; see [`crate::frame::FrameScheduler::finish_frame`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOutcome {
+    /// The frame reached the display.
+    Presented,
+    /// Nothing was shown, but a retry can succeed: the surface timed out or
+    /// was outdated (and has been reconfigured), a resize is waiting for the
+    /// GPU queue to drain, or the surface was lost and re-created. The
+    /// caller must ask for another frame.
+    Retry,
+    /// The window cannot be seen (minimized, covered, on another desktop),
+    /// so there is nothing to present. Do not poll: keep the work owed and
+    /// draw when the OS reports the window visible again
+    /// (`WindowEvent::Occluded(false)`).
+    Occluded,
+}
+
+/// Errors that can escape [`Renderer::render`]: the cases the renderer could
+/// not recover from internally. Per-frame surface states are reported as a
+/// [`FrameOutcome`] instead.
 #[derive(Debug)]
 pub enum RenderError {
-    /// The window's swap chain is gone (the surface itself was lost).
-    /// Recovering from this in-place is non-trivial; the practical response
-    /// is to tear the renderer down and rebuild it.
+    /// The window's surface was lost and could not be re-created. The
+    /// practical response is to tear the renderer down and rebuild it.
     SurfaceLost,
 }
 
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SurfaceLost => write!(f, "wgpu surface was lost"),
+            Self::SurfaceLost => write!(f, "wgpu surface was lost and could not be re-created"),
         }
     }
 }
@@ -135,15 +166,18 @@ impl std::error::Error for RenderError {}
 /// GPU resources every [`Layer`] shares (its pipelines, bind group layouts)
 /// and the registry of currently-live layers.
 pub struct Renderer {
-    /// Kept alive so the `Surface<'static>` stays valid. Not read directly
-    /// by any method today, but the field is required for soundness — the
-    /// surface is built from this Arc and would dangle if it were dropped.
-    #[allow(dead_code)] // owns the GPU resource its bind group points at
+    /// Kept alive so the `Surface<'static>` stays valid, and used to
+    /// re-create the surface when it is lost.
     window: Arc<Window>,
+    instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
+    // A window size that arrived since the last frame and has not been
+    // configured onto the surface yet — see `Renderer::resize` for why the
+    // configure cannot happen where the size arrives.
+    pending_surface_size: Option<(u32, u32)>,
     // GPU resources shared by every `Layer` (its pipelines, bind group
     // layouts, the composite quad) — built once here rather than per layer.
     layer_pipelines: layer::LayerPipelines,
@@ -420,7 +454,8 @@ impl Renderer {
         // feature would fail device creation outright, hence the check.
         let timestamp_features =
             wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-        let timestamps_supported = adapter.features().contains(timestamp_features);
+        let timestamps_supported =
+            supports_timestamp_queries(adapter.get_info().backend, adapter.features());
 
         // `TextureFormatFeatureFlags`/`get_texture_format_features` reports
         // what the adapter's hardware can *physically* do, but wgpu only
@@ -481,7 +516,11 @@ impl Renderer {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // One frame in flight, not two. Every extra queued frame is a
+            // frame of display latency. Two suits a game rendering
+            // continuously for throughput; this renders on demand, a
+            // keystroke at a time, and wants the frame it just drew on screen.
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &surface_config);
 
@@ -520,10 +559,12 @@ impl Renderer {
 
         Self {
             window,
+            instance,
             device,
             queue,
             surface,
             surface_config,
+            pending_surface_size: None,
             layer_pipelines,
             msaa_texture,
             msaa_view,
@@ -549,15 +590,24 @@ impl Renderer {
         self.scale_factor = scale_factor;
     }
 
-    /// Reconfigure the swap chain for a new window size. No-op on zero-sized
+    /// Record a new window size. The swap chain is reconfigured at the top
+    /// of a later [`Renderer::render`], never here. No-op on zero-sized
     /// (minimised) windows, which would otherwise produce invalid surfaces.
-    /// Live layers pick up the new size lazily, the next time they render
+    /// Live layers pick up the new size lazily the next time they render
     /// (see `layer::render_layers`).
+    ///
+    /// Deferring is the fix for a macOS hang that took the whole app with
+    /// it. `Surface::configure` waits for every submission still in flight,
+    /// and wgpu-core waits *indefinitely*. On Metal a drawable presented
+    /// while the window is invisible or being moved by a window manager can
+    /// wait forever for a vsync that never arrives (gfx-rs/wgpu#8309), so
+    /// its command buffer never completes and the process never responds
+    /// again. `render` therefore configures only once the queue has
+    /// drained, which leaves the wait nothing to block on. While a resize
+    /// is pending, frames report [`FrameOutcome::Retry`].
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
-            self.surface_config.width = width;
-            self.surface_config.height = height;
-            self.surface.configure(&self.device, &self.surface_config);
+            self.pending_surface_size = Some((width, height));
         }
     }
 
@@ -602,10 +652,45 @@ impl Renderer {
     /// texture first, skipped entirely for layers whose content hasn't
     /// changed — see `layer::render_layers`).
     ///
-    /// Returns `Ok(())` for every per-frame state that is handled in place
-    /// (timeout, occlusion, suboptimal/outdated swap chain). The `Result`
-    /// only carries genuinely unrecoverable surface errors.
-    pub fn render(&mut self) -> Result<(), RenderError> {
+    /// Returns a [`FrameOutcome`] saying whether the frame was shown and,
+    /// if not, whether to retry or wait for the window to become visible.
+    /// The `Err` side is reserved for genuinely unrecoverable surface
+    /// errors.
+    pub fn render(&mut self) -> Result<FrameOutcome, RenderError> {
+        // Wall-clock frame delta, the anchor for `get_frametime`. Measured
+        // before anything below can return early, because several paths do:
+        // an occluded window, a timed-out or outdated surface, a frame
+        // skipped while a resize is pending. Measuring only after a
+        // presented frame left the delta at zero through a run of early
+        // returns, which froze every animation mid-play and had the loop
+        // ask for another frame forever.
+        let now = Instant::now();
+        if let Some(previous) = self.previous_frame_at {
+            self.frame_delta = now.duration_since(previous);
+        }
+        self.previous_frame_at = Some(now);
+
+        // The one place the swap chain is reconfigured: before a frame is
+        // acquired, and only once the queue has drained (see `resize`).
+        if let Some((width, height)) = self.pending_surface_size {
+            if matches!(
+                self.device.poll(wgpu::PollType::Poll),
+                Ok(wgpu::PollStatus::QueueEmpty)
+            ) {
+                self.pending_surface_size = None;
+                self.surface_config.width = width;
+                self.surface_config.height = height;
+                self.surface.configure(&self.device, &self.surface_config);
+            } else {
+                // Draw nothing: rendering is what fills the queue, so
+                // carrying on would leave it no emptier and the swap chain
+                // could stay at the old size while the window is at the new
+                // one (the compositor scaling a stale surface). Skipping
+                // lets the queue drain; the caller retries.
+                return Ok(FrameOutcome::Retry);
+            }
+        }
+
         let frame = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => frame,
             // Still a valid, presentable frame — just not ideally sized.
@@ -617,25 +702,31 @@ impl Renderer {
             // it while still holding `frame` is exactly what's invalid. An
             // actual size change already reaches this renderer correctly
             // through `Renderer::resize` (called from
-            // `WindowEvent::Resized`), which runs between frames, never
-            // while one is held — so there's nothing to do here but use
-            // the frame as given.
+            // `WindowEvent::Resized`), which only records it; the configure
+            // happens at the top of this method, before a frame is acquired
+            // — so there's nothing to do here but use the frame as given.
             CurrentSurfaceTexture::Suboptimal(frame) => frame,
             CurrentSurfaceTexture::Outdated => {
-                // The surface has changed; reconfigure and skip this frame.
-                self.surface.configure(&self.device, &self.surface_config);
-                return Ok(());
+                // The surface has changed; queue a reconfigure (done at the
+                // top of the next frame, on a drained queue) and retry.
+                self.pending_surface_size =
+                    Some((self.surface_config.width, self.surface_config.height));
+                return Ok(FrameOutcome::Retry);
             }
-            CurrentSurfaceTexture::Timeout
-            | CurrentSurfaceTexture::Occluded
-            | CurrentSurfaceTexture::Validation => {
-                // Nothing usable this frame; try again next time.
-                return Ok(());
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Validation => {
+                return Ok(FrameOutcome::Retry);
             }
+            CurrentSurfaceTexture::Occluded => return Ok(FrameOutcome::Occluded),
             CurrentSurfaceTexture::Lost => {
-                // The surface itself is gone; the only honest signal we can
-                // give the caller is that the surface is invalid.
-                return Err(RenderError::SurfaceLost);
+                // The device is intact, so every layer and pipeline stays
+                // valid: only the window surface needs re-creating.
+                let surface = self
+                    .instance
+                    .create_surface(self.window.clone())
+                    .map_err(|_| RenderError::SurfaceLost)?;
+                surface.configure(&self.device, &self.surface_config);
+                self.surface = surface;
+                return Ok(FrameOutcome::Retry);
             }
         };
 
@@ -734,15 +825,7 @@ impl Renderer {
             timestamps.collect(&self.device);
         }
 
-        // Wall-clock frame delta, the anchor for `get_frametime`. Measured
-        // at the same point every frame so the delta is stable under vsync.
-        let now = Instant::now();
-        if let Some(previous) = self.previous_frame_at {
-            self.frame_delta = now.duration_since(previous);
-        }
-        self.previous_frame_at = Some(now);
-
-        Ok(())
+        Ok(FrameOutcome::Presented)
     }
 
     /// Wall-clock time between the two most recent frames — the value to
@@ -781,4 +864,32 @@ impl Renderer {
 
     /// Reserved for future per-window state. Currently a no-op.
     pub fn handle_event(&mut self, _event: &WindowEvent) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supports_timestamp_queries;
+
+    const TIMESTAMPS: wgpu::Features =
+        wgpu::Features::TIMESTAMP_QUERY.union(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+
+    #[test]
+    fn metal_never_uses_legacy_timestamp_queries() {
+        assert!(!supports_timestamp_queries(
+            wgpu::Backend::Metal,
+            TIMESTAMPS
+        ));
+    }
+
+    #[test]
+    fn other_backends_require_both_timestamp_features() {
+        assert!(supports_timestamp_queries(
+            wgpu::Backend::Vulkan,
+            TIMESTAMPS
+        ));
+        assert!(!supports_timestamp_queries(
+            wgpu::Backend::Vulkan,
+            wgpu::Features::TIMESTAMP_QUERY
+        ));
+    }
 }

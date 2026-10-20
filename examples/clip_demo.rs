@@ -452,6 +452,7 @@ impl ApplicationHandler for App {
         if self.input.handle_event(&event) {
             self.scheduler.request_redraw();
         }
+        self.scheduler.handle_event(&event);
         if let Some(r) = &mut self.renderer {
             r.handle_event(&event);
         }
@@ -509,8 +510,9 @@ impl ApplicationHandler for App {
                     spot.set_clip_shape(self.demo.spotlight_shape(&self.input))
                         .expect("circle shapes cannot fail to parse");
 
-                    if let Err(e) = r.render() {
-                        eprintln!("render error: {e}");
+                    match r.render() {
+                        Ok(outcome) => self.scheduler.finish_frame(outcome),
+                        Err(e) => eprintln!("render error: {e}"),
                     }
                 }
 

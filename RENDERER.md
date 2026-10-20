@@ -31,7 +31,7 @@ let layer = renderer.new_layer_top(LayerInvalidation::Automatic);
 // In window_event():
 //   WindowEvent::Resized(size)            => renderer.resize(size.width, size.height)  // physical px — the one exception
 //   WindowEvent::ScaleFactorChanged {..}  => renderer.set_scale_factor(scale_factor)
-//   WindowEvent::RedrawRequested          => renderer.render()?  (then window.request_redraw())
+//   WindowEvent::RedrawRequested          => renderer.render()?  (then scheduler.finish_frame(outcome))
 ```
 
 `Renderer` methods:
@@ -41,11 +41,11 @@ let layer = renderer.new_layer_top(LayerInvalidation::Automatic);
 | `new(window: Arc<Window>) -> Renderer` | async — call via `pollster::block_on` |
 | `new_layer_top(invalidation) -> Layer` | drawn last (above everything) |
 | `new_layer_bottom(invalidation) -> Layer` | drawn first (below everything) |
-| `render() -> Result<(), RenderError>` | one frame; recoverable surface states are handled internally |
+| `render() -> Result<FrameOutcome, RenderError>` | one frame. `Presented`: shown. `Retry`: nothing shown but a retry can succeed (timeout, outdated or lost surface, resize waiting on the GPU queue); ask for another frame. `Occluded`: window not visible; wait for `WindowEvent::Occluded(false)`. Report it with `FrameScheduler::finish_frame`. A lost surface is re-created internally; `Err(SurfaceLost)` only if that fails |
 | `resize(width: u32, height: u32)` | **physical** pixels, straight from `WindowEvent::Resized` |
 | `set_scale_factor(f64)` / `scale_factor() -> f64` | wire to `ScaleFactorChanged` |
 | `get_frametime() -> Duration` | wall-clock frame-to-frame |
-| `get_render_time() -> Duration` | CPU time inside `render()` |
+| `get_render_time() -> Duration` | wall-clock time since the renderer was created (not a render cost) |
 | `get_gpu_frametime() -> Option<Duration>` | GPU timestamps; `None` if unsupported |
 | `handle_event(&WindowEvent)` | forward every event; currently a no-op seam |
 
