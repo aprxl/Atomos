@@ -273,3 +273,7 @@ scheduler.request_redraw_in(blink.wake_in());
 ```
 
 `FrameScheduler::request_redraw_in(Duration)` / `request_redraw_at(Instant)` owe a frame at a future instant (the earliest request wins) and let `control_flow()` return `WaitUntil` for it.
+
+### Pacing applies to animation, not input
+
+`set_target_fps` caps how fast an *animation* may ask for its next frame. A `request_redraw()` made outside a frame (an input event, a resize) is drawn at once, ignoring the cap and any retry backoff, so a 5 fps animation demo still answers the mouse immediately. "Inside a frame" means between `begin_frame()` and `finish_frame(outcome)`, so call `finish_frame` after rendering; a loop that never does falls back to treating every request as paced.

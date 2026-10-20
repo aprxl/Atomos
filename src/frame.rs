@@ -77,6 +77,13 @@ const MAX_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 #[derive(Debug)]
 pub struct FrameScheduler {
     redraw_requested: bool,
+    /// A frame was requested from outside a frame (an input event, a
+    /// resize): it is drawn as soon as possible, ignoring the FPS target
+    /// and retry backoff, which pace *animation*, not responsiveness.
+    urgent: bool,
+    /// Between `begin_frame` and `finish_frame`: requests made now are the
+    /// frame asking for its own continuation (an animation), which is paced.
+    in_frame: bool,
     /// A frame owed at a future instant (a caret blink's next step). Kept
     /// as the earliest of everything asked for; it becomes an ordinary owed
     /// frame once due.
@@ -105,6 +112,9 @@ impl FrameScheduler {
             // frame never paints at all, so the first frame has to be owed
             // from the outset.
             redraw_requested: true,
+            // The first frame is owed immediately.
+            urgent: true,
+            in_frame: false,
             wake_at: None,
             occluded: false,
             retries: 0,
@@ -115,8 +125,18 @@ impl FrameScheduler {
 
     /// Ask for another frame. Idempotent within a frame — callers can poke
     /// this from anywhere without coordinating.
+    ///
+    /// Who asks decides how it is paced. A request made while a frame is
+    /// running (between [`begin_frame`](Self::begin_frame) and
+    /// [`finish_frame`](Self::finish_frame)) is an animation asking for its
+    /// next step and honours the FPS target. A request made outside a frame
+    /// (an input event, a resize) is drawn at once: a 5 fps animation cap
+    /// must not make the window answer the mouse at 5 fps.
     pub fn request_redraw(&mut self) {
         self.redraw_requested = true;
+        if !self.in_frame {
+            self.urgent = true;
+        }
     }
 
     /// Ask for a frame once `delay` has passed, without waking the loop
@@ -154,7 +174,7 @@ impl FrameScheduler {
     pub fn should_draw_now(&self) -> bool {
         self.wants_redraw()
             && !self.occluded
-            && self.deadline().is_none_or(|at| Instant::now() >= at)
+            && (self.urgent || self.deadline().is_none_or(|at| Instant::now() >= at))
     }
 
     /// Earliest instant the next frame may start, or `None` when pacing is
@@ -189,6 +209,7 @@ impl FrameScheduler {
     /// - [`FrameOutcome::Occluded`] keeps the frame owed but stops polling
     ///   until [`handle_event`](Self::handle_event) sees the window return.
     pub fn finish_frame(&mut self, outcome: FrameOutcome) {
+        self.in_frame = false;
         match outcome {
             FrameOutcome::Presented => self.retries = 0,
             FrameOutcome::Retry => {
@@ -221,6 +242,8 @@ impl FrameScheduler {
     /// this frame requests counts toward the *next* frame.
     pub fn begin_frame(&mut self) {
         self.redraw_requested = false;
+        self.urgent = false;
+        self.in_frame = true;
         if self.wake_due() {
             self.wake_at = None;
         }
@@ -242,6 +265,9 @@ impl FrameScheduler {
             return self
                 .wake_at
                 .map_or(ControlFlow::Wait, ControlFlow::WaitUntil);
+        }
+        if self.urgent {
+            return ControlFlow::Poll;
         }
         match self.deadline() {
             Some(at) => ControlFlow::WaitUntil(at),
@@ -439,5 +465,34 @@ mod tests {
         scheduler.request_redraw_at(soon);
         scheduler.request_redraw_at(soon + Duration::from_secs(5));
         assert_eq!(scheduler.control_flow(), ControlFlow::WaitUntil(soon));
+    }
+
+    #[test]
+    fn input_is_not_throttled_by_an_animation_fps_target() {
+        let mut scheduler = FrameScheduler::new();
+        scheduler.set_target_fps(Some(5.0));
+        scheduler.begin_frame();
+        scheduler.request_redraw(); // the animation asking for its next step
+        scheduler.finish_frame(FrameOutcome::Presented);
+        assert!(!scheduler.should_draw_now(), "the animation is paced");
+
+        scheduler.request_redraw(); // a mouse move, between frames
+        assert!(scheduler.should_draw_now(), "input is answered at once");
+        assert_eq!(scheduler.control_flow(), ControlFlow::Poll);
+
+        scheduler.begin_frame();
+        assert!(!scheduler.wants_redraw(), "the frame consumed the request");
+    }
+
+    #[test]
+    fn input_cuts_through_retry_backoff() {
+        let mut scheduler = FrameScheduler::new();
+        for _ in 0..=RETRIES_BEFORE_BACKOFF + 1 {
+            scheduler.begin_frame();
+            scheduler.finish_frame(FrameOutcome::Retry);
+        }
+        assert!(!scheduler.should_draw_now(), "retries back off");
+        scheduler.request_redraw();
+        assert!(scheduler.should_draw_now());
     }
 }

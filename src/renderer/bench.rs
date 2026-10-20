@@ -164,3 +164,54 @@ fn blinking_caret_over_a_full_screen_text_layer() {
         }
     }
 }
+
+/// A UI-like layer that interleaves shapes and short labels (many text
+/// batches) and changes its text every frame, as a live readout does.
+#[test]
+#[ignore = "benchmark; run on demand"]
+fn interleaved_labels_changing_every_frame() {
+    println!("\nN (rect + label) pairs, one label changes each frame (median / p95 ms)");
+    for pairs in [4usize, 16, 64] {
+        let Some(mut scene) = Scene::new((1920, 1080)) else {
+            println!("no GPU adapter; skipping");
+            return;
+        };
+        let layer = scene.layer();
+        let mut times = Vec::new();
+        for frame in 0..80 {
+            layer.clear();
+            for i in 0..pairs {
+                let y = i as f32 * 14.0;
+                layer.draw_rectangle(
+                    (0.0, y),
+                    (300.0, 12.0),
+                    Color::rgb(40, 40, 40),
+                    Rounding::NONE,
+                );
+                let label = if i == 0 {
+                    format!("frame {frame}")
+                } else {
+                    format!("row {i}")
+                };
+                layer.draw_text(
+                    &label,
+                    (4.0, y),
+                    Color::rgb(220, 220, 220),
+                    Alignment::default(),
+                    Font::Named("sans-serif".into()),
+                    FontParameters::new(10.0),
+                );
+            }
+            let start = Instant::now();
+            scene.frame(1.0);
+            if frame >= 10 {
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        let (median, p95) = median_p95(times);
+        println!(
+            "{pairs:>4} pairs  {median:>8.3} / {p95:<8.3}  text_batches={}",
+            scene.stats().text_batches
+        );
+    }
+}
