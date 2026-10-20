@@ -268,6 +268,7 @@ impl Hash for DrawCommand {
                 state.write_u32(font_parameters.weight.to_bits());
                 state.write_u32(font_parameters.width.to_bits());
                 state.write_u32(font_parameters.tracking.to_bits());
+                state.write_u32(font_parameters.slant.to_bits());
                 alignment.hash(state);
                 color.hash_bits(state);
             }
@@ -290,6 +291,7 @@ impl Hash for DrawCommand {
                     state.write_u32(span.font_parameters.weight.to_bits());
                     state.write_u32(span.font_parameters.width.to_bits());
                     state.write_u32(span.font_parameters.tracking.to_bits());
+                    state.write_u32(span.font_parameters.slant.to_bits());
                     span.color.hash_bits(state);
                 }
                 hash_f32_pair(position, state);

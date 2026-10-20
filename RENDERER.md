@@ -106,7 +106,7 @@ scale_factor() -> f32
   every frame is cheap.
 - `FontParameters::new(size)` then set fields: `size` (px), `weight` (faux-bold,
   `0.0` = normal, continuous), `width` (faux-condense ratio, `1.0` = normal),
-  `tracking` (extra letter-spacing in EM).
+  `tracking` (extra letter-spacing in EM), `slant` (faux-italic shear; 0.2 is a typical oblique).
 - `Alignment { horizontal, vertical }` says which point of the text's bounding
   box `position` anchors: `Alignment::TOP_LEFT`, `Alignment::CENTER`, or build
   from `HorizontalAlign::{Left,Center,Right}` × `VerticalAlign::{Top,Center,Bottom}`.

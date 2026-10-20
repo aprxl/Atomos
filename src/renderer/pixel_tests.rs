@@ -723,3 +723,78 @@ fn stats_report_groups_passes_and_rebuilds() {
         (0, 0)
     );
 }
+
+mod slant {
+    use super::*;
+    use crate::renderer::{Alignment, Font, FontParameters};
+
+    /// Mean x of inked pixels within rows `rows` of the 64x64 target.
+    fn ink_center(scene: &Scene, rows: std::ops::Range<u32>) -> Option<f32> {
+        let (mut weighted, mut total) = (0.0f32, 0.0f32);
+        for y in rows {
+            for x in 0..64 {
+                let v = scene.pixel(x, y)[0] as f32 / 255.0;
+                weighted += v * x as f32;
+                total += v;
+            }
+        }
+        (total > 0.5).then(|| weighted / total)
+    }
+
+    fn draw(layer: &super::super::Layer, slant: f32) {
+        layer.draw_text(
+            "l",
+            (20.0, 4.0),
+            Color::rgb(255, 255, 255),
+            Alignment::default(),
+            Font::Named("sans-serif".into()),
+            FontParameters {
+                slant,
+                ..FontParameters::new(48.0)
+            },
+        );
+    }
+
+    #[test]
+    fn slant_shears_upper_parts_to_the_right() {
+        let Some(mut scene) = scene() else { return };
+        let layer = scene.layer();
+        draw(&layer, 0.0);
+        scene.frame(1.0);
+        let (Some(top), Some(bottom)) = (ink_center(&scene, 6..18), ink_center(&scene, 34..46))
+        else {
+            return;
+        };
+        let upright_lean = top - bottom;
+
+        layer.clear();
+        draw(&layer, 0.35);
+        scene.frame(1.0);
+        let (Some(top), Some(bottom)) = (ink_center(&scene, 6..18), ink_center(&scene, 34..46))
+        else {
+            return;
+        };
+        let slanted_lean = top - bottom;
+        assert!(
+            slanted_lean > upright_lean + 3.0,
+            "upright {upright_lean}, slanted {slanted_lean}"
+        );
+    }
+
+    #[test]
+    fn a_slant_only_change_redraws() {
+        let Some(mut scene) = scene() else { return };
+        let layer = scene.layer();
+        draw(&layer, 0.0);
+        scene.frame(1.0);
+        let before: Vec<[u8; 4]> = (0..64).map(|x| scene.pixel(x, 8)).collect();
+        if before.iter().all(|p| p[0] < 20) {
+            return;
+        }
+        layer.clear();
+        draw(&layer, 0.5);
+        scene.frame(1.0);
+        let after: Vec<[u8; 4]> = (0..64).map(|x| scene.pixel(x, 8)).collect();
+        assert_ne!(before, after, "slant is part of the draw hash");
+    }
+}

@@ -111,14 +111,14 @@ or keep `Custom` groups surface-sized.
 `Layer::layout_text` breaks lines only at `\n`. Wrapping needs the width in the
 layout and `draw_text` to draw the wrapped result with the same geometry.
 
-### Italic / slant and shaped-glyph data from the fork
-**Trigger:** PDF/export or synthetic italic is needed.
+### Shaped-glyph data and appearance effects from the fork
+**Trigger:** PDF/export or an interaction effect is needed.
 
-Fork additions not ported: `FontParameters::slant` (must be part of the draw
-command hash, or slant-only changes are skipped; this is the audit's italic
-defect), `ShapedText`/`FaceId`/`ShapedGlyph` for export, `effect_advance_delta`
-export, focus-band and radial-wipe effects, `capture_into`/`freeze` frame
-snapshots. Only port what an app needs.
+`FontParameters::slant` (synthetic italic, with its draw-hash regression) is
+ported. Not ported: `ShapedText`/`FaceId`/`ShapedGlyph` for export,
+filled-plus-stroked synthetic bold (the fork changed bold's construction),
+focus-band and radial-wipe effects, `capture_into`/`freeze` frame snapshots.
+Only port what an app needs.
 
 ### Font and typography capabilities not in the renderer
 **Trigger:** an app needs them. True RGB subpixel AA, variable-font axes,

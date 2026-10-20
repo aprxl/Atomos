@@ -36,6 +36,8 @@ pub struct GlyphEffect {
     /// see the tracking-recentering note in
     /// [`EffectGlyphs::layout_to_custom_glyphs_with`].
     pub tracking: f32,
+    /// Faux-italic shear (mirrors `FontParameters::slant`); `0.0` = none.
+    pub slant: f32,
 }
 
 impl GlyphEffect {
@@ -43,6 +45,7 @@ impl GlyphEffect {
         embolden: 0.0,
         condense: 1.0,
         tracking: 0.0,
+        slant: 0.0,
     };
 }
 
@@ -52,6 +55,7 @@ impl From<&super::FontParameters> for GlyphEffect {
             embolden: parameters.weight,
             condense: parameters.width,
             tracking: parameters.tracking,
+            slant: parameters.slant,
         }
     }
 }
@@ -72,7 +76,7 @@ const RESET_AT_IDS: usize = MAX_GLYPH_IDS - 4096;
 /// archive.
 const BITMAP_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// Identifies one distinct (font, glyph, size, weight, condense)
+/// Identifies one distinct (font, glyph, size, weight, condense, slant)
 /// combination. Floats are stored as bits so the key can derive `Eq`/`Hash`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct EffectGlyphKey {
@@ -81,6 +85,7 @@ struct EffectGlyphKey {
     size_bits: u32,
     embolden_bits: u32,
     condense_bits: u32,
+    slant_bits: u32,
 }
 
 /// Rasterizes text through swash directly instead of cosmic-text's built-in
@@ -154,7 +159,7 @@ impl EffectGlyphs {
     /// place the buffer's own origin on screen, matching how a normal
     /// `TextArea` positions text.
     ///
-    /// Rasterizes any not-yet-seen (font, glyph, size, weight, condense)
+    /// Rasterizes any not-yet-seen (font, glyph, size, weight, condense, slant)
     /// combination immediately, rather than lazily inside the rasterize
     /// callback — glyphon requires a `CustomGlyph`'s exact pixel width/height
     /// to be declared up front, before it asks for the bitmap, and that size
@@ -269,6 +274,7 @@ impl EffectGlyphs {
                     size_bits: physical.cache_key.font_size_bits,
                     embolden_bits: embolden.to_bits(),
                     condense_bits: condense.to_bits(),
+                    slant_bits: effect.slant.to_bits(),
                 };
 
                 if !self.cache.contains_key(&key)
@@ -279,6 +285,7 @@ impl EffectGlyphs {
                         physical.cache_key.font_weight,
                         embolden,
                         condense,
+                        effect.slant,
                     )
                 {
                     self.bitmap_bytes += image.data.len();
@@ -370,6 +377,15 @@ pub fn effect_advance_delta(embolden: f32, condense: f32, natural_advance: f32) 
     (condense - 1.0) * natural_advance + 2.0 * embolden
 }
 
+/// The swash [`Transform`] combining faux-condense (horizontal scale) with
+/// faux-italic (horizontal shear): `x' = condense * x + slant * y`, `y' = y`.
+/// Font outlines are y-up with the baseline at 0, so a positive `slant`
+/// shears upper parts to the right, the italic direction. `None` when both
+/// are neutral, which keeps untouched outlines on swash's fast path.
+fn effect_transform(condense: f32, slant: f32) -> Option<Transform> {
+    (condense != 1.0 || slant != 0.0).then(|| Transform::new(condense, 0.0, slant, 1.0, 0.0, 0.0))
+}
+
 /// Rasterize one glyph via swash directly, applying `embolden` (continuous
 /// faux-bold outline expansion) and, if `condense != 1.0`, a horizontal-scale
 /// `transform` (faux condense/expand). Mirrors the recipe cosmic-text's own
@@ -381,6 +397,7 @@ fn rasterize_glyph(
     weight: fontdb::Weight,
     embolden: f32,
     condense: f32,
+    slant: f32,
 ) -> Option<Image> {
     let font = font_system.get_font(key.font_id, weight)?;
     let size = f32::from_bits(key.size_bits);
@@ -389,11 +406,7 @@ fn rasterize_glyph(
         .size(size)
         .hint(true)
         .build();
-    let transform = if condense != 1.0 {
-        Some(Transform::scale(condense, 1.0))
-    } else {
-        None
-    };
+    let transform = effect_transform(condense, slant);
     // Color sources first (embedded-bitmap emoji, then COLR layered-outline
     // emoji), falling back to the plain monochrome outline every other
     // glyph uses. Each source is a no-op fallthrough when the font doesn't
