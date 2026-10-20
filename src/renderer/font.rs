@@ -17,7 +17,6 @@ pub enum Font {
     /// registered for its own lifetime.
     Bytes(&'static [u8]),
     /// A font file to load from disk.
-    #[allow(dead_code)] // not exercised by the current demo
     File(PathBuf),
 }
 

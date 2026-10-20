@@ -23,10 +23,9 @@ use std::rc::Rc;
 
 use wgpu::util::DeviceExt;
 
-use lyon::path::{self, builder::BorderRadii, Path};
+use lyon::path::{self, Path, builder::BorderRadii};
 use lyon::tessellation::{
-    BuffersBuilder, FillOptions, FillTessellator, FillVertex, FillVertexConstructor,
-    VertexBuffers,
+    BuffersBuilder, FillOptions, FillTessellator, FillVertex, FillVertexConstructor, VertexBuffers,
 };
 use lyon_extra::parser::{ParserOptions, PathParser, Source};
 
@@ -117,12 +116,20 @@ pub enum ClipShape {
         size: (f32, f32),
         rounding: Rounding,
     },
-    Circle { center: (f32, f32), radius: f32 },
+    Circle {
+        center: (f32, f32),
+        radius: f32,
+    },
     /// Implicitly closed, same as [`Layer::draw_polygon`].
-    Polygon { vertices: Vec<(f32, f32)> },
+    Polygon {
+        vertices: Vec<(f32, f32)>,
+    },
     /// SVG path-data string, same conventions as [`Layer::draw_path`]:
     /// authored units are logical pixels 1:1, `position` is an offset.
-    Path { d: String, position: (f32, f32) },
+    Path {
+        d: String,
+        position: (f32, f32),
+    },
 }
 
 /// Pixel-space `screen_size` uniform, shared by every layer's internal
@@ -258,12 +265,30 @@ impl CompositeVertex {
 /// top-left of the source texture (row 0 in a layer's own render pass is
 /// pixel-space `y = 0`, i.e. the top of the layer's canvas).
 const COMPOSITE_QUAD: &[CompositeVertex] = &[
-    CompositeVertex { position: [-1.0, 1.0], uv: [0.0, 0.0] },
-    CompositeVertex { position: [1.0, 1.0], uv: [1.0, 0.0] },
-    CompositeVertex { position: [1.0, -1.0], uv: [1.0, 1.0] },
-    CompositeVertex { position: [-1.0, 1.0], uv: [0.0, 0.0] },
-    CompositeVertex { position: [1.0, -1.0], uv: [1.0, 1.0] },
-    CompositeVertex { position: [-1.0, -1.0], uv: [0.0, 1.0] },
+    CompositeVertex {
+        position: [-1.0, 1.0],
+        uv: [0.0, 0.0],
+    },
+    CompositeVertex {
+        position: [1.0, 1.0],
+        uv: [1.0, 0.0],
+    },
+    CompositeVertex {
+        position: [1.0, -1.0],
+        uv: [1.0, 1.0],
+    },
+    CompositeVertex {
+        position: [-1.0, 1.0],
+        uv: [0.0, 0.0],
+    },
+    CompositeVertex {
+        position: [1.0, -1.0],
+        uv: [1.0, 1.0],
+    },
+    CompositeVertex {
+        position: [-1.0, -1.0],
+        uv: [0.0, 1.0],
+    },
 ];
 
 /// Vertex format for `draw_image`: a pixel-space position (same convention
@@ -499,11 +524,12 @@ impl LayerPipelines {
             label: Some("atomos-layer-solid-shader"),
             source: wgpu::ShaderSource::Wgsl(LAYER_SOLID_SHADER_SRC.into()),
         });
-        let solid_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("atomos-layer-solid-pipeline-layout"),
-            bind_group_layouts: &[Some(&screen_size_bind_group_layout)],
-            immediate_size: 0,
-        });
+        let solid_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("atomos-layer-solid-pipeline-layout"),
+                bind_group_layouts: &[Some(&screen_size_bind_group_layout)],
+                immediate_size: 0,
+            });
         // Renders into the layer's multisampled offscreen target (see
         // `msaa_sample_count`/`pick_msaa_sample_count` in `mod.rs`),
         // resolved into the layer's actual texture.
@@ -572,14 +598,15 @@ impl LayerPipelines {
             label: Some("atomos-layer-image-shader"),
             source: wgpu::ShaderSource::Wgsl(LAYER_IMAGE_SHADER_SRC.into()),
         });
-        let image_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("atomos-layer-image-pipeline-layout"),
-            bind_group_layouts: &[
-                Some(&screen_size_bind_group_layout),
-                Some(&composite_bind_group_layout),
-            ],
-            immediate_size: 0,
-        });
+        let image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("atomos-layer-image-pipeline-layout"),
+                bind_group_layouts: &[
+                    Some(&screen_size_bind_group_layout),
+                    Some(&composite_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
         let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("atomos-layer-image-pipeline"),
             layout: Some(&image_pipeline_layout),
@@ -893,7 +920,7 @@ struct EffectGpu {
     // *final* output regardless of how many passes it took to get there —
     // `composite_bind_group` is repointed here once this exists, so
     // `LayerInner::composite` needs no effect-awareness of its own.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the GPU resource its bind group points at
     output_texture: wgpu::Texture,
     output_view: wgpu::TextureView,
     kind: EffectGpuKind,
@@ -909,7 +936,7 @@ enum EffectGpuKind {
     Blur(Box<BlurEffectGpu>),
     /// One pass: `texture_view` -> `EffectGpu::output_view`.
     ColorMatrix {
-        #[allow(dead_code)]
+        #[allow(dead_code)] // owns the GPU resource its bind group points at
         matrix_buffer: wgpu::Buffer,
         bind_group: wgpu::BindGroup,
     },
@@ -927,12 +954,12 @@ enum EffectGpuKind {
 /// [`EffectGpuKind::Blur`]'s GPU state, boxed out of the enum itself — see
 /// that variant's doc.
 struct BlurEffectGpu {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the GPU resource its bind group points at
     ping_texture: wgpu::Texture,
     ping_view: wgpu::TextureView,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the GPU resource its bind group points at
     params_buffer_h: wgpu::Buffer,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the GPU resource its bind group points at
     params_buffer_v: wgpu::Buffer,
     bind_group_h: wgpu::BindGroup,
     bind_group_v: wgpu::BindGroup,
@@ -952,12 +979,18 @@ fn create_effect_bind_group(
         label: Some("atomos-layer-effect-bind-group"),
         layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::TextureView(texture_view),
             },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
         ],
     })
 }
@@ -977,8 +1010,13 @@ fn build_custom_effect_pipeline(
     bind_group_layout: &wgpu::BindGroupLayout,
 ) -> Option<wgpu::RenderPipeline> {
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let pipeline =
-        build_fullscreen_pipeline(device, format, "atomos-layer-custom-effect", source, bind_group_layout);
+    let pipeline = build_fullscreen_pipeline(
+        device,
+        format,
+        "atomos-layer-custom-effect",
+        source,
+        bind_group_layout,
+    );
     if let Some(error) = pollster::block_on(scope.pop()) {
         eprintln!("Atomos: custom shader effect failed to compile, layer left unaffected: {error}");
         return None;
@@ -1037,7 +1075,6 @@ pub(super) struct LayerInner {
 
     size: (u32, u32),
     // Kept alive so `texture_view` stays valid; not read directly otherwise.
-    #[allow(dead_code)]
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
     // No per-layer MSAA target: layers render into the renderer's one
@@ -1143,7 +1180,7 @@ struct ImageDraw {
     vertex_buffer: wgpu::Buffer,
     // Kept alive so `bind_group`'s texture view stays valid; not read
     // directly otherwise.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the GPU resource its bind group points at
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
 }
@@ -1273,7 +1310,6 @@ impl LayerInner {
 
     // The layer spike's one `Manual` layer never redraws, so nothing calls
     // this yet — real `Manual`-layer callers are the next pass's work.
-    #[allow(dead_code)]
     fn clear(&mut self) {
         self.pending.clear();
         if let InvalidationState::Manual { dirty } = &mut self.invalidation {
@@ -1379,27 +1415,29 @@ impl LayerInner {
                     1.0 / self.size.1.max(1) as f32,
                 ];
                 let params_buffer_h =
-                    self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("atomos-layer-blur-params-h"),
-                        contents: bytemuck::bytes_of(&BlurParamsUniform {
-                            direction: [1.0, 0.0],
-                            texel_size,
-                            radius: physical_radius,
-                            _pad: 0.0,
-                        }),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("atomos-layer-blur-params-h"),
+                            contents: bytemuck::bytes_of(&BlurParamsUniform {
+                                direction: [1.0, 0.0],
+                                texel_size,
+                                radius: physical_radius,
+                                _pad: 0.0,
+                            }),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
                 let params_buffer_v =
-                    self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("atomos-layer-blur-params-v"),
-                        contents: bytemuck::bytes_of(&BlurParamsUniform {
-                            direction: [0.0, 1.0],
-                            texel_size,
-                            radius: physical_radius,
-                            _pad: 0.0,
-                        }),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("atomos-layer-blur-params-v"),
+                            contents: bytemuck::bytes_of(&BlurParamsUniform {
+                                direction: [0.0, 1.0],
+                                texel_size,
+                                radius: physical_radius,
+                                _pad: 0.0,
+                            }),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
                 let bind_group_h = create_effect_bind_group(
                     &self.device,
                     &self.blur_bind_group_layout,
@@ -1425,13 +1463,14 @@ impl LayerInner {
             }
             ShaderEffect::ColorMatrix(matrix) => {
                 let matrix_buffer =
-                    self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("atomos-layer-colormatrix-uniform"),
-                        contents: bytemuck::bytes_of(&ColorMatrixUniform {
-                            cols: matrix.to_columns(),
-                        }),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("atomos-layer-colormatrix-uniform"),
+                            contents: bytemuck::bytes_of(&ColorMatrixUniform {
+                                cols: matrix.to_columns(),
+                            }),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
                 let bind_group = create_effect_bind_group(
                     &self.device,
                     &self.colormatrix_bind_group_layout,
@@ -1439,7 +1478,10 @@ impl LayerInner {
                     &self.texture_view,
                     &self.composite_sampler,
                 );
-                EffectGpuKind::ColorMatrix { matrix_buffer, bind_group }
+                EffectGpuKind::ColorMatrix {
+                    matrix_buffer,
+                    bind_group,
+                }
             }
             ShaderEffect::Custom(source) => {
                 let Some(pipeline) = build_custom_effect_pipeline(
@@ -1462,12 +1504,19 @@ impl LayerInner {
                     &self.composite_sampler,
                     &self.texture_view,
                 );
-                EffectGpuKind::Custom { pipeline, bind_group }
+                EffectGpuKind::Custom {
+                    pipeline,
+                    bind_group,
+                }
             }
         };
 
         self.set_composite_source(output_view.clone());
-        self.effect_gpu = Some(EffectGpu { output_texture, output_view, kind });
+        self.effect_gpu = Some(EffectGpu {
+            output_texture,
+            output_view,
+            kind,
+        });
     }
 
     /// Record this layer's active effect's render pass(es), if any — must
@@ -1476,7 +1525,9 @@ impl LayerInner {
     /// whatever this leaves in `composite_bind_group`, already repointed
     /// by `rebuild_effect_gpu`).
     fn apply_effect(&self, encoder: &mut wgpu::CommandEncoder) {
-        let Some(effect_gpu) = &self.effect_gpu else { return };
+        let Some(effect_gpu) = &self.effect_gpu else {
+            return;
+        };
         match &effect_gpu.kind {
             EffectGpuKind::Blur(blur) => {
                 run_fullscreen_pass(
@@ -1503,7 +1554,10 @@ impl LayerInner {
                     &self.composite_quad_vbuf,
                 );
             }
-            EffectGpuKind::Custom { pipeline, bind_group } => {
+            EffectGpuKind::Custom {
+                pipeline,
+                bind_group,
+            } => {
                 run_fullscreen_pass(
                     encoder,
                     pipeline,
@@ -1612,7 +1666,9 @@ impl LayerInner {
         encoder: &mut wgpu::CommandEncoder,
         msaa_view: &wgpu::TextureView,
     ) {
-        let Some(mask) = &mut self.mask_gpu else { return };
+        let Some(mask) = &mut self.mask_gpu else {
+            return;
+        };
         if !mask.dirty {
             return;
         }
@@ -1677,7 +1733,10 @@ impl LayerInner {
         let mut text_hasher = DefaultHasher::new();
         let mut has_text = false;
         for command in &self.pending {
-            if matches!(command, DrawCommand::Text { .. } | DrawCommand::StyledText { .. }) {
+            if matches!(
+                command,
+                DrawCommand::Text { .. } | DrawCommand::StyledText { .. }
+            ) {
                 has_text = true;
                 command.hash(&mut text_hasher);
             }
@@ -1738,7 +1797,13 @@ impl LayerInner {
         for command in &self.pending {
             // `Image` needs its own texture/bind group, not a shared
             // vertex/index buffer — built separately below.
-            if let DrawCommand::Image { pixels, top_left, size, tint } = command {
+            if let DrawCommand::Image {
+                pixels,
+                top_left,
+                size,
+                tint,
+            } = command
+            {
                 self.image_draws.push(build_image_draw(
                     &self.device,
                     &self.queue,
@@ -1860,7 +1925,11 @@ impl LayerInner {
 
         // Drawn last, on top of this layer's shapes/images — whatever
         // `prepare_layer` uploaded moments ago in `rebuild_if_needed`.
-        if let Err(e) = self.text_stack.borrow().render(&self.text_renderer, &mut rpass) {
+        if let Err(e) = self
+            .text_stack
+            .borrow()
+            .render(&self.text_renderer, &mut rpass)
+        {
             eprintln!("Atomos: text render error: {e:?}");
         }
     }
@@ -2007,7 +2076,11 @@ fn build_image_draw(
         usage: wgpu::BufferUsages::VERTEX,
     });
 
-    ImageDraw { vertex_buffer, texture, bind_group }
+    ImageDraw {
+        vertex_buffer,
+        texture,
+        bind_group,
+    }
 }
 
 fn create_composite_bind_group(
@@ -2068,7 +2141,11 @@ fn create_masked_composite_bind_group(
 fn clip_shape_to_command(shape: &ClipShape, s: f32) -> DrawCommand {
     const WHITE: Color = Color::rgb(0xFF, 0xFF, 0xFF);
     match shape {
-        ClipShape::Rectangle { top_left, size, rounding } => DrawCommand::Rectangle {
+        ClipShape::Rectangle {
+            top_left,
+            size,
+            rounding,
+        } => DrawCommand::Rectangle {
             top_left: [top_left.0 * s, top_left.1 * s],
             size: [size.0 * s, size.1 * s],
             color: WHITE,
@@ -2137,13 +2214,20 @@ fn tessellate_command(
             color,
             rounding,
         } => tessellate_rectangle(*top_left, *size, color, rounding, tessellator),
-        DrawCommand::Polygon { vertices, color } => tessellate_polygon(vertices, color, tessellator),
-        DrawCommand::Circle { center, radius, color } => {
-            tessellate_circle(*center, *radius, color, tessellator)
+        DrawCommand::Polygon { vertices, color } => {
+            tessellate_polygon(vertices, color, tessellator)
         }
-        DrawCommand::Path { d, position, scale, paint } => {
-            tessellate_svg_path(d, *position, *scale, paint, tessellator, stroke_tessellator)
-        }
+        DrawCommand::Circle {
+            center,
+            radius,
+            color,
+        } => tessellate_circle(*center, *radius, color, tessellator),
+        DrawCommand::Path {
+            d,
+            position,
+            scale,
+            paint,
+        } => tessellate_svg_path(d, *position, *scale, paint, tessellator, stroke_tessellator),
         // Handled directly in `LayerInner::build_buffers`, which needs its
         // own texture per image rather than a shared vertex/index buffer
         // — filtered out before ever reaching here.
@@ -2165,9 +2249,9 @@ fn paint_has_per_vertex_color(paint: &PathPaint) -> bool {
     match paint {
         PathPaint::Fill { color, .. } => is_per_vertex(color),
         PathPaint::Stroke(stroke) => is_per_vertex(&stroke.color),
-        PathPaint::FillAndStroke { fill_color, stroke, .. } => {
-            is_per_vertex(fill_color) || is_per_vertex(&stroke.color)
-        }
+        PathPaint::FillAndStroke {
+            fill_color, stroke, ..
+        } => is_per_vertex(fill_color) || is_per_vertex(&stroke.color),
     }
 }
 
@@ -2209,7 +2293,12 @@ fn path_bounding_box(path: &Path) -> ([f32; 2], [f32; 2]) {
                 visit(ctrl);
                 visit(to);
             }
-            path::Event::Cubic { from, ctrl1, ctrl2, to } => {
+            path::Event::Cubic {
+                from,
+                ctrl1,
+                ctrl2,
+                to,
+            } => {
                 visit(from);
                 visit(ctrl1);
                 visit(ctrl2);
@@ -2249,7 +2338,9 @@ fn scale_path(path: &Path, scale: f32) -> Path {
             path::Event::Quadratic { ctrl, to, .. } => {
                 builder.quadratic_bezier_to(s(ctrl), s(to));
             }
-            path::Event::Cubic { ctrl1, ctrl2, to, .. } => {
+            path::Event::Cubic {
+                ctrl1, ctrl2, to, ..
+            } => {
                 builder.cubic_bezier_to(s(ctrl1), s(ctrl2), s(to));
             }
             path::Event::End { close, .. } => {
@@ -2299,7 +2390,11 @@ fn tessellate_stroked(
     tessellator: &mut StrokeTessellator,
 ) -> (Vec<Vertex>, Vec<u32>) {
     let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
-    let ctor = ColorAtPosition { color: &stroke.color, min, max };
+    let ctor = ColorAtPosition {
+        color: &stroke.color,
+        min,
+        max,
+    };
     let mut buf_builder = BuffersBuilder::new(&mut buffers, ctor);
     let options = StrokeOptions::DEFAULT
         .with_line_width(stroke.width * scale)
@@ -2336,15 +2431,25 @@ fn tessellate_svg_path(
     let mut indices: Vec<u32> = Vec::new();
     match paint {
         PathPaint::Fill { color, rule } => {
-            let (v, i) =
-                tessellate_filled(&path, color, to_lyon_fill_rule(*rule), min, max, tessellator);
+            let (v, i) = tessellate_filled(
+                &path,
+                color,
+                to_lyon_fill_rule(*rule),
+                min,
+                max,
+                tessellator,
+            );
             append_geometry(&mut vertices, &mut indices, v, i);
         }
         PathPaint::Stroke(stroke) => {
             let (v, i) = tessellate_stroked(&path, stroke, scale, min, max, stroke_tessellator);
             append_geometry(&mut vertices, &mut indices, v, i);
         }
-        PathPaint::FillAndStroke { fill_color, fill_rule, stroke } => {
+        PathPaint::FillAndStroke {
+            fill_color,
+            fill_rule,
+            stroke,
+        } => {
             let (v, i) = tessellate_filled(
                 &path,
                 fill_color,
@@ -2384,7 +2489,9 @@ fn tessellate_filled(
     // Tolerance is in pixels here (unlike the old NDC-scale tessellation
     // this replaced), so a value much larger than a NDC-tuned `0.0005`
     // still looks smooth at UI scale.
-    let fill_opts = FillOptions::DEFAULT.with_tolerance(0.1).with_fill_rule(rule);
+    let fill_opts = FillOptions::DEFAULT
+        .with_tolerance(0.1)
+        .with_fill_rule(rule);
     tessellator
         .tessellate_path(path, &fill_opts, &mut buf_builder)
         .expect("fill tessellation should never fail for a valid path");
@@ -2478,7 +2585,14 @@ fn tessellate_polygon(
     }
 
     let (min, max) = bounding_box(vertices);
-    tessellate_filled(&builder.build(), color, LyonFillRule::EvenOdd, min, max, tessellator)
+    tessellate_filled(
+        &builder.build(),
+        color,
+        LyonFillRule::EvenOdd,
+        min,
+        max,
+        tessellator,
+    )
 }
 
 fn tessellate_circle(
@@ -2496,7 +2610,14 @@ fn tessellate_circle(
 
     let min = [center[0] - radius, center[1] - radius];
     let max = [center[0] + radius, center[1] + radius];
-    tessellate_filled(&builder.build(), color, LyonFillRule::EvenOdd, min, max, tessellator)
+    tessellate_filled(
+        &builder.build(),
+        color,
+        LyonFillRule::EvenOdd,
+        min,
+        max,
+        tessellator,
+    )
 }
 
 /// A retained drawing surface with its own offscreen texture and pending
@@ -2551,7 +2672,13 @@ impl Layer {
     ///   rectangle's area.
     /// - `rounding`: per-corner radii; use [`Rounding::NONE`] for a sharp
     ///   rectangle.
-    pub fn draw_rectangle(&self, top_left: (f32, f32), size: (f32, f32), color: Color, rounding: Rounding) {
+    pub fn draw_rectangle(
+        &self,
+        top_left: (f32, f32),
+        size: (f32, f32),
+        color: Color,
+        rounding: Rounding,
+    ) {
         let s = self.scale_factor();
         self.0.borrow_mut().push(DrawCommand::Rectangle {
             top_left: [top_left.0 * s, top_left.1 * s],
@@ -2677,7 +2804,12 @@ impl Layer {
             "draw_path/draw_svg_icon doesn't support Color::PerVertex — use Solid or Gradient"
         );
         parse_svg_path(d)?;
-        self.0.borrow_mut().push(DrawCommand::Path { d: d.to_string(), position, scale, paint });
+        self.0.borrow_mut().push(DrawCommand::Path {
+            d: d.to_string(),
+            position,
+            scale,
+            paint,
+        });
         Ok(())
     }
 
@@ -2727,7 +2859,6 @@ impl Layer {
     /// Unexercised by the current demo (no bundled image asset to point it
     /// at yet) — the real entry point for a future caller, e.g. a
     /// file-tree icon loaded from disk.
-    #[allow(dead_code)]
     pub fn draw_image_from_file(
         &self,
         path: &std::path::Path,
@@ -2785,10 +2916,20 @@ impl Layer {
     /// alignment. Exposed so callers can do their own layout (e.g. sizing
     /// a background box to fit a label) without duplicating text-shaping
     /// logic themselves.
-    pub fn get_text_size(&self, text: &str, font: &Font, font_parameters: &FontParameters) -> (f32, f32) {
+    pub fn get_text_size(
+        &self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> (f32, f32) {
         let s = self.scale_factor();
         let scaled = font_parameters.scaled(s);
-        let (width, height) = self.0.borrow().text_stack.borrow_mut().measure(text, font, &scaled);
+        let (width, height) = self
+            .0
+            .borrow()
+            .text_stack
+            .borrow_mut()
+            .measure(text, font, &scaled);
         (width / s, height / s)
     }
 
@@ -2806,7 +2947,9 @@ impl Layer {
     ///   its one string.
     pub fn draw_styled_text(&self, spans: &[TextSpan], position: (f32, f32), alignment: Alignment) {
         debug_assert!(
-            spans.iter().all(|span| matches!(span.color, Color::Solid(_))),
+            spans
+                .iter()
+                .all(|span| matches!(span.color, Color::Solid(_))),
             "draw_styled_text only supports Color::Solid per span"
         );
         let s = self.scale_factor();
@@ -2836,8 +2979,12 @@ impl Layer {
                 ..span.clone()
             })
             .collect();
-        let (width, height) =
-            self.0.borrow().text_stack.borrow_mut().measure_spans(&scaled_spans);
+        let (width, height) = self
+            .0
+            .borrow()
+            .text_stack
+            .borrow_mut()
+            .measure_spans(&scaled_spans);
         (width / s, height / s)
     }
 
@@ -2910,7 +3057,6 @@ impl Layer {
     /// own pending content every rebuilt frame.
     // Not called by the layer spike (its one `Manual` layer draws once and
     // never redraws) — kept as the real API `Manual`-layer callers need.
-    #[allow(dead_code)]
     pub fn clear(&self) {
         self.0.borrow_mut().clear();
     }
@@ -2930,7 +3076,8 @@ pub(super) fn render_layers(
     scale_factor: f32,
 ) {
     order.retain(|weak| weak.strong_count() > 0);
-    let live: Vec<Rc<RefCell<LayerInner>>> = order.iter().filter_map(|weak| weak.upgrade()).collect();
+    let live: Vec<Rc<RefCell<LayerInner>>> =
+        order.iter().filter_map(|weak| weak.upgrade()).collect();
 
     for inner in &live {
         let mut inner = inner.borrow_mut();

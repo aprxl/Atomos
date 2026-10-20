@@ -111,20 +111,34 @@ impl Hash for DrawCommand {
                 }
                 color.hash_bits(state);
             }
-            DrawCommand::Circle { center, radius, color } => {
+            DrawCommand::Circle {
+                center,
+                radius,
+                color,
+            } => {
                 state.write_u8(2);
                 hash_f32_pair(center, state);
                 state.write_u32(radius.to_bits());
                 color.hash_bits(state);
             }
-            DrawCommand::Path { d, position, scale, paint } => {
+            DrawCommand::Path {
+                d,
+                position,
+                scale,
+                paint,
+            } => {
                 state.write_u8(3);
                 d.hash(state);
                 hash_f32_pair(position, state);
                 state.write_u32(scale.to_bits());
                 hash_path_paint(paint, state);
             }
-            DrawCommand::Image { pixels, top_left, size, tint } => {
+            DrawCommand::Image {
+                pixels,
+                top_left,
+                size,
+                tint,
+            } => {
                 state.write_u8(4);
                 pixels.width.hash(state);
                 pixels.height.hash(state);
@@ -152,7 +166,11 @@ impl Hash for DrawCommand {
                 alignment.hash(state);
                 color.hash_bits(state);
             }
-            DrawCommand::StyledText { spans, position, alignment } => {
+            DrawCommand::StyledText {
+                spans,
+                position,
+                alignment,
+            } => {
                 state.write_u8(6);
                 state.write_usize(spans.len());
                 for span in spans {
@@ -195,7 +213,11 @@ fn hash_path_paint<H: Hasher>(paint: &PathPaint, state: &mut H) {
             state.write_u8(1);
             hash_stroke(stroke, state);
         }
-        PathPaint::FillAndStroke { fill_color, fill_rule, stroke } => {
+        PathPaint::FillAndStroke {
+            fill_color,
+            fill_rule,
+            stroke,
+        } => {
             state.write_u8(2);
             fill_color.hash_bits(state);
             state.write_u8(*fill_rule as u8);

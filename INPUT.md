@@ -61,7 +61,7 @@ Input::new(scale_factor: f64) -> Input
 
 `scale_factor` is `window.scale_factor()`. It is kept current from `ScaleFactorChanged` afterwards, so pass the real value once at window creation and never think about it again.
 
-If the window does not exist yet (an `App::default()` before `resumed`), construct with `1.0` and replace the whole `Input` in `resumed` — that is what `main.rs` does.
+If the window does not exist yet (an `App::default()` before `resumed`), construct with `1.0` and replace the whole `Input` in `resumed` — that is what `examples/window.rs` does.
 
 ## Keyboard
 
@@ -175,7 +175,7 @@ This runs automatically on focus loss. Call it manually when the app takes over 
 
 ## Worked example
 
-`src/bin/input_demo.rs` exercises the whole surface: key squares for a plain key and two chords, a hover circle, a scroll-resized cursor-follower, and a live readout of every raw field. Alt-tab away while holding Space to watch the stuck-key guarantee work.
+`examples/input_demo.rs` exercises the whole surface: key squares for a plain key and two chords, a hover circle, a scroll-resized cursor-follower, and a live readout of every raw field. Alt-tab away while holding Space to watch the stuck-key guarantee work.
 
 ```bash
 cargo run --bin input_demo

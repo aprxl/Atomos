@@ -232,5 +232,5 @@ popup.set_clip_shape(Some(ClipShape::Rectangle {
 }))?;
 ```
 
-See `src/bin/clip_demo.rs` for a full walkthrough of both clip paths,
+See `examples/clip_demo.rs` for a full walkthrough of both clip paths,
 including a per-frame animated mask.

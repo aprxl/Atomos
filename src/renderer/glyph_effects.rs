@@ -14,10 +14,10 @@
 use std::collections::HashMap;
 
 use glyphon::{
-    fontdb, Buffer, Color, ContentType, CustomGlyph, CustomGlyphId, FontSystem, LayoutGlyph,
-    RasterizeCustomGlyphRequest, RasterizedCustomGlyph,
+    Buffer, Color, ContentType, CustomGlyph, CustomGlyphId, FontSystem, LayoutGlyph,
+    RasterizeCustomGlyphRequest, RasterizedCustomGlyph, fontdb,
 };
-use swash::scale::{image::Content, image::Image, Render, ScaleContext, Source, StrikeWith};
+use swash::scale::{Render, ScaleContext, Source, StrikeWith, image::Content, image::Image};
 use swash::zeno::{Format, Transform};
 
 /// The synthetic per-glyph effect parameters carried by
@@ -39,7 +39,11 @@ pub struct GlyphEffect {
 }
 
 impl GlyphEffect {
-    pub const NEUTRAL: Self = Self { embolden: 0.0, condense: 1.0, tracking: 0.0 };
+    pub const NEUTRAL: Self = Self {
+        embolden: 0.0,
+        condense: 1.0,
+        tracking: 0.0,
+    };
 }
 
 impl From<&super::FontParameters> for GlyphEffect {
@@ -112,7 +116,9 @@ impl EffectGlyphs {
         color: [u8; 4],
     ) -> Vec<CustomGlyph> {
         let uniform_color = Color::rgba(color[0], color[1], color[2], color[3]);
-        self.layout_to_custom_glyphs_with(font_system, buffer, position, |_glyph| (effect, uniform_color))
+        self.layout_to_custom_glyphs_with(font_system, buffer, position, |_glyph| {
+            (effect, uniform_color)
+        })
     }
 
     /// Per-span variant, for `Layer::draw_styled_text`: every span in a
@@ -133,8 +139,13 @@ impl EffectGlyphs {
         span_effects: &[GlyphEffect],
     ) -> Vec<CustomGlyph> {
         self.layout_to_custom_glyphs_with(font_system, buffer, position, |glyph| {
-            let effect = span_effects.get(glyph.metadata).copied().unwrap_or(GlyphEffect::NEUTRAL);
-            let color = glyph.color_opt.unwrap_or(Color::rgba(0xFF, 0xFF, 0xFF, 0xFF));
+            let effect = span_effects
+                .get(glyph.metadata)
+                .copied()
+                .unwrap_or(GlyphEffect::NEUTRAL);
+            let color = glyph
+                .color_opt
+                .unwrap_or(Color::rgba(0xFF, 0xFF, 0xFF, 0xFF));
             (effect, color)
         })
     }
@@ -242,7 +253,11 @@ impl EffectGlyphs {
                 // `color` entirely for `ContentType::Color` content (see
                 // `rasterize`'s doc), so `None` here just documents that
                 // rather than changing behavior.
-                let glyph_color = if image.content == Content::Color { None } else { Some(color) };
+                let glyph_color = if image.content == Content::Color {
+                    None
+                } else {
+                    Some(color)
+                };
 
                 glyphs.push(CustomGlyph {
                     id,
@@ -276,7 +291,10 @@ impl EffectGlyphs {
             Content::Color => ContentType::Color,
             Content::Mask | Content::SubpixelMask => ContentType::Mask,
         };
-        Some(RasterizedCustomGlyph { data: image.data.clone(), content_type })
+        Some(RasterizedCustomGlyph {
+            data: image.data.clone(),
+            content_type,
+        })
     }
 }
 
@@ -308,7 +326,11 @@ fn rasterize_glyph(
 ) -> Option<Image> {
     let font = font_system.get_font(key.font_id, weight)?;
     let size = f32::from_bits(key.size_bits);
-    let mut scaler = scale_context.builder(font.as_swash()).size(size).hint(true).build();
+    let mut scaler = scale_context
+        .builder(font.as_swash())
+        .size(size)
+        .hint(true)
+        .build();
     let transform = if condense != 1.0 {
         Some(Transform::scale(condense, 1.0))
     } else {

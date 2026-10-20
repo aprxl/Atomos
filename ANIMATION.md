@@ -246,13 +246,13 @@ Also call `request_redraw()` explicitly on `Resized` and `ScaleFactorChanged` �
 
 ## Worked example
 
-`src/bin/input_demo.rs` has an animation panel with one caller-owned bar and one driven through the registry, plus a frame counter that visibly freezes when nothing is animating and nothing is being touched — the proof that frames are demand-driven.
+`examples/input_demo.rs` has an animation panel with one caller-owned bar and one driven through the registry, plus a frame counter that visibly freezes when nothing is animating and nothing is being touched — the proof that frames are demand-driven.
 
 ```bash
 cargo run --bin input_demo
 ```
 
-`src/bin/shader_demo.rs` drives a blur radius from an `Animation` and shows CPU and GPU frametime alongside it.
+`examples/shader_demo.rs` drives a blur radius from an `Animation` and shows CPU and GPU frametime alongside it.
 
 ## Deferred
 

@@ -1,28 +1,25 @@
 # Atomos
 
-**Spiritual successor to Emacs.** Pure-Rust core, Lua scripting, hand-rolled GPU renderer (wgpu + glyphon + lyon). Text editor that's a programmable runtime, not an application with a scripting bolt-on.
+**Native application backend, as a library.** Rendering, layout, styling, input and output on wgpu + winit (glyphon + lyon for text and paths). Other projects (e.g. Typewritter) depend on it; it is not an editor.
 
 ## Quick facts
 
-- **Location:** `~/.dev/Atomos/`
-- **Stack:** winit (windowing) → wgpu (GPU) → glyphon (text) + lyon (vector paths) → cosmic-text (layout)
-- **Language:** Rust (edition 2024), wgpu 0.29 (pinned to match glyphon)
-- **State:** Phase 0 — renderer foundation. Rectangle + text + rounded rect on screen. No editor logic yet.
-- **Cargo.toml** has all dependencies; **PROJECT.md** is the full design doc.
+- **Location:** `~/Develop/Atomos`
+- **Layout:** single library crate `atomos` (`src/lib.rs`); demos in `examples/`
+- **Language:** Rust (edition 2024, `rust-version` 1.98), wgpu 0.29 (pinned to match glyphon)
+- **Status:** being hardened for serious use; see the readiness audit in the Typewritter repo (`docs/audits/atomos-2026-10-20/AUDIT.md`).
+- **PROJECT.md** is the old editor roadmap, kept for history; it does not describe this library.
 
 ## Architecture invariants
 
-- All wgpu types are private to `src/renderer.rs`. Callers only see `Renderer` and its draw methods.
+- All wgpu types are private to `src/renderer/`. Callers only see `Renderer` and its draw methods.
 - The `Renderer` API will be `draw_rect`, `draw_text`, `draw_path`, `draw_image`, `flush` (not yet abstracted — capabilities first, API second).
-- `cosmic-text 0.19.0` is in `Cargo.toml` but unused — glyphon pulls `cosmic-text 0.18.2` internally. Use glyphon's re-exports (`glyphon::Buffer`, `glyphon::FontSystem`, etc.).
+- `cosmic-text` is not a direct dependency; glyphon pulls it in. Use glyphon's re-exports (`glyphon::Buffer`, `glyphon::FontSystem`, etc.).
 - wgpu version follows glyphon (currently 29.0.4). Upgrade both together.
 
 ## Guidelines
 
 - **No `exec` without explicit approval.** This is April's personal machine, not a sandbox.
-- Read `PROJECT.md` for full context before any substantial work.
+- Development uses Haiku agents for exploration, Sonnet for code, Opus for design; never run several Sonnet/Opus agents at once.
 - Keep code clean, no warnings. `cargo check` must pass.
 
-## Full project doc
-
-See [`PROJECT.md`](./PROJECT.md).

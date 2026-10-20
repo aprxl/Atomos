@@ -8,7 +8,6 @@ pub type Rgba = [u8; 4];
 // Not constructed anywhere yet — every current caller (the layer spike)
 // uses `Color::Solid`; `Gradient`/`PerVertex` are exercised once
 // `draw_polygon`/`draw_path`/`draw_image` land.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GradientDirection {
     /// Left edge of the shape's bounding box gets `stops[0]`, right edge
@@ -43,7 +42,6 @@ pub enum Color {
     Solid(Rgba),
     /// A two-stop linear gradient across the shape's bounding box. Not
     /// constructed anywhere yet — see [`GradientDirection`]'s note.
-    #[allow(dead_code)]
     Gradient {
         stops: [Rgba; 2],
         direction: GradientDirection,
@@ -51,7 +49,6 @@ pub enum Color {
     /// Explicit `[top_left, top_right, bottom_right, bottom_left]` corner
     /// colors, bilinearly blended across the shape's bounding box. Not
     /// constructed anywhere yet — see [`GradientDirection`]'s note.
-    #[allow(dead_code)]
     PerVertex([Rgba; 4]),
 }
 

@@ -71,7 +71,6 @@ impl Default for FrameScheduler {
     }
 }
 
-#[allow(dead_code)] // knobs the first animated feature will want; see `input::Input`
 impl FrameScheduler {
     pub fn new() -> Self {
         Self {
@@ -111,9 +110,7 @@ impl FrameScheduler {
     /// left to the display.
     fn deadline(&self) -> Option<Instant> {
         match (self.target_fps, self.last_frame_at) {
-            (Some(fps), Some(last)) if fps > 0.0 => {
-                Some(last + Duration::from_secs_f32(1.0 / fps))
-            }
+            (Some(fps), Some(last)) if fps > 0.0 => Some(last + Duration::from_secs_f32(1.0 / fps)),
             _ => None,
         }
     }
@@ -199,11 +196,18 @@ mod tests {
         let mut scheduler = FrameScheduler::new();
         scheduler.set_target_fps(Some(30.0));
         scheduler.begin_frame();
-        assert_eq!(scheduler.control_flow(), ControlFlow::Wait, "idle ignores the target");
+        assert_eq!(
+            scheduler.control_flow(),
+            ControlFlow::Wait,
+            "idle ignores the target"
+        );
 
         scheduler.request_redraw();
         let ControlFlow::WaitUntil(deadline) = scheduler.control_flow() else {
-            panic!("expected a WaitUntil deadline, got {:?}", scheduler.control_flow());
+            panic!(
+                "expected a WaitUntil deadline, got {:?}",
+                scheduler.control_flow()
+            );
         };
         let budget = deadline.duration_since(scheduler.last_frame_at.unwrap());
         assert!(
@@ -223,7 +227,10 @@ mod tests {
         scheduler.request_redraw();
 
         assert!(scheduler.wants_redraw(), "a frame is owed");
-        assert!(!scheduler.should_draw_now(), "but not until 200ms have passed");
+        assert!(
+            !scheduler.should_draw_now(),
+            "but not until 200ms have passed"
+        );
 
         // No target -> nothing to wait for, vsync does the pacing.
         scheduler.set_target_fps(None);

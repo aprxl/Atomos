@@ -83,7 +83,6 @@ pub struct Input {
 // The whole query surface is the point of this type; `main.rs` only drives
 // the event/frame plumbing, so most queries have no caller until editor code
 // lands. Same situation (and same treatment) as the renderer's draw API.
-#[allow(dead_code)]
 impl Input {
     /// `scale_factor` is the window's current DPI scale (`window.scale_factor()`);
     /// it is kept current from `ScaleFactorChanged` afterwards.
@@ -452,7 +451,11 @@ mod tests {
     }
 
     fn click(state: ElementState) -> WindowEvent {
-        WindowEvent::MouseInput { device_id: DeviceId::dummy(), state, button: MouseButton::Left }
+        WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state,
+            button: MouseButton::Left,
+        }
     }
 
     #[test]
@@ -463,8 +466,14 @@ mod tests {
         assert!(input.is_mouse_pressed(MouseButton::Left));
 
         input.end_frame();
-        assert!(input.is_mouse_down(MouseButton::Left), "held state must survive the frame");
-        assert!(!input.is_mouse_pressed(MouseButton::Left), "press edge must not repeat");
+        assert!(
+            input.is_mouse_down(MouseButton::Left),
+            "held state must survive the frame"
+        );
+        assert!(
+            !input.is_mouse_pressed(MouseButton::Left),
+            "press edge must not repeat"
+        );
 
         input.handle_event(&click(ElementState::Released));
         assert!(!input.is_mouse_down(MouseButton::Left));
@@ -483,7 +492,11 @@ mod tests {
         input.handle_event(&WindowEvent::Focused(false));
 
         assert!(!input.is_focused());
-        assert_eq!(input.keys_down().count(), 0, "keys must not stay stuck across focus loss");
+        assert_eq!(
+            input.keys_down().count(),
+            0,
+            "keys must not stay stuck across focus loss"
+        );
         assert!(!input.is_mouse_down(MouseButton::Left));
         assert!(input.modifiers().is_empty());
         // Reported as edges so press/release pairing unwinds instead of hanging.
@@ -495,8 +508,16 @@ mod tests {
     fn mouse_position_is_logical_and_delta_is_per_frame() {
         let mut input = Input::new(2.0);
         input.handle_event(&cursor(200.0, 100.0));
-        assert_eq!(input.mouse_position(), (100.0, 50.0), "physical px must be scaled down");
-        assert_eq!(input.mouse_delta(), (0.0, 0.0), "first move has no previous anchor");
+        assert_eq!(
+            input.mouse_position(),
+            (100.0, 50.0),
+            "physical px must be scaled down"
+        );
+        assert_eq!(
+            input.mouse_delta(),
+            (0.0, 0.0),
+            "first move has no previous anchor"
+        );
 
         input.end_frame();
         input.handle_event(&cursor(220.0, 100.0));
@@ -512,11 +533,17 @@ mod tests {
         input.handle_event(&cursor(10.0, 10.0));
         input.end_frame();
 
-        input.handle_event(&WindowEvent::CursorLeft { device_id: DeviceId::dummy() });
+        input.handle_event(&WindowEvent::CursorLeft {
+            device_id: DeviceId::dummy(),
+        });
         input.handle_event(&cursor(900.0, 600.0));
 
         assert!(input.is_cursor_in_window());
-        assert_eq!(input.mouse_delta(), (0.0, 0.0), "re-entry is a teleport, not a drag");
+        assert_eq!(
+            input.mouse_delta(),
+            (0.0, 0.0),
+            "re-entry is a teleport, not a drag"
+        );
     }
 
     #[test]

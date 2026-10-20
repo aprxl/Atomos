@@ -20,7 +20,12 @@ pub struct TextSpan {
 }
 
 impl TextSpan {
-    pub fn new(text: impl Into<String>, font: Font, font_parameters: FontParameters, color: Color) -> Self {
+    pub fn new(
+        text: impl Into<String>,
+        font: Font,
+        font_parameters: FontParameters,
+        color: Color,
+    ) -> Self {
         Self {
             text: text.into(),
             font,

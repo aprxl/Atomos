@@ -35,15 +35,16 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use glyphon::{
-    fontdb, Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, LayoutGlyph, Metrics,
+    Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, LayoutGlyph, Metrics,
     Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    fontdb,
 };
 
 use super::color::Color;
 use super::draw_command::DrawCommand;
 use super::font::Font;
 use super::font_parameters::FontParameters;
-use super::glyph_effects::{effect_advance_delta, EffectGlyphs, GlyphEffect};
+use super::glyph_effects::{EffectGlyphs, GlyphEffect, effect_advance_delta};
 use super::text_span::TextSpan;
 use super::{Alignment, HorizontalAlign, VerticalAlign};
 
@@ -152,7 +153,13 @@ impl TextStack {
         let glyph_cache = Cache::new(device);
         let atlas = TextAtlas::new(device, queue, &glyph_cache, format);
         let mut viewport = Viewport::new(device, &glyph_cache);
-        viewport.update(queue, Resolution { width: size.0, height: size.1 });
+        viewport.update(
+            queue,
+            Resolution {
+                width: size.0,
+                height: size.1,
+            },
+        );
 
         let blank_buffer = build_buffer(&mut font_system, "", &Attrs::new(), 16.0);
 
@@ -231,7 +238,13 @@ impl TextStack {
     }
 
     pub(super) fn resize(&mut self, queue: &wgpu::Queue, size: (u32, u32)) {
-        self.viewport.update(queue, Resolution { width: size.0, height: size.1 });
+        self.viewport.update(
+            queue,
+            Resolution {
+                width: size.0,
+                height: size.1,
+            },
+        );
     }
 
     /// Measure the pixel size `text` would occupy shaped with `font`/
@@ -240,7 +253,12 @@ impl TextStack {
     /// resolve alignment (and the same shape cache, so measuring text that
     /// is also drawn this frame shapes it once, not twice). Exposed via
     /// [`super::Layer::get_text_size`].
-    pub(super) fn measure(&mut self, text: &str, font: &Font, font_parameters: &FontParameters) -> (f32, f32) {
+    pub(super) fn measure(
+        &mut self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> (f32, f32) {
         let key = self.ensure_shaped(text, font, font_parameters);
         let effect = GlyphEffect::from(font_parameters);
         measure_shaped_buffer_with(&self.shape_cache[&key].buffer, |_| effect)
@@ -257,7 +275,13 @@ impl TextStack {
             return key;
         }
         let buffer = self.shape(text, font, font_parameters);
-        self.shape_cache.insert(key, CachedShape { buffer, last_used: frame });
+        self.shape_cache.insert(
+            key,
+            CachedShape {
+                buffer,
+                last_used: frame,
+            },
+        );
         key
     }
 
@@ -270,7 +294,13 @@ impl TextStack {
             return key;
         }
         let buffer = self.shape_spans(spans);
-        self.shape_cache.insert(key, CachedShape { buffer, last_used: frame });
+        self.shape_cache.insert(
+            key,
+            CachedShape {
+                buffer,
+                last_used: frame,
+            },
+        );
         key
     }
 
@@ -316,10 +346,15 @@ impl TextStack {
     /// [`super::Layer::get_styled_text_size`].
     pub(super) fn measure_spans(&mut self, spans: &[TextSpan]) -> (f32, f32) {
         let key = self.ensure_shaped_spans(spans);
-        let span_effects: Vec<GlyphEffect> =
-            spans.iter().map(|span| GlyphEffect::from(&span.font_parameters)).collect();
+        let span_effects: Vec<GlyphEffect> = spans
+            .iter()
+            .map(|span| GlyphEffect::from(&span.font_parameters))
+            .collect();
         measure_shaped_buffer_with(&self.shape_cache[&key].buffer, |glyph| {
-            span_effects.get(glyph.metadata).copied().unwrap_or(GlyphEffect::NEUTRAL)
+            span_effects
+                .get(glyph.metadata)
+                .copied()
+                .unwrap_or(GlyphEffect::NEUTRAL)
         })
     }
 
@@ -337,8 +372,10 @@ impl TextStack {
         // Resolved before building any `Attrs` below, since those borrow
         // the resolved family names by reference — `resolve_family` needs
         // `&mut self` and can't be called again once that borrow starts.
-        let families: Vec<Option<String>> =
-            spans.iter().map(|span| self.resolve_family(&span.font)).collect();
+        let families: Vec<Option<String>> = spans
+            .iter()
+            .map(|span| self.resolve_family(&span.font))
+            .collect();
 
         let attrs_per_span: Vec<Attrs> = spans
             .iter()
@@ -430,7 +467,12 @@ impl TextStack {
                     // Destructured so the cached buffer (immutable) and
                     // `font_system`/`effect_glyphs` (mutable) borrows are
                     // visibly disjoint fields of `self`.
-                    let TextStack { shape_cache, font_system, effect_glyphs, .. } = self;
+                    let TextStack {
+                        shape_cache,
+                        font_system,
+                        effect_glyphs,
+                        ..
+                    } = self;
                     let buffer = &shape_cache[&key].buffer;
                     let (width, height) = measure_shaped_buffer_with(buffer, |_| effect);
                     let anchored = apply_alignment(*position, *alignment, width, height);
@@ -443,16 +485,28 @@ impl TextStack {
                     );
                     all_glyphs.push(glyphs);
                 }
-                DrawCommand::StyledText { spans, position, alignment } => {
+                DrawCommand::StyledText {
+                    spans,
+                    position,
+                    alignment,
+                } => {
                     let key = self.ensure_shaped_spans(spans);
                     let span_effects: Vec<GlyphEffect> = spans
                         .iter()
                         .map(|span| GlyphEffect::from(&span.font_parameters))
                         .collect();
-                    let TextStack { shape_cache, font_system, effect_glyphs, .. } = self;
+                    let TextStack {
+                        shape_cache,
+                        font_system,
+                        effect_glyphs,
+                        ..
+                    } = self;
                     let buffer = &shape_cache[&key].buffer;
                     let (width, height) = measure_shaped_buffer_with(buffer, |glyph| {
-                        span_effects.get(glyph.metadata).copied().unwrap_or(GlyphEffect::NEUTRAL)
+                        span_effects
+                            .get(glyph.metadata)
+                            .copied()
+                            .unwrap_or(GlyphEffect::NEUTRAL)
                     });
                     let anchored = apply_alignment(*position, *alignment, width, height);
                     let glyphs = effect_glyphs.layout_to_custom_glyphs_spans(
@@ -606,7 +660,10 @@ fn register_font_bytes(db: &mut fontdb::Database, bytes: &'static [u8]) -> Optio
 }
 
 /// [`register_font_bytes`], loading from a file instead.
-fn register_font_file(db: &mut fontdb::Database, path: &Path) -> Result<Option<String>, std::io::Error> {
+fn register_font_file(
+    db: &mut fontdb::Database,
+    path: &Path,
+) -> Result<Option<String>, std::io::Error> {
     let before: std::collections::HashSet<fontdb::ID> = db.faces().map(|f| f.id).collect();
     db.load_font_file(path)?;
     Ok(db

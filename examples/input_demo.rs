@@ -1,7 +1,7 @@
 //! Input-system proof of concept.
 //!
 //! Run with `cargo run --bin input_demo`. Exercises every part of
-//! `input::Input` against the renderer:
+//! `atomos::input::Input` against the renderer:
 //!
 //! - three key squares — a plain key (Space) and two chords (Ctrl+S,
 //!   Shift+A) — lit while held, with a press counter proving edge-triggering
@@ -21,22 +21,13 @@
 //! touching the mouse with animations paused (`T`) and it freezes. Nothing
 //! is being drawn at all until something asks.
 
-#[path = "../animation.rs"]
-mod animation;
-#[path = "../frame.rs"]
-mod frame;
-#[path = "../input.rs"]
-mod input;
-#[path = "../renderer/mod.rs"]
-mod renderer;
-
 use std::sync::Arc;
 use std::time::Duration;
 
-use animation::{Animation, Animations, Easing};
-use frame::FrameScheduler;
-use input::Input;
-use renderer::{
+use atomos::animation::{Animation, Animations, Easing};
+use atomos::frame::FrameScheduler;
+use atomos::input::Input;
+use atomos::renderer::{
     Alignment, Color, Font, FontParameters, Layer, LayerInvalidation, Renderer, Rounding,
 };
 use winit::{
@@ -84,7 +75,13 @@ fn label(layer: &Layer, s: &str, position: (f32, f32), size: f32, color: Color) 
 
 fn panel(layer: &Layer, top_left: (f32, f32), size: (f32, f32), title: &str) {
     layer.draw_rectangle(top_left, size, PANEL, Rounding::uniform(8.0));
-    label(layer, title, (top_left.0 + 16.0, top_left.1 + 14.0), 12.0, DIM);
+    label(
+        layer,
+        title,
+        (top_left.0 + 16.0, top_left.1 + 14.0),
+        12.0,
+        DIM,
+    );
 }
 
 /// One of the three key squares: a chord to watch, and how many times it has
@@ -436,8 +433,16 @@ impl Demo {
             "window",
             &format!(
                 "{} · cursor {}",
-                if input.is_focused() { "focused" } else { "blurred" },
-                if input.is_cursor_in_window() { "in" } else { "out" },
+                if input.is_focused() {
+                    "focused"
+                } else {
+                    "blurred"
+                },
+                if input.is_cursor_in_window() {
+                    "in"
+                } else {
+                    "out"
+                },
             ),
             if input.is_focused() { TEXT } else { RED },
         );
@@ -548,7 +553,9 @@ impl ApplicationHandler for App {
                 // Clamped, because the first frame after an idle stretch
                 // reports however long the window sat untouched.
                 let dt = FrameScheduler::animation_delta(
-                    self.renderer.as_ref().map_or(Duration::ZERO, Renderer::get_frametime),
+                    self.renderer
+                        .as_ref()
+                        .map_or(Duration::ZERO, Renderer::get_frametime),
                 );
                 let animating = self.demo.update(&self.input, dt);
                 if animating {

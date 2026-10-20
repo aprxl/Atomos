@@ -3,24 +3,6 @@
 version = 4
 
 [[package]]
-name = "Atomos"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "clap",
- "cosmic-text 0.19.0",
- "glyphon",
- "image",
- "lyon",
- "lyon_extra",
- "pollster",
- "ropey",
- "swash",
- "wgpu",
- "winit",
-]
-
-[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -177,6 +159,23 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
+name = "atomos"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "clap",
+ "glyphon",
+ "image",
+ "lyon",
+ "lyon_extra",
+ "pollster",
+ "ropey",
+ "swash",
+ "wgpu",
+ "winit",
+]
 
 [[package]]
 name = "autocfg"
@@ -447,30 +446,6 @@ name = "cosmic-text"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbe782a9e7520cc7de2232c957a47f99d3a35e855552677d07a557bc1a3b66ed"
-dependencies = [
- "bitflags 2.13.0",
- "fontdb",
- "harfrust",
- "linebender_resource_handle",
- "log",
- "rangemap",
- "rustc-hash 2.1.2",
- "self_cell",
- "skrifa 0.40.0",
- "smol_str 0.3.6",
- "swash",
- "sys-locale",
- "unicode-bidi",
- "unicode-linebreak",
- "unicode-script",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "cosmic-text"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73"
 dependencies = [
  "bitflags 2.13.0",
  "fontdb",
@@ -783,7 +758,7 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68dde9640ec6f986f59a265b4c0a5177f61e87e3ba71983b2195dab119cda0fa"
 dependencies = [
- "cosmic-text 0.18.2",
+ "cosmic-text",
  "etagere",
  "lru",
  "rustc-hash 2.1.2",

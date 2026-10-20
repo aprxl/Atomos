@@ -1,7 +1,7 @@
 //! Clipping-API proof of concept.
 //!
 //! Run with `cargo run --bin clip_demo`. Exercises both clip paths on
-//! `renderer::Layer`:
+//! `atomos::renderer::Layer`:
 //!
 //! - **Scissor** (`set_clip_rect`, the cheap everyday one): a viewport
 //!   panel whose scrolling content — text and bars alike — is cut off
@@ -19,24 +19,15 @@
 //!
 //! `Esc` quits.
 
-#[path = "../animation.rs"]
-mod animation;
-#[path = "../frame.rs"]
-mod frame;
-#[path = "../input.rs"]
-mod input;
-#[path = "../renderer/mod.rs"]
-mod renderer;
-
 use std::sync::Arc;
 use std::time::Duration;
 
-use animation::{Animation, Easing};
-use frame::FrameScheduler;
-use input::Input;
-use renderer::{
-    Alignment, ClipShape, Color, Font, FontParameters, GradientDirection, Layer,
-    LayerInvalidation, Renderer, Rounding,
+use atomos::animation::{Animation, Easing};
+use atomos::frame::FrameScheduler;
+use atomos::input::Input;
+use atomos::renderer::{
+    Alignment, ClipShape, Color, Font, FontParameters, GradientDirection, Layer, LayerInvalidation,
+    Renderer, Rounding,
 };
 use winit::{
     application::ApplicationHandler,
@@ -99,7 +90,13 @@ fn label(layer: &Layer, s: &str, position: (f32, f32), size: f32, color: Color) 
 
 fn panel(layer: &Layer, top_left: (f32, f32), size: (f32, f32), title: &str) {
     layer.draw_rectangle(top_left, size, PANEL, Rounding::uniform(8.0));
-    label(layer, title, (top_left.0 + 16.0, top_left.1 + 14.0), 12.0, DIM);
+    label(
+        layer,
+        title,
+        (top_left.0 + 16.0, top_left.1 + 14.0),
+        12.0,
+        DIM,
+    );
 }
 
 /// The shapes `M` cycles through on the mask panel. Everything is authored
@@ -138,15 +135,18 @@ impl MaskKind {
                 size: (pw - 48.0, ph - 64.0),
                 rounding: Rounding::uniform(36.0),
             },
-            MaskKind::Circle => ClipShape::Circle { center, radius: 118.0 },
+            MaskKind::Circle => ClipShape::Circle {
+                center,
+                radius: 118.0,
+            },
             MaskKind::Star => {
                 // Five-pointed star: alternate outer/inner radius vertices.
                 let (outer, inner) = (128.0, 52.0);
                 let vertices = (0..10)
                     .map(|i| {
                         let r = if i % 2 == 0 { outer } else { inner };
-                        let a = std::f32::consts::TAU * i as f32 / 10.0
-                            - std::f32::consts::FRAC_PI_2;
+                        let a =
+                            std::f32::consts::TAU * i as f32 / 10.0 - std::f32::consts::FRAC_PI_2;
                         (center.0 + r * a.cos(), center.1 + r * a.sin())
                     })
                     .collect();
@@ -192,12 +192,14 @@ impl Demo {
         animating |= self.breathe.advance(dt);
 
         if input.is_key_pressed(KeyCode::KeyM) {
-            let i = MaskKind::ALL.iter().position(|k| *k == self.mask).unwrap_or(0);
+            let i = MaskKind::ALL
+                .iter()
+                .position(|k| *k == self.mask)
+                .unwrap_or(0);
             self.mask = MaskKind::ALL[(i + 1) % MaskKind::ALL.len()];
         }
 
-        self.spot_radius = (self.spot_radius
-            + input.scroll_delta().1 * SPOT_RADIUS_PER_LINE)
+        self.spot_radius = (self.spot_radius + input.scroll_delta().1 * SPOT_RADIUS_PER_LINE)
             .clamp(SPOT_RADIUS_MIN, SPOT_RADIUS_MAX);
 
         animating
@@ -231,7 +233,13 @@ impl Demo {
             "MASK — set_clip_shape, any geometry",
         );
         let ((mx, my), (_, mh)) = MASK_PANEL;
-        label(layer, self.mask.name(), (mx + 16.0, my + mh - 26.0), 12.0, YELLOW);
+        label(
+            layer,
+            self.mask.name(),
+            (mx + 16.0, my + mh - 26.0),
+            12.0,
+            YELLOW,
+        );
 
         panel(
             layer,
@@ -367,11 +375,8 @@ impl Demo {
     fn spotlight_shape(&self, input: &Input) -> Option<ClipShape> {
         let ((sx, sy), (sw, sh)) = SPOT_PANEL;
         let (mx, my) = input.mouse_position();
-        let inside = input.is_cursor_in_window()
-            && mx >= sx
-            && mx <= sx + sw
-            && my >= sy
-            && my <= sy + sh;
+        let inside =
+            input.is_cursor_in_window() && mx >= sx && mx <= sx + sw && my >= sy && my <= sy + sh;
         inside.then(|| ClipShape::Circle {
             center: (mx, my),
             radius: self.spot_radius + self.breathe.value(-SPOT_BREATHE, SPOT_BREATHE),
@@ -473,7 +478,9 @@ impl ApplicationHandler for App {
                 self.scheduler.begin_frame();
 
                 let dt = FrameScheduler::animation_delta(
-                    self.renderer.as_ref().map_or(Duration::ZERO, Renderer::get_frametime),
+                    self.renderer
+                        .as_ref()
+                        .map_or(Duration::ZERO, Renderer::get_frametime),
                 );
                 let animating = self.demo.update(&self.input, dt);
                 if animating {

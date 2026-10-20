@@ -17,8 +17,8 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use wgpu::{CurrentSurfaceTexture, QuerySet};
@@ -43,19 +43,16 @@ mod text_stack;
 // `bin` crate, so nothing outside can reach these `pub` items yet either,
 // hence the blanket allow rather than one per item.
 pub use alignment::{Alignment, HorizontalAlign, VerticalAlign};
-pub use color::{Color, GradientDirection};
-#[allow(unused_imports)]
 pub use color::Rgba;
+pub use color::{Color, GradientDirection};
 pub use font::Font;
 pub use font_parameters::FontParameters;
 pub use layer::{Layer, LayerInvalidation};
 // Same story as `PathFileError` below: only bins that actually clip by
 // shape touch it.
-#[allow(unused_imports)]
 pub use layer::ClipShape;
 // Only needed by callers that pattern-match the error instead of just
 // `.expect()`/`?`-propagating it (like the current demo does).
-#[allow(unused_imports)]
 pub use layer::PathFileError;
 pub use path_paint::{FillRule, LineCap, LineJoin, PathPaint, Stroke};
 pub use pixels::Pixels;
@@ -136,7 +133,7 @@ pub struct Renderer {
     /// Kept alive so the `Surface<'static>` stays valid. Not read directly
     /// by any method today, but the field is required for soundness — the
     /// surface is built from this Arc and would dangle if it were dropped.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the GPU resource its bind group points at
     window: Arc<Window>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -150,7 +147,6 @@ pub struct Renderer {
     // because layer passes run sequentially and the target is transient
     // (cleared per pass, discarded after resolve) — per-layer copies would
     // cost a full-surface 4x texture each. Kept alive for `msaa_view`.
-    #[allow(dead_code)]
     msaa_texture: wgpu::Texture,
     msaa_view: wgpu::TextureView,
     msaa_size: (u32, u32),
@@ -314,10 +310,16 @@ impl TimestampState {
         self.next_serial += 1;
         slot.status.store(SLOT_STATUS_PENDING, Ordering::Release);
         let status = slot.status.clone();
-        slot.buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            let outcome = if result.is_ok() { SLOT_STATUS_MAPPED } else { SLOT_STATUS_FAILED };
-            status.store(outcome, Ordering::Release);
-        });
+        slot.buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let outcome = if result.is_ok() {
+                    SLOT_STATUS_MAPPED
+                } else {
+                    SLOT_STATUS_FAILED
+                };
+                status.store(outcome, Ordering::Release);
+            });
     }
 
     /// Drive map callbacks with a *non-blocking* poll and consume every
@@ -340,10 +342,8 @@ impl TimestampState {
                     slot.in_flight = false;
                     if slot.serial > self.consumed_serial {
                         self.consumed_serial = slot.serial;
-                        let elapsed_ns =
-                            ticks[1].saturating_sub(ticks[0]) as f64 * self.period_ns;
-                        self.last_gpu_frametime =
-                            Some(Duration::from_nanos(elapsed_ns as u64));
+                        let elapsed_ns = ticks[1].saturating_sub(ticks[0]) as f64 * self.period_ns;
+                        self.last_gpu_frametime = Some(Duration::from_nanos(elapsed_ns as u64));
                     }
                 }
                 // Map failed (e.g. device loss) — the buffer never mapped,
@@ -413,8 +413,8 @@ impl Renderer {
         // degrades to `None` (the animation-facing `get_frametime` is
         // wall-clock and needs no GPU features). Requesting an unsupported
         // feature would fail device creation outright, hence the check.
-        let timestamp_features = wgpu::Features::TIMESTAMP_QUERY
-            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let timestamp_features =
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
         let timestamps_supported = adapter.features().contains(timestamp_features);
 
         // `TextureFormatFeatureFlags`/`get_texture_format_features` reports
@@ -429,8 +429,9 @@ impl Renderer {
         // feature shape as `timestamp_features` above: request it only if
         // the adapter actually offers it, and gate any use of >4x MSAA on
         // whether it was actually granted, not just adapter-capable.
-        let extended_msaa_supported =
-            adapter.features().contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
+        let extended_msaa_supported = adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
 
         let mut required_features = wgpu::Features::empty();
         if timestamps_supported {
@@ -495,8 +496,12 @@ impl Renderer {
         let layer_pipelines =
             layer::LayerPipelines::new(&device, surface_config.format, msaa_sample_count);
         let msaa_size = (surface_config.width, surface_config.height);
-        let (msaa_texture, msaa_view) =
-            layer::create_msaa_texture(&device, surface_config.format, msaa_size, msaa_sample_count);
+        let (msaa_texture, msaa_view) = layer::create_msaa_texture(
+            &device,
+            surface_config.format,
+            msaa_size,
+            msaa_sample_count,
+        );
         let text_stack = Rc::new(RefCell::new(text_stack::TextStack::new(
             &device,
             &queue,
@@ -754,7 +759,9 @@ impl Renderer {
     /// queries, or before the first measurement completes. Use
     /// [`Renderer::get_frametime`] for animation stepping, not this.
     pub fn get_gpu_frametime(&self) -> Option<Duration> {
-        self.timestamps.as_ref().and_then(|timestamps| timestamps.last_gpu_frametime)
+        self.timestamps
+            .as_ref()
+            .and_then(|timestamps| timestamps.last_gpu_frametime)
     }
 
     /// Wall-clock time elapsed since this `Renderer` was created.

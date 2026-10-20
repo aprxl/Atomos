@@ -20,6 +20,10 @@ impl Pixels {
             width as usize * height as usize * 4,
             "Pixels data length must be width * height * 4"
         );
-        Self { width, height, data }
+        Self {
+            width,
+            height,
+            data,
+        }
     }
 }
