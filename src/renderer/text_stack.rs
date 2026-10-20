@@ -372,7 +372,35 @@ impl TextStack {
     ) -> super::text_layout::TextLayout {
         let key = self.ensure_shaped(text, font, font_parameters, wrap_width);
         let effect = GlyphEffect::from(font_parameters);
-        super::text_layout::TextLayout::from_buffer(&self.shape_cache[&key].buffer, text, effect)
+        super::text_layout::TextLayout::from_buffer(&self.shape_cache[&key].buffer, text, |_| {
+            effect
+        })
+    }
+
+    /// [`TextStack::layout`] for a span list: offsets index the spans'
+    /// concatenated text, and each glyph takes its own span's synthetic
+    /// effect.
+    pub(super) fn layout_spans(
+        &mut self,
+        spans: &[TextSpan],
+        wrap_width: Option<f32>,
+    ) -> super::text_layout::TextLayout {
+        let key = self.ensure_shaped_spans(spans, wrap_width);
+        let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+        let span_effects: Vec<GlyphEffect> = spans
+            .iter()
+            .map(|span| GlyphEffect::from(&span.font_parameters))
+            .collect();
+        super::text_layout::TextLayout::from_buffer(
+            &self.shape_cache[&key].buffer,
+            &text,
+            |glyph| {
+                span_effects
+                    .get(glyph.metadata)
+                    .copied()
+                    .unwrap_or(GlyphEffect::NEUTRAL)
+            },
+        )
     }
 
     /// Look up (or shape and insert) the cached buffer for one

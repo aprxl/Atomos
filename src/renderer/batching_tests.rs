@@ -89,14 +89,14 @@ impl Lcg {
     }
 }
 
-fn random_scene(layer: &Layer, seed: u64, clipped: bool) {
+fn random_scene(layer: &Layer, seed: u64, clipped: bool, fractional: bool) {
     let mut rng = Lcg(seed);
     let words = ["fn main()", "MMM", "let x = 1;", "iiiiiiii", "Wide W"];
     let image = Pixels::new(2, 2, [255, 128, 0, 255].repeat(4));
     let mut open_clips = 0;
     for _ in 0..40 {
-        let x = rng.below(110) as f32;
-        let y = rng.below(110) as f32;
+        let x = rng.below(110) as f32 + if fractional { rng.unit() } else { 0.0 };
+        let y = rng.below(110) as f32 + if fractional { rng.unit() } else { 0.0 };
         let color = Color::rgba(
             rng.below(256) as u8,
             rng.below(256) as u8,
@@ -166,30 +166,34 @@ fn random_scene(layer: &Layer, seed: u64, clipped: bool) {
 
 #[test]
 fn merging_never_changes_a_pixel() {
-    for clipped in [false, true] {
-        for seed in 1..=24u64 {
-            let Some(mut scene) = Scene::new((128, 128)) else {
-                return;
-            };
-            let merged = scene.layer();
-            random_scene(&merged, seed, clipped);
-            scene.frame(1.0);
-            let with_merging = scene.pixels();
-            let merged_ops = merged.0.borrow().op_kinds_for_test().len();
+    // Whole and fractional positions, at scale factors that put edges and
+    // glyph bitmaps between pixels.
+    for (scale, fractional) in [(1.0, false), (1.0, true), (1.25, true), (2.0, true)] {
+        for clipped in [false, true] {
+            for seed in 1..=16u64 {
+                let Some(mut scene) = Scene::new((128, 128)) else {
+                    return;
+                };
+                let merged = scene.layer();
+                random_scene(&merged, seed, clipped, fractional);
+                scene.frame(scale);
+                let with_merging = scene.pixels();
+                let merged_ops = merged.0.borrow().op_kinds_for_test().len();
 
-            let plain = scene.layer();
-            plain.0.borrow_mut().set_merge_batches_for_test(false);
-            random_scene(&plain, seed, clipped);
-            merged.clear();
-            scene.frame(1.0);
-            let without_merging = scene.pixels();
-            let plain_ops = plain.0.borrow().op_kinds_for_test().len();
+                let plain = scene.layer();
+                plain.0.borrow_mut().set_merge_batches_for_test(false);
+                random_scene(&plain, seed, clipped, fractional);
+                merged.clear();
+                scene.frame(scale);
+                let without_merging = scene.pixels();
+                let plain_ops = plain.0.borrow().op_kinds_for_test().len();
 
-            assert!(
-                with_merging == without_merging,
-                "seed {seed} (clipped: {clipped}) differs when merged"
-            );
-            assert!(merged_ops <= plain_ops, "merging never adds ops");
+                assert!(
+                    with_merging == without_merging,
+                    "seed {seed} differs when merged (scale {scale}, fractional {fractional}, clipped {clipped})"
+                );
+                assert!(merged_ops <= plain_ops, "merging never adds ops");
+            }
         }
     }
 }
@@ -307,4 +311,79 @@ fn long_merged_text_runs_are_cut_into_bounded_batches() {
     let kinds = layer.0.borrow().op_kinds_for_test();
     // 40 text commands at 16 per batch: 16 + 16 + 8.
     assert_eq!(kinds, ["solid", "text", "text", "text"]);
+}
+
+#[test]
+fn styled_text_layout_indexes_the_concatenated_spans() {
+    let Some(scene) = Scene::new((128, 128)) else {
+        return;
+    };
+    let mut scene = scene;
+    let layer = scene.layer();
+    let plain = FontParameters::new(14.0);
+    let bold = FontParameters {
+        weight: 1.5,
+        ..plain
+    };
+    let spans = [
+        TextSpan::new("fn ", font(), plain, Color::rgb(255, 255, 255)),
+        TextSpan::new("main", font(), bold, Color::rgb(255, 255, 255)),
+        TextSpan::new("() {}", font(), plain, Color::rgb(255, 255, 255)),
+    ];
+    let layout = layer.layout_styled_text(&spans);
+    if layout.size().0 <= 0.0 {
+        return;
+    }
+    // The layout agrees with the size query, synthetic bold included.
+    assert_eq!(layout.size(), layer.get_styled_text_size(&spans));
+    let text = "fn main() {}";
+    assert_eq!(layout.lines().len(), 1);
+    assert_eq!(layout.lines()[0].range, 0..text.len());
+    // Carets advance, and the bold span's glyphs are wider than plain ones.
+    let (before, inside, after) = (
+        layout.caret_rect(3).x,
+        layout.caret_rect(5).x,
+        layout.caret_rect(7).x,
+    );
+    assert!(before < inside && inside < after);
+    let plain_layout = layer.layout_text(text, &font(), &plain);
+    assert!(
+        layout.size().0 > plain_layout.size().0,
+        "bold widens its span"
+    );
+    // Hit-testing inverts caret placement across the span boundary.
+    let rect = layout.caret_rect(7);
+    assert_eq!(layout.hit_test((rect.x, rect.y + rect.height / 2.0)), 7);
+}
+
+#[test]
+fn wrapped_styled_layout_follows_the_wrapped_lines() {
+    let Some(scene) = Scene::new((128, 128)) else {
+        return;
+    };
+    let mut scene = scene;
+    let layer = scene.layer();
+    let params = FontParameters::new(14.0);
+    let spans = [
+        TextSpan::new("MMM MMM ", font(), params, Color::rgb(255, 255, 255)),
+        TextSpan::new("MMM MMM", font(), params, Color::rgb(0, 255, 255)),
+    ];
+    let natural = layer.get_styled_text_size(&spans);
+    if natural.0 <= 0.0 {
+        return;
+    }
+    let max = natural.0 / 2.0;
+    let wrapped = layer.layout_wrapped_styled_text(&spans, max);
+    assert_eq!(
+        wrapped.size(),
+        layer.get_wrapped_styled_text_size(&spans, max)
+    );
+    assert!(wrapped.lines().len() >= 2);
+    let second = wrapped.lines()[1].clone();
+    let at_wrap = wrapped.caret_rect(second.range.start);
+    assert_eq!(at_wrap.y, second.top);
+    assert_eq!(at_wrap.x, 0.0);
+    let y = second.top + second.height / 2.0;
+    // A click far to the right lands at the line's end (the text end here).
+    assert_eq!(wrapped.hit_test((5000.0, y)), second.range.end);
 }

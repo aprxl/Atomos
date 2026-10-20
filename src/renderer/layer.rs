@@ -3812,6 +3812,36 @@ impl Layer {
         Ok(f(self))
     }
 
+    /// [`Layer::layout_text`] for a [`Layer::draw_styled_text`] call: the
+    /// shaped geometry of all `spans` together, for carets, hit-testing and
+    /// selections. Byte offsets index the spans' text concatenated in order.
+    pub fn layout_styled_text(&self, spans: &[TextSpan]) -> TextLayout {
+        self.styled_text_layout(spans, None)
+    }
+
+    /// [`Layer::layout_wrapped_text`] for [`Layer::draw_wrapped_styled_text`]
+    /// with the same `max_width`.
+    pub fn layout_wrapped_styled_text(&self, spans: &[TextSpan], max_width: f32) -> TextLayout {
+        self.styled_text_layout(spans, Some(max_width))
+    }
+
+    fn styled_text_layout(&self, spans: &[TextSpan], wrap_width: Option<f32>) -> TextLayout {
+        let s = self.scale_factor();
+        let scaled_spans: Vec<TextSpan> = spans
+            .iter()
+            .map(|span| TextSpan {
+                font_parameters: span.font_parameters.scaled(s),
+                ..span.clone()
+            })
+            .collect();
+        self.0
+            .borrow()
+            .text_stack
+            .borrow_mut()
+            .layout_spans(&scaled_spans, wrap_width.map(|w| w * s))
+            .unscaled(s)
+    }
+
     pub fn get_styled_text_size(&self, spans: &[TextSpan]) -> (f32, f32) {
         self.styled_text_size(spans, None)
     }

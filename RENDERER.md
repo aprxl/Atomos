@@ -81,6 +81,7 @@ draw_wrapped_styled_text(spans: &[TextSpan], position, max_width, alignment)
 get_text_size(text, &Font, &FontParameters) -> (f32, f32)   // logical px, pre-alignment
 get_wrapped_text_size(text, max_width, &Font, &FontParameters) -> (f32, f32)
 get_styled_text_size(spans: &[TextSpan]) -> (f32, f32)
+layout_styled_text(spans) / layout_wrapped_styled_text(spans, max_width) -> TextLayout  // offsets index the concatenated spans
 get_wrapped_styled_text_size(spans: &[TextSpan], max_width: f32) -> (f32, f32)
 set_effect(effect: Option<ShaderEffect>)
 with_clip(shape: ClipShape, |layer| ..) -> Result<R, ParseError>   // clips what the closure draws

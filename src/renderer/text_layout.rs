@@ -17,7 +17,7 @@
 use std::ops::Range;
 
 use super::glyph_effects::{GlyphEffect, effect_advance_delta};
-use glyphon::Buffer;
+use glyphon::{Buffer, LayoutGlyph};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// An axis-aligned rectangle in logical pixels.
@@ -67,7 +67,7 @@ impl TextLayout {
     pub(in crate::renderer) fn from_buffer(
         buffer: &Buffer,
         text: &str,
-        effect: GlyphEffect,
+        mut effect_of: impl FnMut(&LayoutGlyph) -> GlyphEffect,
     ) -> Self {
         // Byte offset at which each `\n`-separated paragraph begins.
         let mut line_starts = vec![0usize];
@@ -89,6 +89,7 @@ impl TextLayout {
             // Byte span the glyphs cover, relative to the paragraph.
             let (mut first, mut last) = (usize::MAX, 0usize);
             for glyph in run.glyphs {
+                let effect = effect_of(glyph);
                 let delta =
                     effect_advance_delta(effect.embolden.max(0.0), effect.condense, glyph.w);
                 cells.push((

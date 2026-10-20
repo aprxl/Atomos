@@ -108,19 +108,17 @@ or keep `Custom` groups surface-sized.
 
 ## Text
 
-### Wrap options and layout for wrapped styled text
-**Trigger:** an app needs caret/selection geometry for a wrapped, syntax-
-highlighted line, or hanging indents / `Wrap::Glyph`-only / justified lines.
+### Wrap options
+**Trigger:** an app needs hanging indents, `Wrap::Glyph`-only or justified
+lines.
 
-`draw_wrapped_text`, `draw_wrapped_styled_text` and their size queries wrap to
-a logical-pixel width (word boundaries, glyph breaks for an over-long word).
-`layout_wrapped_text` returns carets, hit-testing and selection rectangles
-for plain text only; there is no layout query for styled spans (its
-`TextLayout` assumes one effect for the whole string, while spans each carry
-their own weight/width). Wrapped text is left-aligned inside its block, and
-each distinct width is its own shape-cache entry (animating the width
-re-shapes every frame). A wrapped line's swallowed trailing whitespace has no
-glyph, so selection rectangles stop at the last visible glyph.
+`draw_wrapped_text`, `draw_wrapped_styled_text`, their size queries and
+`layout_wrapped_text` / `layout_wrapped_styled_text` wrap to a logical-pixel
+width (word boundaries, glyph breaks for an over-long word). Wrapped text is
+left-aligned inside its block, and each distinct width is its own shape-cache
+entry (animating the width re-shapes every frame). A wrapped line's swallowed
+trailing whitespace has no glyph, so selection rectangles stop at the last
+visible glyph.
 
 ### Shaped-glyph data and appearance effects from the fork
 **Trigger:** PDF/export or an interaction effect is needed.
