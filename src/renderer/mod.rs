@@ -100,6 +100,25 @@ const MSAA_SAMPLE_COUNT_FALLBACK: u32 = 4;
 /// climbing even if an adapter offers more.
 const MSAA_SAMPLE_COUNT_MAX: u32 = 8;
 
+/// Upper bound on the shared multisampled colour + stencil targets, in
+/// bytes. Their cost is `width * height * samples * 5`, so 8x is 79 MiB at
+/// 1080p, 141 MiB at 1440p, but 316 MiB at 4K and over 500 MiB on a 5K display. Windows whose
+/// 8x cost would exceed this get the fallback count instead.
+const MSAA_BUDGET_BYTES: u64 = 160 * 1024 * 1024;
+
+/// `supported` unless its colour + stencil targets would exceed
+/// [`MSAA_BUDGET_BYTES`] at `size` (physical pixels), in which case the
+/// 4x floor is used. The count is fixed when the renderer is created: every
+/// pipeline is built for it.
+fn cap_msaa_sample_count(supported: u32, size: (u32, u32)) -> u32 {
+    let pixels = size.0.max(1) as u64 * size.1.max(1) as u64;
+    if supported > MSAA_SAMPLE_COUNT_FALLBACK && pixels * supported as u64 * 5 > MSAA_BUDGET_BYTES {
+        MSAA_SAMPLE_COUNT_FALLBACK
+    } else {
+        supported
+    }
+}
+
 /// Pick the highest MSAA sample count (up to [`MSAA_SAMPLE_COUNT_MAX`])
 /// this adapter actually supports for `format`, including
 /// `resolve_target` support at that count (every layer's render pass
@@ -549,7 +568,8 @@ impl Renderer {
         // feature granted is a validation error regardless of what the
         // hardware can physically do.
         let msaa_sample_count = if extended_msaa_supported {
-            pick_msaa_sample_count(&adapter, surface_config.format)
+            let supported = pick_msaa_sample_count(&adapter, surface_config.format);
+            cap_msaa_sample_count(supported, (surface_config.width, surface_config.height))
         } else {
             MSAA_SAMPLE_COUNT_FALLBACK
         };
@@ -897,5 +917,15 @@ mod tests {
             wgpu::Backend::Vulkan,
             wgpu::Features::TIMESTAMP_QUERY
         ));
+    }
+
+    #[test]
+    fn large_windows_fall_back_to_4x_msaa() {
+        use super::cap_msaa_sample_count as cap;
+        assert_eq!(cap(8, (1920, 1080)), 8);
+        assert_eq!(cap(8, (2560, 1440)), 8);
+        assert_eq!(cap(8, (3840, 2160)), 4);
+        assert_eq!(cap(8, (5120, 2880)), 4);
+        assert_eq!(cap(4, (7680, 4320)), 4, "never below the floor");
     }
 }
