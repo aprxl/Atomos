@@ -25,8 +25,7 @@ pub(super) struct Scene {
     size: (u32, u32),
     target: wgpu::Texture,
     target_view: wgpu::TextureView,
-    _msaa: wgpu::Texture,
-    msaa_view: wgpu::TextureView,
+    msaa: layer::MsaaTarget,
     pipelines: LayerPipelines,
     text: Rc<RefCell<TextStack>>,
     order: VecDeque<Weak<RefCell<LayerInner>>>,
@@ -66,15 +65,14 @@ impl Scene {
             view_formats: &[],
         });
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        let (msaa, msaa_view) = layer::create_msaa_texture(&device, FORMAT, size, MSAA);
+        let msaa = layer::create_msaa_target(&device, FORMAT, size, MSAA);
         Some(Self {
             device,
             queue,
             size,
             target,
             target_view,
-            _msaa: msaa,
-            msaa_view,
+            msaa,
             pipelines,
             text,
             order: VecDeque::new(),
@@ -123,7 +121,7 @@ impl Scene {
         layer::render_layers(
             &mut encoder,
             &self.target_view,
-            &self.msaa_view,
+            &self.msaa,
             &mut self.order,
             self.size,
             scale_factor,

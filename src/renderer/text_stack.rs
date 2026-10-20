@@ -257,7 +257,7 @@ impl TextStack {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            None,
+            Some(super::layer::content_stencil_state()),
         )
     }
 

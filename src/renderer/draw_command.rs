@@ -4,6 +4,7 @@
 
 use std::hash::{Hash, Hasher};
 
+use super::ClipShape;
 use super::Color;
 use super::Pixels;
 use super::Rounding;
@@ -86,6 +87,10 @@ pub(super) enum DrawCommand {
         position: [f32; 2],
         alignment: Alignment,
     },
+    /// Everything drawn until the matching [`DrawCommand::PopClip`] is
+    /// clipped to this shape, in logical pixels. Scopes nest.
+    PushClip(ClipShape),
+    PopClip,
 }
 
 impl DrawCommand {
@@ -94,6 +99,10 @@ impl DrawCommand {
     pub(super) fn to_physical(&self, s: f32) -> DrawCommand {
         let pair = |p: &[f32; 2]| [p[0] * s, p[1] * s];
         match self {
+            // Kept logical: a path clip's scale is applied when its
+            // geometry is built, which knows the layer's scale factor.
+            DrawCommand::PushClip(shape) => DrawCommand::PushClip(shape.clone()),
+            DrawCommand::PopClip => DrawCommand::PopClip,
             DrawCommand::Rectangle {
                 top_left,
                 size,
@@ -262,6 +271,11 @@ impl Hash for DrawCommand {
                 alignment.hash(state);
                 color.hash_bits(state);
             }
+            DrawCommand::PushClip(shape) => {
+                state.write_u8(7);
+                hash_clip_shape(shape, state);
+            }
+            DrawCommand::PopClip => state.write_u8(8),
             DrawCommand::StyledText {
                 spans,
                 position,
@@ -281,6 +295,39 @@ impl Hash for DrawCommand {
                 hash_f32_pair(position, state);
                 alignment.hash(state);
             }
+        }
+    }
+}
+
+fn hash_clip_shape<H: Hasher>(shape: &ClipShape, state: &mut H) {
+    match shape {
+        ClipShape::Rectangle {
+            top_left,
+            size,
+            rounding,
+        } => {
+            state.write_u8(0);
+            hash_f32_pair(&[top_left.0, top_left.1], state);
+            hash_f32_pair(&[size.0, size.1], state);
+            hash_f32_pair(&[rounding.top_left, rounding.top_right], state);
+            hash_f32_pair(&[rounding.bottom_right, rounding.bottom_left], state);
+        }
+        ClipShape::Circle { center, radius } => {
+            state.write_u8(1);
+            hash_f32_pair(&[center.0, center.1], state);
+            state.write_u32(radius.to_bits());
+        }
+        ClipShape::Polygon { vertices } => {
+            state.write_u8(2);
+            state.write_usize(vertices.len());
+            for (x, y) in vertices {
+                hash_f32_pair(&[*x, *y], state);
+            }
+        }
+        ClipShape::Path { d, position } => {
+            state.write_u8(3);
+            d.hash(state);
+            hash_f32_pair(&[position.0, position.1], state);
         }
     }
 }

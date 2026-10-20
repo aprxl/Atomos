@@ -487,6 +487,8 @@ struct ColorMatrixUniform {
 /// [`LayerInner`].
 pub(super) struct LayerPipelines {
     solid_pipeline: wgpu::RenderPipeline,
+    stencil_incr_pipeline: wgpu::RenderPipeline,
+    stencil_decr_pipeline: wgpu::RenderPipeline,
     screen_size_bind_group_layout: wgpu::BindGroupLayout,
     // `draw_image`'s pipeline. Shares `screen_size_bind_group_layout` (group
     // 0) with `solid_pipeline`, and reuses `composite_bind_group_layout`/
@@ -583,7 +585,7 @@ impl LayerPipelines {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(content_stencil_state()),
             multisample: wgpu::MultisampleState {
                 count: msaa_sample_count,
                 mask: !0,
@@ -592,6 +594,23 @@ impl LayerPipelines {
             multiview_mask: None,
             cache: None,
         });
+
+        let stencil_incr_pipeline = build_stencil_clip_pipeline(
+            device,
+            &solid_shader,
+            &solid_pipeline_layout,
+            surface_format,
+            msaa_sample_count,
+            wgpu::StencilOperation::IncrementClamp,
+        );
+        let stencil_decr_pipeline = build_stencil_clip_pipeline(
+            device,
+            &solid_shader,
+            &solid_pipeline_layout,
+            surface_format,
+            msaa_sample_count,
+            wgpu::StencilOperation::DecrementClamp,
+        );
 
         let composite_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -659,7 +678,7 @@ impl LayerPipelines {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(content_stencil_state()),
             multisample: wgpu::MultisampleState {
                 count: msaa_sample_count,
                 mask: !0,
@@ -800,6 +819,8 @@ impl LayerPipelines {
 
         Self {
             solid_pipeline,
+            stencil_incr_pipeline,
+            stencil_decr_pipeline,
             screen_size_bind_group_layout,
             image_pipeline,
             composite_pipeline,
@@ -814,6 +835,47 @@ impl LayerPipelines {
             colormatrix_bind_group_layout,
         }
     }
+}
+
+/// A pipeline that draws a clip shape into the stencil only: no colour
+/// output, and `op` applied wherever the stencil equals the reference.
+fn build_stencil_clip_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    surface_format: wgpu::TextureFormat,
+    msaa_sample_count: u32,
+    op: wgpu::StencilOperation,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("atomos-layer-stencil-clip-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[Vertex::layout()],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::empty(),
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: Some(clip_stencil_state(op)),
+        multisample: wgpu::MultisampleState {
+            count: msaa_sample_count,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 /// Build one of the two composite pipelines (plain and masked): a
@@ -1096,6 +1158,14 @@ enum ReplayOp {
     Images(std::ops::Range<usize>),
     /// Index into `text_batches`.
     Text(usize),
+    /// Enter a clip that is a pixel-aligned rectangle, as `[x, y, w, h]` in
+    /// physical pixels: a free hardware scissor.
+    ClipScissor([u32; 4]),
+    /// Enter a clip of any other shape: its geometry is this range of the
+    /// solid index buffer, drawn into the stencil.
+    ClipStencil(std::ops::Range<u32>),
+    /// Leave the innermost clip.
+    ClipPop,
 }
 
 /// A run of consecutive text commands with its own glyphon renderer.
@@ -1115,6 +1185,8 @@ pub(super) struct LayerInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     solid_pipeline: wgpu::RenderPipeline,
+    stencil_incr_pipeline: wgpu::RenderPipeline,
+    stencil_decr_pipeline: wgpu::RenderPipeline,
     image_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     composite_bind_group_layout: wgpu::BindGroupLayout,
@@ -1303,6 +1375,8 @@ impl LayerInner {
             device: device.clone(),
             queue: queue.clone(),
             solid_pipeline: pipelines.solid_pipeline.clone(),
+            stencil_incr_pipeline: pipelines.stencil_incr_pipeline.clone(),
+            stencil_decr_pipeline: pipelines.stencil_decr_pipeline.clone(),
             image_pipeline: pipelines.image_pipeline.clone(),
             composite_pipeline: pipelines.composite_pipeline.clone(),
             composite_bind_group_layout: pipelines.composite_bind_group_layout.clone(),
@@ -1790,11 +1864,7 @@ impl LayerInner {
     /// a static clip costs one small pass total, not one per frame. Runs
     /// through the shared MSAA scratch target (same as `render_to_texture`)
     /// so mask edges get the same antialiasing drawn geometry gets.
-    fn render_mask_if_needed(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        msaa_view: &wgpu::TextureView,
-    ) {
+    fn render_mask_if_needed(&mut self, encoder: &mut wgpu::CommandEncoder, msaa: &MsaaTarget) {
         let Some(mask) = &mut self.mask_gpu else {
             return;
         };
@@ -1806,7 +1876,7 @@ impl LayerInner {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("atomos-layer-mask-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: msaa_view,
+                view: &msaa.color_view,
                 depth_slice: None,
                 resolve_target: Some(&mask.view),
                 ops: wgpu::Operations {
@@ -1814,7 +1884,7 @@ impl LayerInner {
                     store: wgpu::StoreOp::Discard,
                 },
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(stencil_attachment(&msaa.stencil_view)),
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
@@ -1954,6 +2024,31 @@ impl LayerInner {
         let mut in_text_run = false;
         let physical = self.physical_commands();
         for command in physical {
+            match &command {
+                DrawCommand::PushClip(shape) => {
+                    in_text_run = false;
+                    if let Some(rect) = scissor_for_clip(shape, self.scale_factor, self.size) {
+                        ops.push(ReplayOp::ClipScissor(rect));
+                    } else {
+                        let geometry = clip_shape_to_command(shape, self.scale_factor);
+                        let before = indices.len() as u32;
+                        let (cmd_vertices, cmd_indices) = tessellate_command(
+                            &geometry,
+                            &mut tessellator,
+                            &mut stroke_tessellator,
+                        );
+                        append_geometry(&mut vertices, &mut indices, cmd_vertices, cmd_indices);
+                        ops.push(ReplayOp::ClipStencil(before..indices.len() as u32));
+                    }
+                    continue;
+                }
+                DrawCommand::PopClip => {
+                    in_text_run = false;
+                    ops.push(ReplayOp::ClipPop);
+                    continue;
+                }
+                _ => {}
+            }
             let is_text = matches!(
                 command,
                 DrawCommand::Text { .. } | DrawCommand::StyledText { .. }
@@ -2093,7 +2188,7 @@ impl LayerInner {
     fn render_to_texture_if_needed(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        msaa_view: &wgpu::TextureView,
+        msaa: &MsaaTarget,
     ) {
         if !std::mem::take(&mut self.content_texture_dirty) {
             return;
@@ -2113,7 +2208,7 @@ impl LayerInner {
             // `Discard` rather than `Store` — which is also what makes
             // sharing one scratch texture across layers safe.
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: msaa_view,
+                view: &msaa.color_view,
                 depth_slice: None,
                 resolve_target: Some(&self.texture_view),
                 ops: wgpu::Operations {
@@ -2121,39 +2216,124 @@ impl LayerInner {
                     store: wgpu::StoreOp::Discard,
                 },
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(stencil_attachment(&msaa.stencil_view)),
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
         });
 
-        // Hardware scissor: pass-level state, so it clips everything below
-        // — solids, images, and text alike. `LoadOp::Clear` above ignores
-        // it (the whole attachment is cleared), which is exactly right:
-        // outside the rect stays transparent. Physical-px conversion
-        // happens here, against the current scale factor, so the stored
-        // logical rect never goes stale across DPI changes.
-        if let Some([x, y, w, h]) = self.clip_rect {
-            let s = self.scale_factor;
-            let max_w = self.size.0 as f32;
-            let max_h = self.size.1 as f32;
-            let x0 = (x * s).clamp(0.0, max_w);
-            let y0 = (y * s).clamp(0.0, max_h);
-            let x1 = ((x + w) * s).clamp(0.0, max_w);
-            let y1 = ((y + h) * s).clamp(0.0, max_h);
-            if x1 <= x0 || y1 <= y0 {
-                // Fully clipped: the clear above already emptied the
-                // texture, and recording zero draws is the cheapest frame
-                // there is.
-                return;
+        // The layer-wide scissor (`set_clip_rect`) is the outermost clip
+        // scope. Physical-px conversion happens here, against the current
+        // scale factor, so the stored logical rect never goes stale across
+        // DPI changes. `LoadOp::Clear` above ignores scissors, which is
+        // exactly right: outside the rect stays transparent.
+        let surface = [0, 0, self.size.0, self.size.1];
+        let base = match self.clip_rect {
+            Some([x, y, w, h]) => {
+                let s = self.scale_factor;
+                let rect = clamp_scissor(x * s, y * s, (x + w) * s, (y + h) * s, self.size);
+                if rect[2] == 0 || rect[3] == 0 {
+                    // Fully clipped: the clear above already emptied the
+                    // texture, and recording zero draws is the cheapest
+                    // frame there is.
+                    return;
+                }
+                rect
             }
-            rpass.set_scissor_rect(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
+            None => surface,
+        };
+        if base != surface {
+            rpass.set_scissor_rect(base[0], base[1], base[2], base[3]);
         }
+        self.replay_ops(&mut rpass, base);
+    }
 
-        // Replay in draw order, so later commands paint over earlier ones
-        // whatever their kind.
+    /// Record this layer's ops in draw order, maintaining the clip stack:
+    /// pixel-aligned rectangle clips tighten the scissor, every other shape
+    /// is drawn into the stencil and tested against by all content.
+    fn replay_ops(&self, rpass: &mut wgpu::RenderPass<'_>, base: [u32; 4]) {
+        /// What a `ClipPop` must undo.
+        enum Scope {
+            /// Restore this scissor.
+            Scissor([u32; 4]),
+            /// Redraw this shape with the decrementing pipeline.
+            Stencil(std::ops::Range<u32>),
+            /// The scope drew nothing (empty intersection, or nested past
+            /// the stencil's depth); only its closing needs tracking.
+            Skipped,
+            /// A clip that could not be applied but must stay balanced.
+            Noop,
+        }
+        /// Deepest stencil nesting: the clear value 0 up to the 8-bit max.
+        const MAX_CLIP_DEPTH: u32 = 255;
+
+        let mut scissor = base;
+        let mut depth: u32 = 0;
+        let mut skipping: u32 = 0;
+        let mut scopes: Vec<Scope> = Vec::new();
+
         for op in &self.ops {
             match op {
+                ReplayOp::ClipScissor(rect) => {
+                    if skipping > 0 {
+                        skipping += 1;
+                        scopes.push(Scope::Skipped);
+                        continue;
+                    }
+                    let next = intersect_scissor(scissor, *rect);
+                    if next[2] == 0 || next[3] == 0 {
+                        skipping += 1;
+                        scopes.push(Scope::Skipped);
+                    } else {
+                        scopes.push(Scope::Scissor(scissor));
+                        scissor = next;
+                        rpass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+                    }
+                }
+                ReplayOp::ClipStencil(range) => {
+                    if skipping > 0 {
+                        skipping += 1;
+                        scopes.push(Scope::Skipped);
+                        continue;
+                    }
+                    let (Some(vbuf), Some(ibuf)) = (&self.vertex_buffer, &self.index_buffer) else {
+                        scopes.push(Scope::Noop);
+                        continue;
+                    };
+                    if depth >= MAX_CLIP_DEPTH {
+                        scopes.push(Scope::Noop);
+                        continue;
+                    }
+                    rpass.set_pipeline(&self.stencil_incr_pipeline);
+                    rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+                    rpass.set_vertex_buffer(0, vbuf.slice(..));
+                    rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.set_stencil_reference(depth);
+                    rpass.draw_indexed(range.clone(), 0, 0..1);
+                    depth += 1;
+                    scopes.push(Scope::Stencil(range.clone()));
+                }
+                ReplayOp::ClipPop => match scopes.pop() {
+                    Some(Scope::Scissor(previous)) => {
+                        scissor = previous;
+                        rpass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
+                    }
+                    Some(Scope::Stencil(range)) => {
+                        if let (Some(vbuf), Some(ibuf)) = (&self.vertex_buffer, &self.index_buffer)
+                        {
+                            rpass.set_pipeline(&self.stencil_decr_pipeline);
+                            rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+                            rpass.set_vertex_buffer(0, vbuf.slice(..));
+                            rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                            rpass.set_stencil_reference(depth);
+                            rpass.draw_indexed(range, 0, 0..1);
+                        }
+                        depth -= 1;
+                    }
+                    Some(Scope::Skipped) => skipping -= 1,
+                    Some(Scope::Noop) | None => {}
+                },
+                _ if skipping > 0 => {}
                 ReplayOp::Solid(range) => {
                     let (Some(vbuf), Some(ibuf)) = (&self.vertex_buffer, &self.index_buffer) else {
                         continue;
@@ -2162,11 +2342,13 @@ impl LayerInner {
                     rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
                     rpass.set_vertex_buffer(0, vbuf.slice(..));
                     rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.set_stencil_reference(depth);
                     rpass.draw_indexed(range.clone(), 0, 0..1);
                 }
                 ReplayOp::Images(range) => {
                     rpass.set_pipeline(&self.image_pipeline);
                     rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+                    rpass.set_stencil_reference(depth);
                     for image_draw in &self.image_draws[range.clone()] {
                         rpass.set_bind_group(1, &image_draw.bind_group, &[]);
                         rpass.set_vertex_buffer(0, image_draw.vertex_buffer.slice(..));
@@ -2174,10 +2356,11 @@ impl LayerInner {
                     }
                 }
                 ReplayOp::Text(batch) => {
+                    rpass.set_stencil_reference(depth);
                     if let Err(e) = self
                         .text_stack
                         .borrow()
-                        .render(&self.text_batches[*batch].renderer, &mut rpass)
+                        .render(&self.text_batches[*batch].renderer, rpass)
                     {
                         eprintln!("Atomos: text render error: {e:?}");
                     }
@@ -2226,6 +2409,145 @@ fn create_layer_texture(
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
+}
+
+/// A physical-pixel rectangle `[x, y, w, h]` from edge coordinates, clamped
+/// to the target. Zero width or height means empty.
+fn clamp_scissor(x0: f32, y0: f32, x1: f32, y1: f32, size: (u32, u32)) -> [u32; 4] {
+    let (max_w, max_h) = (size.0 as f32, size.1 as f32);
+    let x0 = x0.clamp(0.0, max_w);
+    let y0 = y0.clamp(0.0, max_h);
+    let x1 = x1.clamp(0.0, max_w);
+    let y1 = y1.clamp(0.0, max_h);
+    if x1 <= x0 || y1 <= y0 {
+        return [0, 0, 0, 0];
+    }
+    [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]
+}
+
+fn intersect_scissor(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    let x0 = a[0].max(b[0]);
+    let y0 = a[1].max(b[1]);
+    let x1 = (a[0] + a[2]).min(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).min(b[1] + b[3]);
+    if x1 <= x0 || y1 <= y0 {
+        return [0, 0, 0, 0];
+    }
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
+/// The scissor equivalent of `shape`, when it is an unrounded rectangle
+/// whose physical edges all fall on whole pixels. A fractional edge must
+/// stay antialiased, which only the stencil path does.
+fn scissor_for_clip(shape: &ClipShape, scale: f32, size: (u32, u32)) -> Option<[u32; 4]> {
+    let ClipShape::Rectangle {
+        top_left,
+        size: extent,
+        rounding,
+    } = shape
+    else {
+        return None;
+    };
+    if *rounding != Rounding::NONE {
+        return None;
+    }
+    let edges = [
+        top_left.0 * scale,
+        top_left.1 * scale,
+        (top_left.0 + extent.0) * scale,
+        (top_left.1 + extent.1) * scale,
+    ];
+    if edges.iter().any(|e| (e - e.round()).abs() > 1e-3) {
+        return None;
+    }
+    Some(clamp_scissor(edges[0], edges[1], edges[2], edges[3], size))
+}
+
+/// Format of the shared stencil attachment that clip scopes draw into.
+pub(super) const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Stencil8;
+
+/// The shared multisampled targets every layer pass renders into: colour
+/// (resolved into the layer's own texture) and the stencil clip scopes use.
+pub(super) struct MsaaTarget {
+    _color: wgpu::Texture,
+    pub(super) color_view: wgpu::TextureView,
+    _stencil: wgpu::Texture,
+    pub(super) stencil_view: wgpu::TextureView,
+}
+
+pub(super) fn create_msaa_target(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    size: (u32, u32),
+    sample_count: u32,
+) -> MsaaTarget {
+    let (color, color_view) = create_msaa_texture(device, format, size, sample_count);
+    let (stencil, stencil_view) = create_msaa_texture(device, STENCIL_FORMAT, size, sample_count);
+    MsaaTarget {
+        _color: color,
+        color_view,
+        _stencil: stencil,
+        stencil_view,
+    }
+}
+
+/// The stencil attachment for a pass: cleared to 0 (no clip active) and
+/// never read afterwards.
+fn stencil_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassDepthStencilAttachment<'_> {
+    wgpu::RenderPassDepthStencilAttachment {
+        view,
+        depth_ops: None,
+        stencil_ops: Some(wgpu::Operations {
+            load: wgpu::LoadOp::Clear(0),
+            store: wgpu::StoreOp::Discard,
+        }),
+    }
+}
+
+/// Stencil state of content pipelines: draw only where the stencil equals
+/// the pass's current reference (the clip depth), never write it.
+pub(super) fn content_stencil_state() -> wgpu::DepthStencilState {
+    let face = wgpu::StencilFaceState {
+        compare: wgpu::CompareFunction::Equal,
+        fail_op: wgpu::StencilOperation::Keep,
+        depth_fail_op: wgpu::StencilOperation::Keep,
+        pass_op: wgpu::StencilOperation::Keep,
+    };
+    wgpu::DepthStencilState {
+        format: STENCIL_FORMAT,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Always),
+        stencil: wgpu::StencilState {
+            front: face,
+            back: face,
+            read_mask: 0xff,
+            write_mask: 0xff,
+        },
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
+
+/// Stencil state that adds `op` wherever the stencil equals the reference:
+/// `IncrementClamp` enters a clip, `DecrementClamp` leaves it.
+fn clip_stencil_state(op: wgpu::StencilOperation) -> wgpu::DepthStencilState {
+    let face = wgpu::StencilFaceState {
+        compare: wgpu::CompareFunction::Equal,
+        fail_op: wgpu::StencilOperation::Keep,
+        depth_fail_op: wgpu::StencilOperation::Keep,
+        pass_op: op,
+    };
+    wgpu::DepthStencilState {
+        format: STENCIL_FORMAT,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Always),
+        stencil: wgpu::StencilState {
+            front: face,
+            back: face,
+            read_mask: 0xff,
+            write_mask: 0xff,
+        },
+        bias: wgpu::DepthBiasState::default(),
+    }
 }
 
 /// Build the offscreen multisampled colour texture every layer's
@@ -2487,7 +2809,10 @@ fn tessellate_command(
         // Handled entirely in `LayerInner::rebuild_if_needed`/
         // `render_to_texture` via the shared `TextStack`, not the solid
         // vertex/index batch.
-        DrawCommand::Text { .. } | DrawCommand::StyledText { .. } => (Vec::new(), Vec::new()),
+        DrawCommand::Text { .. }
+        | DrawCommand::StyledText { .. }
+        | DrawCommand::PushClip(_)
+        | DrawCommand::PopClip => (Vec::new(), Vec::new()),
     }
 }
 
@@ -3229,6 +3554,41 @@ impl Layer {
             .unscaled(s)
     }
 
+    /// Clip everything `f` draws to `clip` (logical pixels). Scopes nest;
+    /// content drawn after `f` returns is unclipped again.
+    ///
+    /// An unrounded rectangle on whole physical pixels is a free hardware
+    /// scissor. Any other shape (rounded corners, circle, polygon, path, or
+    /// a fractional edge) is drawn into a stencil buffer: no extra surface
+    /// is allocated, and edges are antialiased by the same MSAA as the
+    /// content. Text, images and shapes are all clipped, and a later shape
+    /// can still paint over earlier clipped content.
+    ///
+    /// Errors, without calling `f`, only for an unparsable
+    /// [`ClipShape::Path`].
+    pub fn with_clip<R>(
+        &self,
+        clip: ClipShape,
+        f: impl FnOnce(&Layer) -> R,
+    ) -> Result<R, lyon_extra::parser::ParseError> {
+        if let ClipShape::Path { d, .. } = &clip {
+            parse_svg_path(d)?;
+        }
+        /// Closes the scope even if `f` panics, so the clip cannot leak
+        /// into later commands.
+        struct Close<'a>(&'a Layer);
+        impl Drop for Close<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut inner) = self.0.0.try_borrow_mut() {
+                    inner.push(DrawCommand::PopClip);
+                }
+            }
+        }
+        self.0.borrow_mut().push(DrawCommand::PushClip(clip));
+        let _close = Close(self);
+        Ok(f(self))
+    }
+
     pub fn get_styled_text_size(&self, spans: &[TextSpan]) -> (f32, f32) {
         let s = self.scale_factor();
         let scaled_spans: Vec<TextSpan> = spans
@@ -3341,7 +3701,7 @@ impl Layer {
 pub(super) fn render_layers(
     encoder: &mut wgpu::CommandEncoder,
     view: &wgpu::TextureView,
-    msaa_view: &wgpu::TextureView,
+    msaa: &MsaaTarget,
     order: &mut std::collections::VecDeque<std::rc::Weak<RefCell<LayerInner>>>,
     surface_size: (u32, u32),
     scale_factor: f32,
@@ -3355,8 +3715,8 @@ pub(super) fn render_layers(
         inner.resize_if_needed(surface_size);
         inner.set_scale_factor(scale_factor);
         inner.rebuild_if_needed();
-        inner.render_mask_if_needed(encoder, msaa_view);
-        inner.render_to_texture_if_needed(encoder, msaa_view);
+        inner.render_mask_if_needed(encoder, msaa);
+        inner.render_to_texture_if_needed(encoder, msaa);
         inner.apply_effect_if_needed(encoder);
     }
 

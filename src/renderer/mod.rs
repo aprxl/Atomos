@@ -40,6 +40,8 @@ mod text_span;
 mod text_stack;
 
 #[cfg(test)]
+mod clip_tests;
+#[cfg(test)]
 mod pixel_tests;
 #[cfg(test)]
 mod test_support;
@@ -104,7 +106,15 @@ const MSAA_SAMPLE_COUNT_MAX: u32 = 8;
 fn pick_msaa_sample_count(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> u32 {
     let flags = adapter.get_texture_format_features(format).flags;
     let can_resolve = flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE);
-    if can_resolve && flags.sample_count_supported(MSAA_SAMPLE_COUNT_MAX) {
+    // The clip stencil shares the colour attachment's sample count, so the
+    // count must be supported by both formats.
+    let stencil_flags = adapter
+        .get_texture_format_features(layer::STENCIL_FORMAT)
+        .flags;
+    if can_resolve
+        && flags.sample_count_supported(MSAA_SAMPLE_COUNT_MAX)
+        && stencil_flags.sample_count_supported(MSAA_SAMPLE_COUNT_MAX)
+    {
         MSAA_SAMPLE_COUNT_MAX
     } else {
         MSAA_SAMPLE_COUNT_FALLBACK
@@ -188,8 +198,7 @@ pub struct Renderer {
     // because layer passes run sequentially and the target is transient
     // (cleared per pass, discarded after resolve) — per-layer copies would
     // cost a full-surface 4x texture each. Kept alive for `msaa_view`.
-    msaa_texture: wgpu::Texture,
-    msaa_view: wgpu::TextureView,
+    msaa: layer::MsaaTarget,
     msaa_size: (u32, u32),
     // Resolved once in `new` via `pick_msaa_sample_count` — every layer's
     // solid/image/text pipeline and the shared MSAA texture above all use
@@ -542,12 +551,8 @@ impl Renderer {
         let layer_pipelines =
             layer::LayerPipelines::new(&device, surface_config.format, msaa_sample_count);
         let msaa_size = (surface_config.width, surface_config.height);
-        let (msaa_texture, msaa_view) = layer::create_msaa_texture(
-            &device,
-            surface_config.format,
-            msaa_size,
-            msaa_sample_count,
-        );
+        let msaa =
+            layer::create_msaa_target(&device, surface_config.format, msaa_size, msaa_sample_count);
         let text_stack = Rc::new(RefCell::new(text_stack::TextStack::new(
             &device,
             &queue,
@@ -568,8 +573,7 @@ impl Renderer {
             surface_config,
             pending_surface_size: None,
             layer_pipelines,
-            msaa_texture,
-            msaa_view,
+            msaa,
             msaa_size,
             msaa_sample_count,
             text_stack,
@@ -797,21 +801,19 @@ impl Renderer {
         // the same here rather than in `resize()`.
         let surface_size = (self.surface_config.width, self.surface_config.height);
         if self.msaa_size != surface_size {
-            let (msaa_texture, msaa_view) = layer::create_msaa_texture(
+            self.msaa = layer::create_msaa_target(
                 &self.device,
                 self.surface_config.format,
                 surface_size,
                 self.msaa_sample_count,
             );
-            self.msaa_texture = msaa_texture;
-            self.msaa_view = msaa_view;
             self.msaa_size = surface_size;
         }
 
         layer::render_layers(
             &mut encoder,
             &view,
-            &self.msaa_view,
+            &self.msaa,
             &mut self.layers,
             surface_size,
             self.scale_factor as f32,
