@@ -1,16 +1,25 @@
-//! [`Layer`] — a retained, independently-cached drawing surface.
+//! [`Layer`] — a retained, z-ordered drawing unit.
 //!
-//! A `Layer` owns its own offscreen GPU texture and a queue of pending
-//! [`DrawCommand`]s. Calling a `draw_*` method never touches the GPU
-//! directly — it only records a command and marks the layer dirty; the
-//! actual tessellation, upload, and render-to-texture happen once per frame
-//! inside [`super::Renderer::render`], which also composites every live
-//! layer's texture onto the screen in bottom-to-top order.
+//! A `Layer` holds a queue of pending [`DrawCommand`]s in logical pixels.
+//! Calling a `draw_*` method never touches the GPU directly — it only
+//! records a command and marks the layer dirty; the actual tessellation,
+//! upload and text preparation happen lazily inside
+//! [`super::Renderer::render`].
 //!
-//! Because a layer renders into its own texture, applying a shader to
-//! "everything in the layer" later just means swapping which pipeline the
-//! composite step binds for that layer — the seam is already here, just
-//! unused for now (see `LayerPipelines::composite_pipeline`).
+//! Commands paint in the order they were issued, whatever their kind: a
+//! later shape covers earlier text and images. Layers stack bottom to top.
+//!
+//! By default a layer owns no render target. Its retained geometry is
+//! replayed straight into the frame's single multisampled pass, so a plain
+//! layer costs no texture memory. Only a layer that needs its pixels
+//! isolated — it has a [`ShaderEffect`], or asked for
+//! [`CachePolicy::Always`] — renders into an offscreen texture, which is
+//! retained until the layer changes and then composited as one quad.
+//!
+//! Clipping is a scope, not a surface: [`Layer::with_clip`] clips what a
+//! closure draws, [`Layer::set_clip`] clips the whole layer (after any
+//! effect). Pixel-aligned rectangles are hardware scissors; every other
+//! shape uses one shared stencil buffer.
 //!
 //! `Layer` is a cheap-to-clone handle (`Rc<RefCell<LayerInner>>`); dropping
 //! every clone of a given layer removes it from the renderer's composite
@@ -23,10 +32,9 @@ use std::rc::Rc;
 
 use wgpu::util::DeviceExt;
 
-use lyon::path::{self, builder::BorderRadii, Path};
+use lyon::path::{self, Path, builder::BorderRadii};
 use lyon::tessellation::{
-    BuffersBuilder, FillOptions, FillTessellator, FillVertex, FillVertexConstructor,
-    VertexBuffers,
+    BuffersBuilder, FillOptions, FillTessellator, FillVertex, FillVertexConstructor, VertexBuffers,
 };
 use lyon_extra::parser::{ParserOptions, PathParser, Source};
 
@@ -36,8 +44,9 @@ use super::path_paint::{FillRule, LineCap, LineJoin, PathPaint, Stroke};
 use super::pixels::Pixels;
 use super::rounding::Rounding;
 use super::shader::ShaderEffect;
+use super::stats::RenderStats;
 use super::text_stack::TextStack;
-use super::{Alignment, Font, FontParameters, TextSpan, Vertex};
+use super::{Alignment, Font, FontParameters, TextLayout, TextSpan, Vertex};
 
 use lyon::tessellation::{
     FillRule as LyonFillRule, LineCap as LyonLineCap, LineJoin as LyonLineJoin, StrokeOptions,
@@ -98,10 +107,9 @@ enum InvalidationState {
     Manual { dirty: bool },
 }
 
-/// An arbitrary clip shape for [`Layer::set_clip_shape`] — the layer's
-/// composited output is multiplied by this shape's coverage, so content
-/// only shows where the shape is. All coordinates are logical pixels, the
-/// same convention as every `draw_*` call.
+/// An arbitrary clip shape for [`Layer::with_clip`] and [`Layer::set_clip`]:
+/// content only shows where the shape is. All coordinates are logical
+/// pixels, the same convention as every `draw_*` call.
 ///
 /// Variants mirror the solid-geometry `draw_*` calls (rectangle including
 /// rounded corners, circle, polygon, SVG path), and are tessellated by the
@@ -110,19 +118,27 @@ enum InvalidationState {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClipShape {
     /// Axis-aligned rectangle, optionally rounded. For an *unrounded*
-    /// rectangle prefer [`Layer::set_clip_rect`], which is cheaper (a
-    /// hardware scissor, no mask texture at all).
+    /// rectangle on whole pixels this is a free hardware scissor; any other
+    /// shape uses the stencil.
     Rectangle {
         top_left: (f32, f32),
         size: (f32, f32),
         rounding: Rounding,
     },
-    Circle { center: (f32, f32), radius: f32 },
+    Circle {
+        center: (f32, f32),
+        radius: f32,
+    },
     /// Implicitly closed, same as [`Layer::draw_polygon`].
-    Polygon { vertices: Vec<(f32, f32)> },
+    Polygon {
+        vertices: Vec<(f32, f32)>,
+    },
     /// SVG path-data string, same conventions as [`Layer::draw_path`]:
     /// authored units are logical pixels 1:1, `position` is an offset.
-    Path { d: String, position: (f32, f32) },
+    Path {
+        d: String,
+        position: (f32, f32),
+    },
 }
 
 /// Pixel-space `screen_size` uniform, shared by every layer's internal
@@ -198,40 +214,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// [`COMPOSITE_SHADER_SRC`] plus a mask texture: the layer's alpha is
-/// multiplied by the mask's alpha (its rendered coverage), which is what
-/// [`Layer::set_clip_shape`] clips with. Only alpha is scaled — the
-/// composite pipeline blends with non-premultiplied `ALPHA_BLENDING`, so
-/// scaling the color too would apply the mask twice.
-const MASKED_COMPOSITE_SHADER_SRC: &str = r#"
-struct VsOut {
-    @builtin(position) clip_pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(
-    @location(0) in_pos: vec2<f32>,
-    @location(1) in_uv: vec2<f32>,
-) -> VsOut {
-    var out: VsOut;
-    out.clip_pos = vec4<f32>(in_pos, 0.0, 1.0);
-    out.uv = in_uv;
-    return out;
-}
-
-@group(0) @binding(0) var tex: texture_2d<f32>;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var mask_tex: texture_2d<f32>;
-
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let c = textureSample(tex, samp, in.uv);
-    let m = textureSample(mask_tex, samp, in.uv).a;
-    return vec4<f32>(c.rgb, c.a * m);
-}
-"#;
-
 /// Vertex format for the composite full-screen quad: clip-space position
 /// plus texture coordinate.
 #[repr(C)]
@@ -258,12 +240,30 @@ impl CompositeVertex {
 /// top-left of the source texture (row 0 in a layer's own render pass is
 /// pixel-space `y = 0`, i.e. the top of the layer's canvas).
 const COMPOSITE_QUAD: &[CompositeVertex] = &[
-    CompositeVertex { position: [-1.0, 1.0], uv: [0.0, 0.0] },
-    CompositeVertex { position: [1.0, 1.0], uv: [1.0, 0.0] },
-    CompositeVertex { position: [1.0, -1.0], uv: [1.0, 1.0] },
-    CompositeVertex { position: [-1.0, 1.0], uv: [0.0, 0.0] },
-    CompositeVertex { position: [1.0, -1.0], uv: [1.0, 1.0] },
-    CompositeVertex { position: [-1.0, -1.0], uv: [0.0, 1.0] },
+    CompositeVertex {
+        position: [-1.0, 1.0],
+        uv: [0.0, 0.0],
+    },
+    CompositeVertex {
+        position: [1.0, 1.0],
+        uv: [1.0, 0.0],
+    },
+    CompositeVertex {
+        position: [1.0, -1.0],
+        uv: [1.0, 1.0],
+    },
+    CompositeVertex {
+        position: [-1.0, 1.0],
+        uv: [0.0, 0.0],
+    },
+    CompositeVertex {
+        position: [1.0, -1.0],
+        uv: [1.0, 1.0],
+    },
+    CompositeVertex {
+        position: [-1.0, -1.0],
+        uv: [0.0, 1.0],
+    },
 ];
 
 /// Vertex format for `draw_image`: a pixel-space position (same convention
@@ -412,9 +412,23 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let c = textureSampleLevel(tex, samp, in.uv, 0.0);
-    var result = mat.cols[0] * c.r + mat.cols[1] * c.g + mat.cols[2] * c.b + mat.cols[3] * c.a + mat.cols[4];
-    return clamp(result, vec4<f32>(0.0), vec4<f32>(1.0));
+    // Layer textures are premultiplied, but the matrix is defined on
+    // straight (unpremultiplied) linear-light RGBA, so offsets and
+    // alpha-changing rows mean what they say. Un-premultiply, transform,
+    // clamp, and premultiply again so the output is a valid premultiplied
+    // texel: transparent input with an additive offset (invert) stays
+    // invisible instead of adding colour.
+    let p = textureSampleLevel(tex, samp, in.uv, 0.0);
+    var c = vec4<f32>(0.0);
+    if (p.a > 0.0) {
+        c = vec4<f32>(p.rgb / p.a, p.a);
+    }
+    let result = clamp(
+        mat.cols[0] * c.r + mat.cols[1] * c.g + mat.cols[2] * c.b + mat.cols[3] * c.a + mat.cols[4],
+        vec4<f32>(0.0),
+        vec4<f32>(1.0),
+    );
+    return vec4<f32>(result.rgb * result.a, result.a);
 }
 "#;
 
@@ -446,6 +460,8 @@ struct ColorMatrixUniform {
 /// [`LayerInner`].
 pub(super) struct LayerPipelines {
     solid_pipeline: wgpu::RenderPipeline,
+    stencil_incr_pipeline: wgpu::RenderPipeline,
+    stencil_decr_pipeline: wgpu::RenderPipeline,
     screen_size_bind_group_layout: wgpu::BindGroupLayout,
     // `draw_image`'s pipeline. Shares `screen_size_bind_group_layout` (group
     // 0) with `solid_pipeline`, and reuses `composite_bind_group_layout`/
@@ -454,13 +470,6 @@ pub(super) struct LayerPipelines {
     image_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     composite_bind_group_layout: wgpu::BindGroupLayout,
-    // Composite variant for layers with a `set_clip_shape` mask: same
-    // shader plus a mask texture at binding 2. A separate pipeline (chosen
-    // per layer in `LayerInner::composite`) rather than a 1x1-white-mask
-    // fallback bound on every unclipped layer — unclipped layers keep
-    // paying exactly what they paid before masks existed.
-    masked_composite_pipeline: wgpu::RenderPipeline,
-    masked_composite_bind_group_layout: wgpu::BindGroupLayout,
     composite_sampler: wgpu::Sampler,
     composite_quad_vbuf: wgpu::Buffer,
     // `ShaderEffect` pipelines — see `shader.rs`'s module doc. Both are
@@ -499,11 +508,12 @@ impl LayerPipelines {
             label: Some("atomos-layer-solid-shader"),
             source: wgpu::ShaderSource::Wgsl(LAYER_SOLID_SHADER_SRC.into()),
         });
-        let solid_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("atomos-layer-solid-pipeline-layout"),
-            bind_group_layouts: &[Some(&screen_size_bind_group_layout)],
-            immediate_size: 0,
-        });
+        let solid_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("atomos-layer-solid-pipeline-layout"),
+                bind_group_layouts: &[Some(&screen_size_bind_group_layout)],
+                immediate_size: 0,
+            });
         // Renders into the layer's multisampled offscreen target (see
         // `msaa_sample_count`/`pick_msaa_sample_count` in `mod.rs`),
         // resolved into the layer's actual texture.
@@ -521,7 +531,13 @@ impl LayerPipelines {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    // A shape blends over what the layer already holds, the
+                    // same as text and images. `REPLACE` let a translucent
+                    // fill overwrite the texel, punching its alpha into an
+                    // opaque card so whatever was under the layer showed
+                    // through. Straight-alpha source in, premultiplied out
+                    // (see `build_composite_pipeline`).
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -535,7 +551,7 @@ impl LayerPipelines {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(content_stencil_state()),
             multisample: wgpu::MultisampleState {
                 count: msaa_sample_count,
                 mask: !0,
@@ -544,6 +560,23 @@ impl LayerPipelines {
             multiview_mask: None,
             cache: None,
         });
+
+        let stencil_incr_pipeline = build_stencil_clip_pipeline(
+            device,
+            &solid_shader,
+            &solid_pipeline_layout,
+            surface_format,
+            msaa_sample_count,
+            wgpu::StencilOperation::IncrementClamp,
+        );
+        let stencil_decr_pipeline = build_stencil_clip_pipeline(
+            device,
+            &solid_shader,
+            &solid_pipeline_layout,
+            surface_format,
+            msaa_sample_count,
+            wgpu::StencilOperation::DecrementClamp,
+        );
 
         let composite_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -572,14 +605,15 @@ impl LayerPipelines {
             label: Some("atomos-layer-image-shader"),
             source: wgpu::ShaderSource::Wgsl(LAYER_IMAGE_SHADER_SRC.into()),
         });
-        let image_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("atomos-layer-image-pipeline-layout"),
-            bind_group_layouts: &[
-                Some(&screen_size_bind_group_layout),
-                Some(&composite_bind_group_layout),
-            ],
-            immediate_size: 0,
-        });
+        let image_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("atomos-layer-image-pipeline-layout"),
+                bind_group_layouts: &[
+                    Some(&screen_size_bind_group_layout),
+                    Some(&composite_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
         let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("atomos-layer-image-pipeline"),
             layout: Some(&image_pipeline_layout),
@@ -610,7 +644,7 @@ impl LayerPipelines {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(content_stencil_state()),
             multisample: wgpu::MultisampleState {
                 count: msaa_sample_count,
                 mask: !0,
@@ -623,52 +657,10 @@ impl LayerPipelines {
         let composite_pipeline = build_composite_pipeline(
             device,
             surface_format,
+            msaa_sample_count,
             "atomos-layer-composite",
             COMPOSITE_SHADER_SRC,
             &composite_bind_group_layout,
-        );
-
-        // The masked variant's layout: the composite pair plus the mask
-        // texture. The sampler is shared — mask and source are the same
-        // size, sampled at the same UVs.
-        let masked_composite_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("atomos-layer-masked-composite-bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-        let masked_composite_pipeline = build_composite_pipeline(
-            device,
-            surface_format,
-            "atomos-layer-masked-composite",
-            MASKED_COMPOSITE_SHADER_SRC,
-            &masked_composite_bind_group_layout,
         );
 
         let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -751,12 +743,12 @@ impl LayerPipelines {
 
         Self {
             solid_pipeline,
+            stencil_incr_pipeline,
+            stencil_decr_pipeline,
             screen_size_bind_group_layout,
             image_pipeline,
             composite_pipeline,
             composite_bind_group_layout,
-            masked_composite_pipeline,
-            masked_composite_bind_group_layout,
             composite_sampler,
             composite_quad_vbuf,
             blur_pipeline,
@@ -767,14 +759,61 @@ impl LayerPipelines {
     }
 }
 
+/// A pipeline that draws a clip shape into the stencil only: no colour
+/// output, and `op` applied wherever the stencil equals the reference.
+fn build_stencil_clip_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    surface_format: wgpu::TextureFormat,
+    msaa_sample_count: u32,
+    op: wgpu::StencilOperation,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("atomos-layer-stencil-clip-pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[Vertex::layout()],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::empty(),
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: Some(clip_stencil_state(op)),
+        multisample: wgpu::MultisampleState {
+            count: msaa_sample_count,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 /// Build one of the two composite pipelines (plain and masked): a
-/// fullscreen `CompositeVertex` quad onto the swap-chain view with
-/// non-premultiplied alpha blending — a layer's texture is cleared to
-/// transparent, so untouched areas must let whatever composited before it
-/// show through.
+/// fullscreen `CompositeVertex` quad onto the swap-chain view. A layer's
+/// texture is cleared to transparent, so untouched areas must let whatever
+/// composited before it show through.
+///
+/// The blend is **premultiplied**, because a layer's texture already is:
+/// everything drawn into one blends with `ALPHA_BLENDING`, which leaves
+/// `rgb * a` behind, and so does the MSAA resolve. Treating that as straight
+/// alpha would multiply by alpha a second time, darkening translucent fills
+/// and anti-aliased edges over transparent layer.
 fn build_composite_pipeline(
     device: &wgpu::Device,
     surface_format: wgpu::TextureFormat,
+    msaa_sample_count: u32,
     label: &str,
     shader_src: &str,
     bind_group_layout: &wgpu::BindGroupLayout,
@@ -802,7 +841,7 @@ fn build_composite_pipeline(
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -816,8 +855,12 @@ fn build_composite_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
+        depth_stencil: Some(content_stencil_state()),
+        multisample: wgpu::MultisampleState {
+            count: msaa_sample_count,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
         multiview_mask: None,
         cache: None,
     })
@@ -893,7 +936,7 @@ struct EffectGpu {
     // *final* output regardless of how many passes it took to get there —
     // `composite_bind_group` is repointed here once this exists, so
     // `LayerInner::composite` needs no effect-awareness of its own.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the GPU resource its bind group points at
     output_texture: wgpu::Texture,
     output_view: wgpu::TextureView,
     kind: EffectGpuKind,
@@ -909,7 +952,7 @@ enum EffectGpuKind {
     Blur(Box<BlurEffectGpu>),
     /// One pass: `texture_view` -> `EffectGpu::output_view`.
     ColorMatrix {
-        #[allow(dead_code)]
+        #[allow(dead_code)] // owns the GPU resource its bind group points at
         matrix_buffer: wgpu::Buffer,
         bind_group: wgpu::BindGroup,
     },
@@ -927,12 +970,12 @@ enum EffectGpuKind {
 /// [`EffectGpuKind::Blur`]'s GPU state, boxed out of the enum itself — see
 /// that variant's doc.
 struct BlurEffectGpu {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the GPU resource its bind group points at
     ping_texture: wgpu::Texture,
     ping_view: wgpu::TextureView,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the GPU resource its bind group points at
     params_buffer_h: wgpu::Buffer,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the GPU resource its bind group points at
     params_buffer_v: wgpu::Buffer,
     bind_group_h: wgpu::BindGroup,
     bind_group_v: wgpu::BindGroup,
@@ -952,12 +995,18 @@ fn create_effect_bind_group(
         label: Some("atomos-layer-effect-bind-group"),
         layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::TextureView(texture_view),
             },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
         ],
     })
 }
@@ -977,8 +1026,13 @@ fn build_custom_effect_pipeline(
     bind_group_layout: &wgpu::BindGroupLayout,
 ) -> Option<wgpu::RenderPipeline> {
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let pipeline =
-        build_fullscreen_pipeline(device, format, "atomos-layer-custom-effect", source, bind_group_layout);
+    let pipeline = build_fullscreen_pipeline(
+        device,
+        format,
+        "atomos-layer-custom-effect",
+        source,
+        bind_group_layout,
+    );
     if let Some(error) = pollster::block_on(scope.pop()) {
         eprintln!("Atomos: custom shader effect failed to compile, layer left unaffected: {error}");
         return None;
@@ -1022,22 +1076,62 @@ fn run_fullscreen_pass(
 
 /// The GPU/CPU state shared by every clone of a [`Layer`]. See the module
 /// doc for the overall design.
+/// One step of a layer's draw order. See `LayerInner::ops`.
+#[derive(Clone, Debug, PartialEq)]
+enum ReplayOp {
+    /// A sub-range of the layer's one solid index buffer.
+    Solid(std::ops::Range<u32>),
+    /// A range of `image_draws`, each with its own bind group.
+    Images(std::ops::Range<usize>),
+    /// Index into `text_batches`.
+    Text(usize),
+    /// Enter a clip that is a pixel-aligned rectangle, as `[x, y, w, h]` in
+    /// physical pixels: a free hardware scissor.
+    ClipScissor([u32; 4]),
+    /// Enter a clip of any other shape: its geometry is this range of the
+    /// solid index buffer, drawn into the stencil.
+    ClipStencil(std::ops::Range<u32>),
+    /// Leave the innermost clip.
+    ClipPop,
+}
+
+/// The whole-layer clip resolved against the current scale and size: a
+/// scissor, or geometry in buffers of its own (so changing the clip never
+/// rebuilds the layer's content).
+struct LayerClipGpu {
+    op: ReplayOp,
+    vertex_buffer: Option<wgpu::Buffer>,
+    index_buffer: Option<wgpu::Buffer>,
+}
+
+/// A run of consecutive text commands with its own glyphon renderer.
+struct TextBatch {
+    renderer: glyphon::TextRenderer,
+    /// The run's commands, in physical pixels (built against the scale
+    /// factor current at the last rebuild).
+    commands: Vec<DrawCommand>,
+    hash: u64,
+    /// `(hash, atlas generation)` as of the last successful prepare. A
+    /// mismatch with either means the renderer's vertices are stale: the
+    /// content changed, or the shared atlas was trimmed or reset since.
+    prepared: Option<(u64, u64)>,
+}
+
 pub(super) struct LayerInner {
     device: wgpu::Device,
     queue: wgpu::Queue,
     solid_pipeline: wgpu::RenderPipeline,
+    stencil_incr_pipeline: wgpu::RenderPipeline,
+    stencil_decr_pipeline: wgpu::RenderPipeline,
     image_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     composite_bind_group_layout: wgpu::BindGroupLayout,
-    masked_composite_pipeline: wgpu::RenderPipeline,
-    masked_composite_bind_group_layout: wgpu::BindGroupLayout,
     composite_sampler: wgpu::Sampler,
     composite_quad_vbuf: wgpu::Buffer,
     format: wgpu::TextureFormat,
 
     size: (u32, u32),
     // Kept alive so `texture_view` stays valid; not read directly otherwise.
-    #[allow(dead_code)]
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
     // No per-layer MSAA target: layers render into the renderer's one
@@ -1057,33 +1151,16 @@ pub(super) struct LayerInner {
     // texture/bind group, so unlike the solid batch above these can't share
     // one buffer.
     image_draws: Vec<ImageDraw>,
-    // `FontSystem`/`TextAtlas`/etc. are shared by every layer; the
-    // `TextRenderer` below is not — see `text_stack.rs`'s module doc.
+    // `FontSystem`/`TextAtlas`/etc. are shared by every layer; text
+    // renderers are not — see `text_stack.rs`'s module doc.
     text_stack: Rc<RefCell<TextStack>>,
-    text_renderer: glyphon::TextRenderer,
-    // Whether the most recent `prepare_layer` call had any text commands.
-    // Lets `rebuild_if_needed` skip the per-frame prepare entirely for
-    // text-free layers (a cursor layer, a selection layer): when this
-    // frame has no text AND the last prepared batch was already empty,
-    // `text_renderer` is guaranteed empty, so there is nothing to refresh
-    // — and `TextStack::render` on an empty renderer is already a no-op.
-    had_text: bool,
-    // Hash of this layer's text `DrawCommand`s as of the last successful
-    // `prepare_layer` call (`None` when `had_text` is false). Lets
-    // `rebuild_if_needed` skip re-preparing when text content is
-    // byte-for-byte unchanged from last time — the expensive part of text
-    // handling (walking every glyph into `CustomGlyph`s, both here and
-    // inside glyphon's own `prepare_with_custom`) happens regardless of
-    // the shape cache, so this is what actually avoids redoing it for
-    // static text.
-    last_text_hash: Option<u64>,
-    // `TextStack::atlas_generation` as of the last successful
-    // `prepare_layer` call. A mismatch means the shared atlas may have
-    // been trimmed (and evicted glyphs this layer depends on) since then,
-    // so a re-prepare is needed even if `last_text_hash` still matches —
-    // see `TextStack::advance_frame`'s doc for why trimming makes this
-    // necessary.
-    text_prepared_generation: Option<u64>,
+    // The layer's draw order: consecutive commands of one kind share an op,
+    // so a later shape paints over earlier text and images, not under them.
+    ops: Vec<ReplayOp>,
+    // One glyphon renderer per run of consecutive text commands. glyphon
+    // can only draw everything it prepared in one call, so a text run that
+    // must sit between other ops needs a renderer of its own.
+    text_batches: Vec<TextBatch>,
 
     // Shared, pre-built effect pipelines/layouts, cloned in from
     // `LayerPipelines` the same way `solid_pipeline`/`image_pipeline`/
@@ -1113,28 +1190,52 @@ pub(super) struct LayerInner {
     // binding 0) can be rebuilt whenever the source is repointed.
     composite_source_view: wgpu::TextureView,
 
-    // `set_clip_rect`'s rect as logical-pixel `[x, y, w, h]` (mirrors
-    // `effect`'s logical-units convention) — converted to a physical
-    // scissor rect against the *current* scale factor every frame in
-    // `render_to_texture`, so DPI changes never leave it stale.
-    clip_rect: Option<[f32; 4]>,
-    // `set_clip_shape`'s shape, logical pixels; `mask_gpu` is the GPU
-    // state built from it (`None`/`None` when unclipped). Caller-driven
-    // like `effect`, not part of `pending`'s per-frame content hash.
-    clip_shape: Option<ClipShape>,
-    mask_gpu: Option<MaskGpu>,
+    // `set_clip`'s whole-layer clip, logical pixels. It is the outermost
+    // scope of the layer: wrapped around the replayed ops of a direct layer
+    // and around the composite of a group (so an effect is clipped too).
+    clip: Option<ClipShape>,
+    // How `clip` is applied, resolved at build time against the current
+    // scale and size: a scissor, or a range of the solid index buffer
+    // drawn into the stencil.
+    layer_clip: Option<LayerClipGpu>,
+    // `CachePolicy::Always`: keep this layer in an offscreen texture even
+    // without an effect.
+    cache_always: bool,
+    // Size of `texture`: the surface for a group, 1x1 for a direct layer
+    // (which draws straight into the frame and owns no real target).
+    texture_size: (u32, u32),
 
     // Current DPI scale factor — every `draw_*` method multiplies its
     // caller-supplied *logical*-pixel arguments by this before building a
     // `DrawCommand`, so `DrawCommand`/tessellation/glyph rasterization all
     // stay physical-pixel internally (crisp, no upscale blur) while callers
-    // never have to think about DPI. Kept in sync lazily by `render_layers`
+    // never have to think about DPI. Kept in sync lazily by `render_frame`
     // (same pull-based pattern as `resize_if_needed`), not pushed on
     // change.
     scale_factor: f32,
 
     pending: Vec<DrawCommand>,
     invalidation: InvalidationState,
+
+    // The retained textures are the cache boundary. A clean layer keeps its
+    // rendered content and effect output across frames and is only
+    // composited again; these flags say which of the two passes is stale.
+    // Both start true because a new texture's contents are undefined even
+    // when nothing was drawn.
+    content_texture_dirty: bool,
+    effect_texture_dirty: bool,
+    /// Passes actually recorded, so tests can prove clean frames skip them.
+    #[cfg(test)]
+    pub(super) content_passes: u32,
+    #[cfg(test)]
+    pub(super) effect_passes: u32,
+    /// Full effect-resource rebuilds (texture allocations), as opposed to
+    /// uniform patches.
+    #[cfg(test)]
+    pub(super) effect_rebuilds: u32,
+    /// Geometry/op rebuilds, to prove clean direct layers do no CPU work.
+    #[cfg(test)]
+    pub(super) geometry_rebuilds: u32,
 }
 
 /// GPU state for one `DrawCommand::Image`, rebuilt whenever the layer
@@ -1143,29 +1244,9 @@ struct ImageDraw {
     vertex_buffer: wgpu::Buffer,
     // Kept alive so `bind_group`'s texture view stays valid; not read
     // directly otherwise.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the GPU resource its bind group points at
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
-}
-
-/// GPU state for one layer's [`ClipShape`] mask: the mask's own
-/// (surface-sized, single-sample) texture, the tessellated shape geometry
-/// that gets rendered into it, and the masked-composite bind group
-/// (composite source + sampler + mask). Rebuilt by
-/// [`LayerInner::rebuild_mask`] on shape/size/DPI change; `dirty` means the
-/// geometry hasn't been rendered into the texture yet — the actual render
-/// pass runs lazily in [`LayerInner::render_mask_if_needed`], which is
-/// where the shared MSAA scratch target is available.
-struct MaskGpu {
-    // Also consulted by `rebuild_mask`'s size check to decide whether the
-    // texture can be reused across shape changes.
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    bind_group: wgpu::BindGroup,
-    vertex_buffer: Option<wgpu::Buffer>,
-    index_buffer: Option<wgpu::Buffer>,
-    num_indices: u32,
-    dirty: bool,
 }
 
 impl LayerInner {
@@ -1183,7 +1264,8 @@ impl LayerInner {
         scale_factor: f32,
         invalidation: LayerInvalidation,
     ) -> Self {
-        let (texture, texture_view) = create_layer_texture(device, format, size);
+        // Direct layers own no real target; groups get one in `sync_target`.
+        let (texture, texture_view) = create_layer_texture(device, format, (1, 1));
         let screen_size_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("atomos-layer-screen-size-ubo"),
             contents: bytemuck::bytes_of(&ScreenSize {
@@ -1211,22 +1293,15 @@ impl LayerInner {
             LayerInvalidation::Manual => InvalidationState::Manual { dirty: false },
         };
 
-        // Own `TextRenderer` per layer, registered against the shared
-        // `TextAtlas` — see `TextStack::create_text_renderer`'s doc for why
-        // sharing one `TextRenderer` across layers is unsound.
-        let text_renderer = text_stack.borrow_mut().create_text_renderer(device);
-
         Self {
             device: device.clone(),
             queue: queue.clone(),
             solid_pipeline: pipelines.solid_pipeline.clone(),
+            stencil_incr_pipeline: pipelines.stencil_incr_pipeline.clone(),
+            stencil_decr_pipeline: pipelines.stencil_decr_pipeline.clone(),
             image_pipeline: pipelines.image_pipeline.clone(),
             composite_pipeline: pipelines.composite_pipeline.clone(),
             composite_bind_group_layout: pipelines.composite_bind_group_layout.clone(),
-            masked_composite_pipeline: pipelines.masked_composite_pipeline.clone(),
-            masked_composite_bind_group_layout: pipelines
-                .masked_composite_bind_group_layout
-                .clone(),
             composite_sampler: pipelines.composite_sampler.clone(),
             composite_quad_vbuf: pipelines.composite_quad_vbuf.clone(),
             format,
@@ -1242,22 +1317,31 @@ impl LayerInner {
             num_indices: 0,
             image_draws: Vec::new(),
             text_stack,
-            text_renderer,
-            had_text: false,
-            last_text_hash: None,
-            text_prepared_generation: None,
+            ops: Vec::new(),
+            text_batches: Vec::new(),
             blur_pipeline: pipelines.blur_pipeline.clone(),
             blur_bind_group_layout: pipelines.blur_bind_group_layout.clone(),
             colormatrix_pipeline: pipelines.colormatrix_pipeline.clone(),
             colormatrix_bind_group_layout: pipelines.colormatrix_bind_group_layout.clone(),
             effect: None,
             effect_gpu: None,
-            clip_rect: None,
-            clip_shape: None,
-            mask_gpu: None,
+            clip: None,
+            layer_clip: None,
+            cache_always: false,
+            texture_size: (1, 1),
             scale_factor,
             pending: Vec::new(),
             invalidation: invalidation_state,
+            content_texture_dirty: true,
+            effect_texture_dirty: true,
+            #[cfg(test)]
+            content_passes: 0,
+            #[cfg(test)]
+            effect_passes: 0,
+            #[cfg(test)]
+            effect_rebuilds: 0,
+            #[cfg(test)]
+            geometry_rebuilds: 0,
         }
     }
 
@@ -1273,7 +1357,6 @@ impl LayerInner {
 
     // The layer spike's one `Manual` layer never redraws, so nothing calls
     // this yet — real `Manual`-layer callers are the next pass's work.
-    #[allow(dead_code)]
     fn clear(&mut self) {
         self.pending.clear();
         if let InvalidationState::Manual { dirty } = &mut self.invalidation {
@@ -1281,17 +1364,14 @@ impl LayerInner {
         }
     }
 
-    /// Resize the offscreen texture (and everything that references it) to
-    /// match the current surface size. Cached vertex/index data is left
-    /// alone — `DrawCommand` positions are already absolute pixel
-    /// coordinates, so they stay correct on a resized canvas without
-    /// re-tessellating.
+    /// Track the surface size: the screen-size uniform, the text viewport,
+    /// and everything built against the old size (clip scissors) are
+    /// refreshed. A group's texture is resized by [`LayerInner::sync_target`].
     fn resize_if_needed(&mut self, size: (u32, u32)) {
         if size == self.size {
             return;
         }
         self.size = size;
-        let (texture, texture_view) = create_layer_texture(&self.device, self.format, size);
         self.queue.write_buffer(
             &self.screen_size_buffer,
             0,
@@ -1299,28 +1379,96 @@ impl LayerInner {
                 screen_size: [size.0 as f32, size.1 as f32],
             }),
         );
-        self.texture = texture;
-        self.texture_view = texture_view;
-        self.set_composite_source(self.texture_view.clone());
         // Shared across every layer, so this runs redundantly once per
         // layer on an actual resize — harmless, it's just a small
         // `Resolution` update.
         self.text_stack.borrow_mut().resize(&self.queue, size);
+        // Clip scopes were resolved against the old size.
+        self.rebuild_layer_clip();
+        self.mark_for_rebuild();
+    }
 
+    /// Resolve `clip` against the current scale and size. Cheap, and
+    /// independent of the layer's content.
+    fn rebuild_layer_clip(&mut self) {
+        let Some(shape) = self.clip.clone() else {
+            self.layer_clip = None;
+            return;
+        };
+        if let Some(rect) = scissor_for_clip(&shape, self.scale_factor, self.size) {
+            self.layer_clip = Some(LayerClipGpu {
+                op: ReplayOp::ClipScissor(rect),
+                vertex_buffer: None,
+                index_buffer: None,
+            });
+            return;
+        }
+        let geometry = clip_shape_to_command(&shape, self.scale_factor);
+        let mut tessellator = FillTessellator::new();
+        let mut stroke_tessellator = StrokeTessellator::new();
+        let (vertices, indices) =
+            tessellate_command(&geometry, &mut tessellator, &mut stroke_tessellator);
+        let vertex_buffer = (!vertices.is_empty()).then(|| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("atomos-layer-clip-vbuf"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+        let index_buffer = (!indices.is_empty()).then(|| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("atomos-layer-clip-ibuf"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                })
+        });
+        self.layer_clip = Some(LayerClipGpu {
+            op: ReplayOp::ClipStencil(0..indices.len() as u32),
+            vertex_buffer,
+            index_buffer,
+        });
+    }
+
+    /// Force the next `rebuild_if_needed` to rebuild geometry and ops.
+    fn mark_for_rebuild(&mut self) {
+        match &mut self.invalidation {
+            InvalidationState::Automatic { last_hash } => *last_hash = None,
+            InvalidationState::Manual { dirty } => *dirty = true,
+        }
+    }
+
+    /// Whether this layer renders into an offscreen texture that is then
+    /// composited: it has an effect, or asked to be cached. Every other
+    /// layer is drawn straight into the frame and owns no real target.
+    fn is_group(&self) -> bool {
+        self.effect.is_some() || self.cache_always
+    }
+
+    /// Give a group a surface-sized texture and a direct layer a 1x1
+    /// placeholder, reallocating (and rebuilding what samples it) only when
+    /// that changes. This is what keeps a plain layer from costing a
+    /// surface-sized allocation.
+    fn sync_target(&mut self) {
+        let wanted = if self.is_group() { self.size } else { (1, 1) };
+        if self.texture_size == wanted {
+            return;
+        }
+        self.texture_size = wanted;
+        let (texture, texture_view) = create_layer_texture(&self.device, self.format, wanted);
+        self.texture = texture;
+        self.texture_view = texture_view;
+        self.content_texture_dirty = true;
+        self.effect_texture_dirty = true;
+        self.set_composite_source(self.texture_view.clone());
         if self.effect.is_some() {
             self.rebuild_effect_gpu();
-        }
-        // After the effect rebuild — the mask's bind group samples the
-        // final composite source (the effect's output when one is active).
-        if self.clip_shape.is_some() {
-            self.rebuild_mask();
         }
     }
 
     /// Repoint what the composite step samples from: `texture_view`
-    /// directly, or an active effect's output. The single place both the
-    /// plain composite bind group and (when a clip mask is active) the
-    /// masked one get rebuilt, so they can never disagree on the source.
+    /// directly, or an active effect's output.
     fn set_composite_source(&mut self, view: wgpu::TextureView) {
         self.composite_bind_group = create_composite_bind_group(
             &self.device,
@@ -1329,15 +1477,6 @@ impl LayerInner {
             &view,
         );
         self.composite_source_view = view;
-        if let Some(mask) = &mut self.mask_gpu {
-            mask.bind_group = create_masked_composite_bind_group(
-                &self.device,
-                &self.masked_composite_bind_group_layout,
-                &self.composite_sampler,
-                &self.composite_source_view,
-                &mask.view,
-            );
-        }
     }
 
     /// (Re)build `effect_gpu` from `self.effect` (`None` clears it) and
@@ -1359,7 +1498,62 @@ impl LayerInner {
     /// human-timescale resize rates. Split "rebuild textures/bind-groups"
     /// from "rebuild pipeline" if profiling ever shows resize hitching
     /// with a `Custom` effect active.
+    /// Patch the uniforms of the already-built effect to match `effect`
+    /// instead of reallocating its surface-sized textures. Only possible
+    /// when `effect` is the same built-in kind as the one in place; returns
+    /// whether it was, and the caller falls back to
+    /// [`LayerInner::rebuild_effect_gpu`] when not. Marks the effect output
+    /// stale on success.
+    fn update_effect_uniforms(&mut self, effect: &ShaderEffect) -> bool {
+        let Some(effect_gpu) = &self.effect_gpu else {
+            return false;
+        };
+        match (&effect_gpu.kind, effect) {
+            (EffectGpuKind::Blur(blur), ShaderEffect::Blur { radius }) => {
+                let texel_size = [
+                    1.0 / self.size.0.max(1) as f32,
+                    1.0 / self.size.1.max(1) as f32,
+                ];
+                for (buffer, direction) in [
+                    (&blur.params_buffer_h, [1.0, 0.0]),
+                    (&blur.params_buffer_v, [0.0, 1.0]),
+                ] {
+                    self.queue.write_buffer(
+                        buffer,
+                        0,
+                        bytemuck::bytes_of(&BlurParamsUniform {
+                            direction,
+                            texel_size,
+                            radius: radius * self.scale_factor,
+                            _pad: 0.0,
+                        }),
+                    );
+                }
+            }
+            (
+                EffectGpuKind::ColorMatrix { matrix_buffer, .. },
+                ShaderEffect::ColorMatrix(matrix),
+            ) => {
+                self.queue.write_buffer(
+                    matrix_buffer,
+                    0,
+                    bytemuck::bytes_of(&ColorMatrixUniform {
+                        cols: matrix.to_columns(),
+                    }),
+                );
+            }
+            _ => return false,
+        }
+        self.effect_texture_dirty = true;
+        true
+    }
+
     fn rebuild_effect_gpu(&mut self) {
+        #[cfg(test)]
+        {
+            self.effect_rebuilds += 1;
+        }
+        self.effect_texture_dirty = true;
         let Some(effect) = self.effect.clone() else {
             self.effect_gpu = None;
             self.set_composite_source(self.texture_view.clone());
@@ -1379,27 +1573,29 @@ impl LayerInner {
                     1.0 / self.size.1.max(1) as f32,
                 ];
                 let params_buffer_h =
-                    self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("atomos-layer-blur-params-h"),
-                        contents: bytemuck::bytes_of(&BlurParamsUniform {
-                            direction: [1.0, 0.0],
-                            texel_size,
-                            radius: physical_radius,
-                            _pad: 0.0,
-                        }),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("atomos-layer-blur-params-h"),
+                            contents: bytemuck::bytes_of(&BlurParamsUniform {
+                                direction: [1.0, 0.0],
+                                texel_size,
+                                radius: physical_radius,
+                                _pad: 0.0,
+                            }),
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        });
                 let params_buffer_v =
-                    self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("atomos-layer-blur-params-v"),
-                        contents: bytemuck::bytes_of(&BlurParamsUniform {
-                            direction: [0.0, 1.0],
-                            texel_size,
-                            radius: physical_radius,
-                            _pad: 0.0,
-                        }),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("atomos-layer-blur-params-v"),
+                            contents: bytemuck::bytes_of(&BlurParamsUniform {
+                                direction: [0.0, 1.0],
+                                texel_size,
+                                radius: physical_radius,
+                                _pad: 0.0,
+                            }),
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        });
                 let bind_group_h = create_effect_bind_group(
                     &self.device,
                     &self.blur_bind_group_layout,
@@ -1425,13 +1621,14 @@ impl LayerInner {
             }
             ShaderEffect::ColorMatrix(matrix) => {
                 let matrix_buffer =
-                    self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("atomos-layer-colormatrix-uniform"),
-                        contents: bytemuck::bytes_of(&ColorMatrixUniform {
-                            cols: matrix.to_columns(),
-                        }),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("atomos-layer-colormatrix-uniform"),
+                            contents: bytemuck::bytes_of(&ColorMatrixUniform {
+                                cols: matrix.to_columns(),
+                            }),
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        });
                 let bind_group = create_effect_bind_group(
                     &self.device,
                     &self.colormatrix_bind_group_layout,
@@ -1439,7 +1636,10 @@ impl LayerInner {
                     &self.texture_view,
                     &self.composite_sampler,
                 );
-                EffectGpuKind::ColorMatrix { matrix_buffer, bind_group }
+                EffectGpuKind::ColorMatrix {
+                    matrix_buffer,
+                    bind_group,
+                }
             }
             ShaderEffect::Custom(source) => {
                 let Some(pipeline) = build_custom_effect_pipeline(
@@ -1462,12 +1662,19 @@ impl LayerInner {
                     &self.composite_sampler,
                     &self.texture_view,
                 );
-                EffectGpuKind::Custom { pipeline, bind_group }
+                EffectGpuKind::Custom {
+                    pipeline,
+                    bind_group,
+                }
             }
         };
 
         self.set_composite_source(output_view.clone());
-        self.effect_gpu = Some(EffectGpu { output_texture, output_view, kind });
+        self.effect_gpu = Some(EffectGpu {
+            output_texture,
+            output_view,
+            kind,
+        });
     }
 
     /// Record this layer's active effect's render pass(es), if any — must
@@ -1475,8 +1682,17 @@ impl LayerInner {
     /// `texture_view` as input) and before `composite` (which reads
     /// whatever this leaves in `composite_bind_group`, already repointed
     /// by `rebuild_effect_gpu`).
-    fn apply_effect(&self, encoder: &mut wgpu::CommandEncoder) {
-        let Some(effect_gpu) = &self.effect_gpu else { return };
+    fn apply_effect_if_needed(&mut self, encoder: &mut wgpu::CommandEncoder) -> bool {
+        if !std::mem::take(&mut self.effect_texture_dirty) {
+            return false;
+        }
+        let Some(effect_gpu) = &self.effect_gpu else {
+            return false;
+        };
+        #[cfg(test)]
+        {
+            self.effect_passes += 1;
+        }
         match &effect_gpu.kind {
             EffectGpuKind::Blur(blur) => {
                 run_fullscreen_pass(
@@ -1503,7 +1719,10 @@ impl LayerInner {
                     &self.composite_quad_vbuf,
                 );
             }
-            EffectGpuKind::Custom { pipeline, bind_group } => {
+            EffectGpuKind::Custom {
+                pipeline,
+                bind_group,
+            } => {
                 run_fullscreen_pass(
                     encoder,
                     pipeline,
@@ -1513,133 +1732,51 @@ impl LayerInner {
                 );
             }
         }
+        true
     }
 
-    /// Pick up a new DPI scale factor. Cached `DrawCommand`s/GPU buffers
-    /// are left alone — they're already baked to physical pixels at the
-    /// *old* scale, so nothing looks wrong until content is next redrawn
-    /// (`Automatic` layers redraw every frame anyway; a `Manual` layer's
-    /// static content simply stays crisp at whatever scale it was drawn
-    /// at, same as a raster image would, until the caller redraws it).
-    fn set_scale_factor(&mut self, scale_factor: f32) {
+    /// Add this layer's targets and counts to `stats`.
+    fn add_to_stats(&self, stats: &mut RenderStats) {
+        stats.layers += 1;
+        stats.text_batches += self.text_batches.len() as u32;
+        let texels = self.texture_size.0 as u64 * self.texture_size.1 as u64;
+        stats.bytes.group_textures += texels * 4;
+        if self.is_group() {
+            stats.group_layers += 1;
+        } else {
+            stats.direct_layers += 1;
+        }
+        if let Some(effect) = &self.effect_gpu {
+            let textures = match effect.kind {
+                EffectGpuKind::Blur(_) => 2,
+                _ => 1,
+            };
+            stats.bytes.effect_textures += texels * 4 * textures;
+        }
+    }
+
+    /// Pick up a new DPI scale factor. Pending commands are logical, so a
+    /// change just invalidates the built geometry and prepared text; the
+    /// next rebuild derives physical sizes from the new factor.
+    pub(super) fn set_scale_factor(&mut self, scale_factor: f32) {
         let changed = self.scale_factor != scale_factor;
         self.scale_factor = scale_factor;
-        // A clip mask's geometry is baked at physical scale (same as every
-        // `DrawCommand`), but unlike drawn content nothing re-issues it per
-        // frame — re-derive it from the logical-units shape here so a DPI
-        // change doesn't leave the mask at the old density.
-        if changed && self.clip_shape.is_some() {
-            self.rebuild_mask();
-        }
-    }
-
-    /// (Re)build `mask_gpu` from `clip_shape` (`None` clears it) at the
-    /// layer's current `size`/`scale_factor`: tessellate the shape through
-    /// the exact same code path drawn geometry uses (flat white fill — the
-    /// mask only ever reads coverage/alpha), upload it, and mark the mask
-    /// texture dirty for `render_mask_if_needed` to fill next frame.
-    fn rebuild_mask(&mut self) {
-        let Some(shape) = &self.clip_shape else {
-            self.mask_gpu = None;
-            return;
-        };
-        let command = clip_shape_to_command(shape, self.scale_factor);
-        let mut tessellator = FillTessellator::new();
-        let mut stroke_tessellator = StrokeTessellator::new();
-        let (vertices, indices) =
-            tessellate_command(&command, &mut tessellator, &mut stroke_tessellator);
-
-        let vertex_buffer = (!vertices.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("atomos-layer-mask-vbuf"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
-        let index_buffer = (!indices.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("atomos-layer-mask-ibuf"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                })
-        });
-
-        // An animated clip re-sets its shape every frame — keep the mask
-        // texture and its bind group across rebuilds so that path costs new
-        // geometry buffers and one mask pass, not a fresh surface-sized
-        // texture allocation per frame. The size check falls through to a
-        // full rebuild after a resize (`resize_if_needed` updates
-        // `self.size` before calling this).
-        if let Some(mask) = &mut self.mask_gpu
-            && mask.texture.width() == self.size.0.max(1)
-            && mask.texture.height() == self.size.1.max(1)
-        {
-            mask.vertex_buffer = vertex_buffer;
-            mask.index_buffer = index_buffer;
-            mask.num_indices = indices.len() as u32;
-            mask.dirty = true;
-            return;
-        }
-
-        let (texture, view) = create_layer_texture(&self.device, self.format, self.size);
-        let bind_group = create_masked_composite_bind_group(
-            &self.device,
-            &self.masked_composite_bind_group_layout,
-            &self.composite_sampler,
-            &self.composite_source_view,
-            &view,
-        );
-        self.mask_gpu = Some(MaskGpu {
-            texture,
-            view,
-            bind_group,
-            vertex_buffer,
-            index_buffer,
-            num_indices: indices.len() as u32,
-            dirty: true,
-        });
-    }
-
-    /// Render the clip-mask geometry into the mask texture if it changed
-    /// since last rendered — a no-op every frame the mask is unchanged, so
-    /// a static clip costs one small pass total, not one per frame. Runs
-    /// through the shared MSAA scratch target (same as `render_to_texture`)
-    /// so mask edges get the same antialiasing drawn geometry gets.
-    fn render_mask_if_needed(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        msaa_view: &wgpu::TextureView,
-    ) {
-        let Some(mask) = &mut self.mask_gpu else { return };
-        if !mask.dirty {
-            return;
-        }
-        mask.dirty = false;
-
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("atomos-layer-mask-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: msaa_view,
-                depth_slice: None,
-                resolve_target: Some(&mask.view),
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Discard,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        if let (Some(vbuf), Some(ibuf)) = (&mask.vertex_buffer, &mask.index_buffer) {
-            rpass.set_pipeline(&self.solid_pipeline);
-            rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
-            rpass.set_vertex_buffer(0, vbuf.slice(..));
-            rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            rpass.draw_indexed(0..mask.num_indices, 0, 0..1);
+        if changed {
+            // Commands are stored in logical pixels, so retained content
+            // only needs rebuilding (and its text re-preparing) at the new
+            // density: nothing for the caller to redraw.
+            match &mut self.invalidation {
+                InvalidationState::Automatic { last_hash } => *last_hash = None,
+                InvalidationState::Manual { dirty } => *dirty = true,
+            }
+            // The layer clip and a blur radius are in logical units too.
+            self.rebuild_layer_clip();
+            self.content_texture_dirty = true;
+            if let Some(effect) = self.effect.clone()
+                && !self.update_effect_uniforms(&effect)
+            {
+                self.rebuild_effect_gpu();
+            }
         }
     }
 
@@ -1667,50 +1804,16 @@ impl LayerInner {
             self.build_buffers();
         }
 
-        // Text re-prepares whenever its content changed, or unconditionally
-        // once per atlas trim cycle — never simply "every frame" (see
-        // `TextStack::advance_frame`'s doc and `LayerInner::last_text_hash`/
-        // `text_prepared_generation`'s field docs for why both checks are
-        // needed for correctness, not just the hash). Must happen before
-        // `pending` is cleared below (an `Automatic` layer's text commands
-        // wouldn't survive to `render_to_texture` otherwise).
-        let mut text_hasher = DefaultHasher::new();
-        let mut has_text = false;
-        for command in &self.pending {
-            if matches!(command, DrawCommand::Text { .. } | DrawCommand::StyledText { .. }) {
-                has_text = true;
-                command.hash(&mut text_hasher);
-            }
-        }
-        let text_hash = has_text.then(|| text_hasher.finish());
+        // Text re-prepares whenever a batch's content changed, or once per
+        // atlas trim or reset (see `TextStack::advance_frame`). This must
+        // finish for every batch before anything is recorded: preparing a
+        // renderer after its draw was recorded would replace the buffer the
+        // recorded draw reads.
+        let prepared = self.prepare_text_batches();
 
-        let atlas_generation = self.text_stack.borrow().atlas_generation();
-        let needs_prepare = if has_text {
-            text_hash != self.last_text_hash
-                || self.text_prepared_generation != Some(atlas_generation)
-        } else {
-            // No text this frame — the only reason to prepare is to clear
-            // out a previous frame's glyphs (see the `had_text` field doc);
-            // an atlas trim can't have invalidated anything since an empty
-            // `text_renderer` has no glyphs for it to have evicted.
-            self.had_text
-        };
-
-        if needs_prepare {
-            if let Err(e) = self.text_stack.borrow_mut().prepare_layer(
-                &self.device,
-                &self.queue,
-                &self.pending,
-                &mut self.text_renderer,
-            ) {
-                eprintln!(
-                    "Atomos: text glyph atlas full, some text may not render this frame: {e:?}"
-                );
-            }
-            self.last_text_hash = text_hash;
-            self.text_prepared_generation = Some(atlas_generation);
+        if should_rebuild || prepared {
+            self.content_texture_dirty = true;
         }
-        self.had_text = has_text;
 
         // `Automatic` layers expect a full re-description of their content
         // every frame; `Manual` layers persist theirs until `clear()`.
@@ -1719,6 +1822,67 @@ impl LayerInner {
         }
 
         should_rebuild
+    }
+
+    /// The pending commands at the current physical scale.
+    fn physical_commands(&self) -> Vec<DrawCommand> {
+        self.pending
+            .iter()
+            .map(|command| command.to_physical(self.scale_factor))
+            .collect()
+    }
+
+    /// Prepare every text batch whose content or atlas generation is stale.
+    /// Returns whether anything was prepared.
+    fn prepare_text_batches(&mut self) -> bool {
+        let mut prepared_any = false;
+        // A second sweep covers the one case where the first goes wrong: a
+        // later batch's prepare reset the shared atlas, which invalidates
+        // every batch prepared earlier in the sweep. A reset during the
+        // second sweep is not retried; those batches retry next frame.
+        for _ in 0..2 {
+            let generation_at_start = self.text_stack.borrow().atlas_generation();
+            for batch in &mut self.text_batches {
+                let generation = self.text_stack.borrow().atlas_generation();
+                if batch.prepared == Some((batch.hash, generation)) {
+                    continue;
+                }
+                prepared_any = true;
+                let mut stack = self.text_stack.borrow_mut();
+                let mut result = stack.prepare_layer(
+                    &self.device,
+                    &self.queue,
+                    &batch.commands,
+                    &mut batch.renderer,
+                );
+                if result.is_err() {
+                    // The atlas is full of glyphs nothing uses any more:
+                    // start it afresh and try once more.
+                    stack.reset_glyph_atlas(&self.device, &self.queue);
+                    result = stack.prepare_layer(
+                        &self.device,
+                        &self.queue,
+                        &batch.commands,
+                        &mut batch.renderer,
+                    );
+                }
+                match result {
+                    Ok(()) => batch.prepared = Some((batch.hash, stack.atlas_generation())),
+                    Err(e) => {
+                        // Left unprepared so the next frame tries again
+                        // instead of treating stale glyphs as current.
+                        eprintln!(
+                            "Atomos: text glyph atlas full, text will retry next frame: {e:?}"
+                        );
+                        batch.prepared = None;
+                    }
+                }
+            }
+            if self.text_stack.borrow().atlas_generation() == generation_at_start {
+                break;
+            }
+        }
+        prepared_any
     }
 
     fn build_buffers(&mut self) {
@@ -1735,10 +1899,65 @@ impl LayerInner {
         let mut tessellator = FillTessellator::new();
         let mut stroke_tessellator = StrokeTessellator::new();
         self.image_draws.clear();
-        for command in &self.pending {
+        let mut ops: Vec<ReplayOp> = Vec::new();
+        let mut text_runs: Vec<Vec<DrawCommand>> = Vec::new();
+        // Whether the previous command was text, so a run of them shares
+        // one batch.
+        let mut in_text_run = false;
+        let physical = self.physical_commands();
+        for command in physical {
+            match &command {
+                DrawCommand::PushClip(shape) => {
+                    in_text_run = false;
+                    if let Some(rect) = scissor_for_clip(shape, self.scale_factor, self.size) {
+                        ops.push(ReplayOp::ClipScissor(rect));
+                    } else {
+                        let geometry = clip_shape_to_command(shape, self.scale_factor);
+                        let before = indices.len() as u32;
+                        let (cmd_vertices, cmd_indices) = tessellate_command(
+                            &geometry,
+                            &mut tessellator,
+                            &mut stroke_tessellator,
+                        );
+                        append_geometry(&mut vertices, &mut indices, cmd_vertices, cmd_indices);
+                        ops.push(ReplayOp::ClipStencil(before..indices.len() as u32));
+                    }
+                    continue;
+                }
+                DrawCommand::PopClip => {
+                    in_text_run = false;
+                    ops.push(ReplayOp::ClipPop);
+                    continue;
+                }
+                _ => {}
+            }
+            let is_text = matches!(
+                command,
+                DrawCommand::Text { .. } | DrawCommand::StyledText { .. }
+            );
+            if is_text {
+                if !in_text_run {
+                    text_runs.push(Vec::new());
+                    ops.push(ReplayOp::Text(text_runs.len() - 1));
+                }
+                text_runs
+                    .last_mut()
+                    .expect("a run was just started")
+                    .push(command);
+                in_text_run = true;
+                continue;
+            }
+            in_text_run = false;
+
             // `Image` needs its own texture/bind group, not a shared
-            // vertex/index buffer — built separately below.
-            if let DrawCommand::Image { pixels, top_left, size, tint } = command {
+            // vertex/index buffer.
+            if let DrawCommand::Image {
+                pixels,
+                top_left,
+                size,
+                tint,
+            } = &command
+            {
                 self.image_draws.push(build_image_draw(
                     &self.device,
                     &self.queue,
@@ -1749,11 +1968,31 @@ impl LayerInner {
                     *size,
                     tint,
                 ));
+                let at = self.image_draws.len() - 1;
+                match ops.last_mut() {
+                    Some(ReplayOp::Images(range)) => range.end = at + 1,
+                    _ => ops.push(ReplayOp::Images(at..at + 1)),
+                }
                 continue;
             }
+
+            let before = indices.len() as u32;
             let (cmd_vertices, cmd_indices) =
-                tessellate_command(command, &mut tessellator, &mut stroke_tessellator);
+                tessellate_command(&command, &mut tessellator, &mut stroke_tessellator);
             append_geometry(&mut vertices, &mut indices, cmd_vertices, cmd_indices);
+            let after = indices.len() as u32;
+            if after > before {
+                match ops.last_mut() {
+                    Some(ReplayOp::Solid(range)) => range.end = after,
+                    _ => ops.push(ReplayOp::Solid(before..after)),
+                }
+            }
+        }
+        self.ops = ops;
+        self.assign_text_batches(text_runs);
+        #[cfg(test)]
+        {
+            self.geometry_rebuilds += 1;
         }
 
         self.num_indices = indices.len() as u32;
@@ -1788,12 +2027,69 @@ impl LayerInner {
         };
     }
 
+    /// Give each text run a batch, reusing batches (and their glyphon
+    /// renderers) by position so an unchanged run keeps its prepared state.
+    #[cfg(test)]
+    pub(super) fn texture_size_for_test(&self) -> (u32, u32) {
+        self.texture_size
+    }
+
+    #[cfg(test)]
+    pub(super) fn text_batch_states_for_test(&self) -> Vec<Option<(u64, u64)>> {
+        self.text_batches
+            .iter()
+            .map(|batch| batch.prepared)
+            .collect()
+    }
+
+    fn assign_text_batches(&mut self, runs: Vec<Vec<DrawCommand>>) {
+        self.text_batches.truncate(runs.len());
+        for (index, commands) in runs.into_iter().enumerate() {
+            let mut hasher = DefaultHasher::new();
+            for command in &commands {
+                command.hash(&mut hasher);
+            }
+            let hash = hasher.finish();
+            match self.text_batches.get_mut(index) {
+                Some(batch) => {
+                    batch.commands = commands;
+                    batch.hash = hash;
+                }
+                None => {
+                    let renderer = self
+                        .text_stack
+                        .borrow_mut()
+                        .create_text_renderer(&self.device);
+                    self.text_batches.push(TextBatch {
+                        renderer,
+                        commands,
+                        hash,
+                        prepared: None,
+                    });
+                }
+            }
+        }
+    }
+
     /// Render this layer's cached geometry into its own offscreen texture.
     /// A separate render pass from both other layers and the main
     /// swap-chain pass — cheap to skip entirely for layers with no
     /// geometry (an empty `pending` still needs its texture cleared to
     /// transparent so it doesn't keep showing stale content).
-    fn render_to_texture(&self, encoder: &mut wgpu::CommandEncoder, msaa_view: &wgpu::TextureView) {
+    fn render_to_texture_if_needed(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        msaa: &MsaaTarget,
+    ) -> bool {
+        if !std::mem::take(&mut self.content_texture_dirty) {
+            return false;
+        }
+        // New content means the effect must run over it again.
+        self.effect_texture_dirty = true;
+        #[cfg(test)]
+        {
+            self.content_passes += 1;
+        }
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("atomos-layer-pass"),
             // Render into the renderer's shared multisampled scratch
@@ -1803,7 +2099,7 @@ impl LayerInner {
             // `Discard` rather than `Store` — which is also what makes
             // sharing one scratch texture across layers safe.
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: msaa_view,
+                view: &msaa.color_view,
                 depth_slice: None,
                 resolve_target: Some(&self.texture_view),
                 ops: wgpu::Operations {
@@ -1811,76 +2107,216 @@ impl LayerInner {
                     store: wgpu::StoreOp::Discard,
                 },
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(stencil_attachment(&msaa.stencil_view)),
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
         });
 
-        // Hardware scissor: pass-level state, so it clips everything below
-        // — solids, images, and text alike. `LoadOp::Clear` above ignores
-        // it (the whole attachment is cleared), which is exactly right:
-        // outside the rect stays transparent. Physical-px conversion
-        // happens here, against the current scale factor, so the stored
-        // logical rect never goes stale across DPI changes.
-        if let Some([x, y, w, h]) = self.clip_rect {
-            let s = self.scale_factor;
-            let max_w = self.size.0 as f32;
-            let max_h = self.size.1 as f32;
-            let x0 = (x * s).clamp(0.0, max_w);
-            let y0 = (y * s).clamp(0.0, max_h);
-            let x1 = ((x + w) * s).clamp(0.0, max_w);
-            let y1 = ((y + h) * s).clamp(0.0, max_h);
-            if x1 <= x0 || y1 <= y0 {
-                // Fully clipped: the clear above already emptied the
-                // texture, and recording zero draws is the cheapest frame
-                // there is.
-                return;
+        // A group's content is drawn unclipped; the layer clip applies when
+        // it is composited (so an effect is clipped too).
+        let mut clip = ClipStack::new([0, 0, self.size.0, self.size.1]);
+        self.replay_ops(&mut rpass, &mut clip);
+        true
+    }
+
+    /// Enter a clip scope: a pixel-aligned rectangle tightens the scissor,
+    /// any other shape is drawn into the stencil and tested against by all
+    /// content after it.
+    fn clip_open(
+        &self,
+        rpass: &mut wgpu::RenderPass<'_>,
+        clip: &mut ClipStack,
+        op: &ReplayOp,
+        buffers: (&Option<wgpu::Buffer>, &Option<wgpu::Buffer>),
+    ) {
+        if clip.skipping > 0 {
+            clip.skipping += 1;
+            clip.scopes.push(Scope::Skipped);
+            return;
+        }
+        match op {
+            ReplayOp::ClipScissor(rect) => {
+                let next = intersect_scissor(clip.scissor, *rect);
+                if next[2] == 0 || next[3] == 0 {
+                    clip.skipping += 1;
+                    clip.scopes.push(Scope::Skipped);
+                } else {
+                    clip.scopes.push(Scope::Scissor(clip.scissor));
+                    clip.scissor = next;
+                    rpass.set_scissor_rect(next[0], next[1], next[2], next[3]);
+                }
             }
-            rpass.set_scissor_rect(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
-        }
-
-        if let (Some(vbuf), Some(ibuf)) = (&self.vertex_buffer, &self.index_buffer) {
-            rpass.set_pipeline(&self.solid_pipeline);
-            rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
-            rpass.set_vertex_buffer(0, vbuf.slice(..));
-            rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            rpass.draw_indexed(0..self.num_indices, 0, 0..1);
-        }
-
-        if !self.image_draws.is_empty() {
-            rpass.set_pipeline(&self.image_pipeline);
-            rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
-            for image_draw in &self.image_draws {
-                rpass.set_bind_group(1, &image_draw.bind_group, &[]);
-                rpass.set_vertex_buffer(0, image_draw.vertex_buffer.slice(..));
-                rpass.draw(0..6, 0..1);
+            ReplayOp::ClipStencil(range) => {
+                let (Some(vbuf), Some(ibuf)) = buffers else {
+                    clip.scopes.push(Scope::Noop);
+                    return;
+                };
+                if clip.depth >= MAX_CLIP_DEPTH {
+                    clip.scopes.push(Scope::Noop);
+                    return;
+                }
+                rpass.set_pipeline(&self.stencil_incr_pipeline);
+                rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+                rpass.set_vertex_buffer(0, vbuf.slice(..));
+                rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.set_stencil_reference(clip.depth);
+                rpass.draw_indexed(range.clone(), 0, 0..1);
+                clip.depth += 1;
+                clip.scopes
+                    .push(Scope::Stencil(range.clone(), vbuf.clone(), ibuf.clone()));
             }
-        }
-
-        // Drawn last, on top of this layer's shapes/images — whatever
-        // `prepare_layer` uploaded moments ago in `rebuild_if_needed`.
-        if let Err(e) = self.text_stack.borrow().render(&self.text_renderer, &mut rpass) {
-            eprintln!("Atomos: text render error: {e:?}");
+            _ => {}
         }
     }
 
-    /// Composite this layer's already-rendered texture onto `view`
-    /// (expected to already contain everything drawn below it — the caller
-    /// is responsible for `LoadOp::Load` and drawing layers in
-    /// bottom-to-top order).
-    fn composite(&self, rpass: &mut wgpu::RenderPass<'_>) {
-        // Masked layers pay one extra fullscreen texture sample here;
-        // unclipped layers take the exact pre-mask path.
-        if let Some(mask) = &self.mask_gpu {
-            rpass.set_pipeline(&self.masked_composite_pipeline);
-            rpass.set_bind_group(0, &mask.bind_group, &[]);
-        } else {
+    /// Leave the innermost clip scope; a stray close is ignored.
+    fn clip_close(&self, rpass: &mut wgpu::RenderPass<'_>, clip: &mut ClipStack) {
+        match clip.scopes.pop() {
+            Some(Scope::Scissor(previous)) => {
+                clip.scissor = previous;
+                rpass.set_scissor_rect(previous[0], previous[1], previous[2], previous[3]);
+            }
+            Some(Scope::Stencil(range, vbuf, ibuf)) => {
+                rpass.set_pipeline(&self.stencil_decr_pipeline);
+                rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+                rpass.set_vertex_buffer(0, vbuf.slice(..));
+                rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.set_stencil_reference(clip.depth);
+                rpass.draw_indexed(range, 0, 0..1);
+                clip.depth -= 1;
+            }
+            Some(Scope::Skipped) => clip.skipping -= 1,
+            Some(Scope::Noop) | None => {}
+        }
+    }
+
+    /// Close every scope still open, restoring scissor and stencil so the
+    /// next layer starts clean.
+    fn clip_close_all(&self, rpass: &mut wgpu::RenderPass<'_>, clip: &mut ClipStack) {
+        while !clip.scopes.is_empty() {
+            self.clip_close(rpass, clip);
+        }
+    }
+
+    /// Record this layer's ops in draw order.
+    fn replay_ops(&self, rpass: &mut wgpu::RenderPass<'_>, clip: &mut ClipStack) {
+        for op in &self.ops {
+            match op {
+                ReplayOp::ClipScissor(_) | ReplayOp::ClipStencil(_) => {
+                    self.clip_open(rpass, clip, op, (&self.vertex_buffer, &self.index_buffer))
+                }
+                ReplayOp::ClipPop => self.clip_close(rpass, clip),
+                _ if clip.skipping > 0 => {}
+                ReplayOp::Solid(range) => {
+                    let (Some(vbuf), Some(ibuf)) = (&self.vertex_buffer, &self.index_buffer) else {
+                        continue;
+                    };
+                    rpass.set_pipeline(&self.solid_pipeline);
+                    rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+                    rpass.set_vertex_buffer(0, vbuf.slice(..));
+                    rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rpass.set_stencil_reference(clip.depth);
+                    rpass.draw_indexed(range.clone(), 0, 0..1);
+                }
+                ReplayOp::Images(range) => {
+                    rpass.set_pipeline(&self.image_pipeline);
+                    rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+                    rpass.set_stencil_reference(clip.depth);
+                    for image_draw in &self.image_draws[range.clone()] {
+                        rpass.set_bind_group(1, &image_draw.bind_group, &[]);
+                        rpass.set_vertex_buffer(0, image_draw.vertex_buffer.slice(..));
+                        rpass.draw(0..6, 0..1);
+                    }
+                }
+                ReplayOp::Text(batch) => {
+                    rpass.set_stencil_reference(clip.depth);
+                    if let Err(e) = self
+                        .text_stack
+                        .borrow()
+                        .render(&self.text_batches[*batch].renderer, rpass)
+                    {
+                        eprintln!("Atomos: text render error: {e:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draw a direct layer into the frame: its ops, inside its layer clip.
+    fn record_direct(&self, rpass: &mut wgpu::RenderPass<'_>, surface: [u32; 4]) {
+        if self.ops.is_empty() {
+            return;
+        }
+        let mut clip = ClipStack::new(surface);
+        if let Some(layer_clip) = &self.layer_clip {
+            self.clip_open(
+                rpass,
+                &mut clip,
+                &layer_clip.op,
+                (&layer_clip.vertex_buffer, &layer_clip.index_buffer),
+            );
+        }
+        self.replay_ops(rpass, &mut clip);
+        self.clip_close_all(rpass, &mut clip);
+    }
+
+    /// Composite a group's finished texture (or effect output) into the
+    /// frame, inside the layer clip.
+    fn record_group(&self, rpass: &mut wgpu::RenderPass<'_>, surface: [u32; 4]) {
+        let mut clip = ClipStack::new(surface);
+        if let Some(layer_clip) = &self.layer_clip {
+            self.clip_open(
+                rpass,
+                &mut clip,
+                &layer_clip.op,
+                (&layer_clip.vertex_buffer, &layer_clip.index_buffer),
+            );
+        }
+        if clip.skipping == 0 {
             rpass.set_pipeline(&self.composite_pipeline);
             rpass.set_bind_group(0, &self.composite_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.composite_quad_vbuf.slice(..));
+            rpass.set_stencil_reference(clip.depth);
+            rpass.draw(0..6, 0..1);
         }
-        rpass.set_vertex_buffer(0, self.composite_quad_vbuf.slice(..));
-        rpass.draw(0..6, 0..1);
+        self.clip_close_all(rpass, &mut clip);
+    }
+}
+
+/// What closing a clip scope must undo.
+enum Scope {
+    /// Restore this scissor.
+    Scissor([u32; 4]),
+    /// Redraw this shape (a range of these buffers) with the decrementing
+    /// pipeline.
+    Stencil(std::ops::Range<u32>, wgpu::Buffer, wgpu::Buffer),
+    /// The scope drew nothing (empty intersection, or nested inside one);
+    /// only its closing needs tracking.
+    Skipped,
+    /// A clip that could not be applied but must stay balanced.
+    Noop,
+}
+
+/// Deepest stencil nesting: the cleared value 0 up to the 8-bit maximum.
+const MAX_CLIP_DEPTH: u32 = 255;
+
+/// Clip state while recording one render pass.
+struct ClipStack {
+    scissor: [u32; 4],
+    depth: u32,
+    skipping: u32,
+    scopes: Vec<Scope>,
+}
+
+impl ClipStack {
+    fn new(surface: [u32; 4]) -> Self {
+        Self {
+            scissor: surface,
+            depth: 0,
+            skipping: 0,
+            scopes: Vec::new(),
+        }
     }
 }
 
@@ -1905,6 +2341,159 @@ fn create_layer_texture(
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
+}
+
+/// A physical-pixel rectangle `[x, y, w, h]` from edge coordinates, clamped
+/// to the target. Zero width or height means empty.
+fn clamp_scissor(x0: f32, y0: f32, x1: f32, y1: f32, size: (u32, u32)) -> [u32; 4] {
+    let (max_w, max_h) = (size.0 as f32, size.1 as f32);
+    let x0 = x0.clamp(0.0, max_w);
+    let y0 = y0.clamp(0.0, max_h);
+    let x1 = x1.clamp(0.0, max_w);
+    let y1 = y1.clamp(0.0, max_h);
+    if x1 <= x0 || y1 <= y0 {
+        return [0, 0, 0, 0];
+    }
+    [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]
+}
+
+fn intersect_scissor(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    let x0 = a[0].max(b[0]);
+    let y0 = a[1].max(b[1]);
+    let x1 = (a[0] + a[2]).min(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).min(b[1] + b[3]);
+    if x1 <= x0 || y1 <= y0 {
+        return [0, 0, 0, 0];
+    }
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
+/// The scissor equivalent of `shape`, when it is an unrounded rectangle
+/// whose physical edges all fall on whole pixels. A fractional edge must
+/// stay antialiased, which only the stencil path does.
+fn scissor_for_clip(shape: &ClipShape, scale: f32, size: (u32, u32)) -> Option<[u32; 4]> {
+    let ClipShape::Rectangle {
+        top_left,
+        size: extent,
+        rounding,
+    } = shape
+    else {
+        return None;
+    };
+    if *rounding != Rounding::NONE {
+        return None;
+    }
+    let edges = [
+        top_left.0 * scale,
+        top_left.1 * scale,
+        (top_left.0 + extent.0) * scale,
+        (top_left.1 + extent.1) * scale,
+    ];
+    if edges.iter().any(|e| (e - e.round()).abs() > 1e-3) {
+        return None;
+    }
+    Some(clamp_scissor(edges[0], edges[1], edges[2], edges[3], size))
+}
+
+/// How a [`Layer`] is kept between frames. See [`Layer::set_cache_policy`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// Drawn straight into the frame; offscreen only if it has an effect.
+    #[default]
+    Auto,
+    /// Always rendered to its own texture, re-rendered only when changed.
+    Always,
+}
+
+/// Format of the shared stencil attachment that clip scopes draw into.
+pub(super) const STENCIL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Stencil8;
+
+/// The shared multisampled targets every layer pass renders into: colour
+/// (resolved into the layer's own texture) and the stencil clip scopes use.
+pub(super) struct MsaaTarget {
+    _color: wgpu::Texture,
+    pub(super) color_view: wgpu::TextureView,
+    _stencil: wgpu::Texture,
+    pub(super) stencil_view: wgpu::TextureView,
+    /// Allocation arithmetic: `(colour, stencil)` bytes.
+    bytes: (u64, u64),
+}
+
+pub(super) fn create_msaa_target(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    size: (u32, u32),
+    sample_count: u32,
+) -> MsaaTarget {
+    let (color, color_view) = create_msaa_texture(device, format, size, sample_count);
+    let (stencil, stencil_view) = create_msaa_texture(device, STENCIL_FORMAT, size, sample_count);
+    let pixels = size.0.max(1) as u64 * size.1.max(1) as u64 * sample_count as u64;
+    MsaaTarget {
+        _color: color,
+        color_view,
+        _stencil: stencil,
+        stencil_view,
+        bytes: (pixels * 4, pixels),
+    }
+}
+
+/// The stencil attachment for a pass: cleared to 0 (no clip active) and
+/// never read afterwards.
+fn stencil_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassDepthStencilAttachment<'_> {
+    wgpu::RenderPassDepthStencilAttachment {
+        view,
+        depth_ops: None,
+        stencil_ops: Some(wgpu::Operations {
+            load: wgpu::LoadOp::Clear(0),
+            store: wgpu::StoreOp::Discard,
+        }),
+    }
+}
+
+/// Stencil state of content pipelines: draw only where the stencil equals
+/// the pass's current reference (the clip depth), never write it.
+pub(super) fn content_stencil_state() -> wgpu::DepthStencilState {
+    let face = wgpu::StencilFaceState {
+        compare: wgpu::CompareFunction::Equal,
+        fail_op: wgpu::StencilOperation::Keep,
+        depth_fail_op: wgpu::StencilOperation::Keep,
+        pass_op: wgpu::StencilOperation::Keep,
+    };
+    wgpu::DepthStencilState {
+        format: STENCIL_FORMAT,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Always),
+        stencil: wgpu::StencilState {
+            front: face,
+            back: face,
+            read_mask: 0xff,
+            write_mask: 0xff,
+        },
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
+
+/// Stencil state that adds `op` wherever the stencil equals the reference:
+/// `IncrementClamp` enters a clip, `DecrementClamp` leaves it.
+fn clip_stencil_state(op: wgpu::StencilOperation) -> wgpu::DepthStencilState {
+    let face = wgpu::StencilFaceState {
+        compare: wgpu::CompareFunction::Equal,
+        fail_op: wgpu::StencilOperation::Keep,
+        depth_fail_op: wgpu::StencilOperation::Keep,
+        pass_op: op,
+    };
+    wgpu::DepthStencilState {
+        format: STENCIL_FORMAT,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Always),
+        stencil: wgpu::StencilState {
+            front: face,
+            back: face,
+            read_mask: 0xff,
+            write_mask: 0xff,
+        },
+        bias: wgpu::DepthBiasState::default(),
+    }
 }
 
 /// Build the offscreen multisampled colour texture every layer's
@@ -2007,7 +2596,11 @@ fn build_image_draw(
         usage: wgpu::BufferUsages::VERTEX,
     });
 
-    ImageDraw { vertex_buffer, texture, bind_group }
+    ImageDraw {
+        vertex_buffer,
+        texture,
+        bind_group,
+    }
 }
 
 fn create_composite_bind_group(
@@ -2032,35 +2625,6 @@ fn create_composite_bind_group(
     })
 }
 
-/// The masked composite's bind group: the composite source (layer texture
-/// or effect output) at 0, the shared sampler at 1, the mask texture at 2.
-fn create_masked_composite_bind_group(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    sampler: &wgpu::Sampler,
-    source_view: &wgpu::TextureView,
-    mask_view: &wgpu::TextureView,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("atomos-layer-masked-composite-bind-group"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(source_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(mask_view),
-            },
-        ],
-    })
-}
-
 /// Lower a logical-units [`ClipShape`] to the physical-px [`DrawCommand`]
 /// its mask is tessellated from — the same logical-to-physical scaling
 /// every `Layer::draw_*` method applies at its call boundary, with a flat
@@ -2068,7 +2632,11 @@ fn create_masked_composite_bind_group(
 fn clip_shape_to_command(shape: &ClipShape, s: f32) -> DrawCommand {
     const WHITE: Color = Color::rgb(0xFF, 0xFF, 0xFF);
     match shape {
-        ClipShape::Rectangle { top_left, size, rounding } => DrawCommand::Rectangle {
+        ClipShape::Rectangle {
+            top_left,
+            size,
+            rounding,
+        } => DrawCommand::Rectangle {
             top_left: [top_left.0 * s, top_left.1 * s],
             size: [size.0 * s, size.1 * s],
             color: WHITE,
@@ -2137,13 +2705,20 @@ fn tessellate_command(
             color,
             rounding,
         } => tessellate_rectangle(*top_left, *size, color, rounding, tessellator),
-        DrawCommand::Polygon { vertices, color } => tessellate_polygon(vertices, color, tessellator),
-        DrawCommand::Circle { center, radius, color } => {
-            tessellate_circle(*center, *radius, color, tessellator)
+        DrawCommand::Polygon { vertices, color } => {
+            tessellate_polygon(vertices, color, tessellator)
         }
-        DrawCommand::Path { d, position, scale, paint } => {
-            tessellate_svg_path(d, *position, *scale, paint, tessellator, stroke_tessellator)
-        }
+        DrawCommand::Circle {
+            center,
+            radius,
+            color,
+        } => tessellate_circle(*center, *radius, color, tessellator),
+        DrawCommand::Path {
+            d,
+            position,
+            scale,
+            paint,
+        } => tessellate_svg_path(d, *position, *scale, paint, tessellator, stroke_tessellator),
         // Handled directly in `LayerInner::build_buffers`, which needs its
         // own texture per image rather than a shared vertex/index buffer
         // — filtered out before ever reaching here.
@@ -2151,7 +2726,10 @@ fn tessellate_command(
         // Handled entirely in `LayerInner::rebuild_if_needed`/
         // `render_to_texture` via the shared `TextStack`, not the solid
         // vertex/index batch.
-        DrawCommand::Text { .. } | DrawCommand::StyledText { .. } => (Vec::new(), Vec::new()),
+        DrawCommand::Text { .. }
+        | DrawCommand::StyledText { .. }
+        | DrawCommand::PushClip(_)
+        | DrawCommand::PopClip => (Vec::new(), Vec::new()),
     }
 }
 
@@ -2165,9 +2743,9 @@ fn paint_has_per_vertex_color(paint: &PathPaint) -> bool {
     match paint {
         PathPaint::Fill { color, .. } => is_per_vertex(color),
         PathPaint::Stroke(stroke) => is_per_vertex(&stroke.color),
-        PathPaint::FillAndStroke { fill_color, stroke, .. } => {
-            is_per_vertex(fill_color) || is_per_vertex(&stroke.color)
-        }
+        PathPaint::FillAndStroke {
+            fill_color, stroke, ..
+        } => is_per_vertex(fill_color) || is_per_vertex(&stroke.color),
     }
 }
 
@@ -2209,7 +2787,12 @@ fn path_bounding_box(path: &Path) -> ([f32; 2], [f32; 2]) {
                 visit(ctrl);
                 visit(to);
             }
-            path::Event::Cubic { from, ctrl1, ctrl2, to } => {
+            path::Event::Cubic {
+                from,
+                ctrl1,
+                ctrl2,
+                to,
+            } => {
                 visit(from);
                 visit(ctrl1);
                 visit(ctrl2);
@@ -2249,7 +2832,9 @@ fn scale_path(path: &Path, scale: f32) -> Path {
             path::Event::Quadratic { ctrl, to, .. } => {
                 builder.quadratic_bezier_to(s(ctrl), s(to));
             }
-            path::Event::Cubic { ctrl1, ctrl2, to, .. } => {
+            path::Event::Cubic {
+                ctrl1, ctrl2, to, ..
+            } => {
                 builder.cubic_bezier_to(s(ctrl1), s(ctrl2), s(to));
             }
             path::Event::End { close, .. } => {
@@ -2299,7 +2884,11 @@ fn tessellate_stroked(
     tessellator: &mut StrokeTessellator,
 ) -> (Vec<Vertex>, Vec<u32>) {
     let mut buffers: VertexBuffers<Vertex, u32> = VertexBuffers::new();
-    let ctor = ColorAtPosition { color: &stroke.color, min, max };
+    let ctor = ColorAtPosition {
+        color: &stroke.color,
+        min,
+        max,
+    };
     let mut buf_builder = BuffersBuilder::new(&mut buffers, ctor);
     let options = StrokeOptions::DEFAULT
         .with_line_width(stroke.width * scale)
@@ -2336,15 +2925,25 @@ fn tessellate_svg_path(
     let mut indices: Vec<u32> = Vec::new();
     match paint {
         PathPaint::Fill { color, rule } => {
-            let (v, i) =
-                tessellate_filled(&path, color, to_lyon_fill_rule(*rule), min, max, tessellator);
+            let (v, i) = tessellate_filled(
+                &path,
+                color,
+                to_lyon_fill_rule(*rule),
+                min,
+                max,
+                tessellator,
+            );
             append_geometry(&mut vertices, &mut indices, v, i);
         }
         PathPaint::Stroke(stroke) => {
             let (v, i) = tessellate_stroked(&path, stroke, scale, min, max, stroke_tessellator);
             append_geometry(&mut vertices, &mut indices, v, i);
         }
-        PathPaint::FillAndStroke { fill_color, fill_rule, stroke } => {
+        PathPaint::FillAndStroke {
+            fill_color,
+            fill_rule,
+            stroke,
+        } => {
             let (v, i) = tessellate_filled(
                 &path,
                 fill_color,
@@ -2384,7 +2983,9 @@ fn tessellate_filled(
     // Tolerance is in pixels here (unlike the old NDC-scale tessellation
     // this replaced), so a value much larger than a NDC-tuned `0.0005`
     // still looks smooth at UI scale.
-    let fill_opts = FillOptions::DEFAULT.with_tolerance(0.1).with_fill_rule(rule);
+    let fill_opts = FillOptions::DEFAULT
+        .with_tolerance(0.1)
+        .with_fill_rule(rule);
     tessellator
         .tessellate_path(path, &fill_opts, &mut buf_builder)
         .expect("fill tessellation should never fail for a valid path");
@@ -2478,7 +3079,14 @@ fn tessellate_polygon(
     }
 
     let (min, max) = bounding_box(vertices);
-    tessellate_filled(&builder.build(), color, LyonFillRule::EvenOdd, min, max, tessellator)
+    tessellate_filled(
+        &builder.build(),
+        color,
+        LyonFillRule::EvenOdd,
+        min,
+        max,
+        tessellator,
+    )
 }
 
 fn tessellate_circle(
@@ -2496,7 +3104,14 @@ fn tessellate_circle(
 
     let min = [center[0] - radius, center[1] - radius];
     let max = [center[0] + radius, center[1] + radius];
-    tessellate_filled(&builder.build(), color, LyonFillRule::EvenOdd, min, max, tessellator)
+    tessellate_filled(
+        &builder.build(),
+        color,
+        LyonFillRule::EvenOdd,
+        min,
+        max,
+        tessellator,
+    )
 }
 
 /// A retained drawing surface with its own offscreen texture and pending
@@ -2551,13 +3166,18 @@ impl Layer {
     ///   rectangle's area.
     /// - `rounding`: per-corner radii; use [`Rounding::NONE`] for a sharp
     ///   rectangle.
-    pub fn draw_rectangle(&self, top_left: (f32, f32), size: (f32, f32), color: Color, rounding: Rounding) {
-        let s = self.scale_factor();
+    pub fn draw_rectangle(
+        &self,
+        top_left: (f32, f32),
+        size: (f32, f32),
+        color: Color,
+        rounding: Rounding,
+    ) {
         self.0.borrow_mut().push(DrawCommand::Rectangle {
-            top_left: [top_left.0 * s, top_left.1 * s],
-            size: [size.0 * s, size.1 * s],
+            top_left: [top_left.0, top_left.1],
+            size: [size.0, size.1],
             color,
-            rounding: rounding.scaled(s),
+            rounding,
         });
     }
 
@@ -2572,9 +3192,8 @@ impl Layer {
     /// deferred-work note on why (lyon vertex-identity guarantees for
     /// simple polygons need a closer look first).
     pub fn draw_polygon(&self, vertices: &[(f32, f32)], color: Color) {
-        let s = self.scale_factor();
         self.0.borrow_mut().push(DrawCommand::Polygon {
-            vertices: vertices.iter().map(|&(x, y)| [x * s, y * s]).collect(),
+            vertices: vertices.iter().map(|&(x, y)| [x, y]).collect(),
             color,
         });
     }
@@ -2591,10 +3210,9 @@ impl Layer {
             !matches!(color, Color::PerVertex(_)),
             "draw_circle doesn't support Color::PerVertex — use Solid or Gradient"
         );
-        let s = self.scale_factor();
         self.0.borrow_mut().push(DrawCommand::Circle {
-            center: [center.0 * s, center.1 * s],
-            radius: radius * s,
+            center: [center.0, center.1],
+            radius,
             color,
         });
     }
@@ -2623,8 +3241,7 @@ impl Layer {
         position: (f32, f32),
         paint: PathPaint,
     ) -> Result<(), lyon_extra::parser::ParseError> {
-        let s = self.scale_factor();
-        self.push_path_command(d, [position.0 * s, position.1 * s], s, paint)
+        self.push_path_command(d, [position.0, position.1], 1.0, paint)
     }
 
     /// Draw an SVG icon whose `d` was authored against `viewbox` (the
@@ -2651,14 +3268,12 @@ impl Layer {
         paint: PathPaint,
     ) -> Result<(), lyon_extra::parser::ParseError> {
         let (min_x, min_y, vb_width, _vb_height) = viewbox;
-        let dpi_s = self.scale_factor();
         let icon_scale = size.0 / vb_width;
-        let scale = icon_scale * dpi_s;
-        let position_physical = [
-            dpi_s * (position.0 - min_x * icon_scale),
-            dpi_s * (position.1 - min_y * icon_scale),
+        let position = [
+            position.0 - min_x * icon_scale,
+            position.1 - min_y * icon_scale,
         ];
-        self.push_path_command(d, position_physical, scale, paint)
+        self.push_path_command(d, position, icon_scale, paint)
     }
 
     /// Shared by [`Layer::draw_path`]/[`Layer::draw_svg_icon`] — both just
@@ -2677,7 +3292,12 @@ impl Layer {
             "draw_path/draw_svg_icon doesn't support Color::PerVertex — use Solid or Gradient"
         );
         parse_svg_path(d)?;
-        self.0.borrow_mut().push(DrawCommand::Path { d: d.to_string(), position, scale, paint });
+        self.0.borrow_mut().push(DrawCommand::Path {
+            d: d.to_string(),
+            position,
+            scale,
+            paint,
+        });
         Ok(())
     }
 
@@ -2711,11 +3331,10 @@ impl Layer {
     ///   4-cornered quad. [`Color::rgb(0xFF, 0xFF, 0xFF)`](Color::rgb) (or
     ///   any full-white solid color) leaves the image untinted.
     pub fn draw_image(&self, pixels: Pixels, top_left: (f32, f32), size: (f32, f32), tint: Color) {
-        let s = self.scale_factor();
         self.0.borrow_mut().push(DrawCommand::Image {
             pixels,
-            top_left: [top_left.0 * s, top_left.1 * s],
-            size: [size.0 * s, size.1 * s],
+            top_left: [top_left.0, top_left.1],
+            size: [size.0, size.1],
             tint,
         });
     }
@@ -2727,7 +3346,6 @@ impl Layer {
     /// Unexercised by the current demo (no bundled image asset to point it
     /// at yet) — the real entry point for a future caller, e.g. a
     /// file-tree icon loaded from disk.
-    #[allow(dead_code)]
     pub fn draw_image_from_file(
         &self,
         path: &std::path::Path,
@@ -2768,12 +3386,11 @@ impl Layer {
             matches!(color, Color::Solid(_)),
             "draw_text only supports Color::Solid"
         );
-        let s = self.scale_factor();
         self.0.borrow_mut().push(DrawCommand::Text {
             text: text.to_string(),
-            position: [position.0 * s, position.1 * s],
+            position: [position.0, position.1],
             font,
-            font_parameters: font_parameters.scaled(s),
+            font_parameters,
             alignment,
             color,
         });
@@ -2785,10 +3402,20 @@ impl Layer {
     /// alignment. Exposed so callers can do their own layout (e.g. sizing
     /// a background box to fit a label) without duplicating text-shaping
     /// logic themselves.
-    pub fn get_text_size(&self, text: &str, font: &Font, font_parameters: &FontParameters) -> (f32, f32) {
+    pub fn get_text_size(
+        &self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> (f32, f32) {
         let s = self.scale_factor();
         let scaled = font_parameters.scaled(s);
-        let (width, height) = self.0.borrow().text_stack.borrow_mut().measure(text, font, &scaled);
+        let (width, height) = self
+            .0
+            .borrow()
+            .text_stack
+            .borrow_mut()
+            .measure(text, font, &scaled);
         (width / s, height / s)
     }
 
@@ -2806,20 +3433,14 @@ impl Layer {
     ///   its one string.
     pub fn draw_styled_text(&self, spans: &[TextSpan], position: (f32, f32), alignment: Alignment) {
         debug_assert!(
-            spans.iter().all(|span| matches!(span.color, Color::Solid(_))),
+            spans
+                .iter()
+                .all(|span| matches!(span.color, Color::Solid(_))),
             "draw_styled_text only supports Color::Solid per span"
         );
-        let s = self.scale_factor();
-        let scaled_spans = spans
-            .iter()
-            .map(|span| TextSpan {
-                font_parameters: span.font_parameters.scaled(s),
-                ..span.clone()
-            })
-            .collect();
         self.0.borrow_mut().push(DrawCommand::StyledText {
-            spans: scaled_spans,
-            position: [position.0 * s, position.1 * s],
+            spans: spans.to_vec(),
+            position: [position.0, position.1],
             alignment,
         });
     }
@@ -2827,6 +3448,64 @@ impl Layer {
     /// [`Layer::get_text_size`], for a [`Layer::draw_styled_text`] call —
     /// the combined bounding box every span in `spans` would occupy
     /// shaped together, before any [`Alignment`] offset.
+    /// Shape `text` exactly as [`Layer::draw_text`] would and return where
+    /// everything lands, for editing and interaction: caret rectangles,
+    /// click hit-testing and selection rectangles that stay correct across
+    /// ligatures, combining marks and right-to-left runs. See
+    /// [`TextLayout`]. Coordinates are logical pixels relative to the text's
+    /// top-left; offset them by the position given to `draw_text` (after any
+    /// [`Alignment`] shift computed from [`TextLayout::size`]).
+    pub fn layout_text(
+        &self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> TextLayout {
+        let s = self.scale_factor();
+        let scaled = font_parameters.scaled(s);
+        self.0
+            .borrow()
+            .text_stack
+            .borrow_mut()
+            .layout(text, font, &scaled)
+            .unscaled(s)
+    }
+
+    /// Clip everything `f` draws to `clip` (logical pixels). Scopes nest;
+    /// content drawn after `f` returns is unclipped again.
+    ///
+    /// An unrounded rectangle on whole physical pixels is a free hardware
+    /// scissor. Any other shape (rounded corners, circle, polygon, path, or
+    /// a fractional edge) is drawn into a stencil buffer: no extra surface
+    /// is allocated, and edges are antialiased by the same MSAA as the
+    /// content. Text, images and shapes are all clipped, and a later shape
+    /// can still paint over earlier clipped content.
+    ///
+    /// Errors, without calling `f`, only for an unparsable
+    /// [`ClipShape::Path`].
+    pub fn with_clip<R>(
+        &self,
+        clip: ClipShape,
+        f: impl FnOnce(&Layer) -> R,
+    ) -> Result<R, lyon_extra::parser::ParseError> {
+        if let ClipShape::Path { d, .. } = &clip {
+            parse_svg_path(d)?;
+        }
+        /// Closes the scope even if `f` panics, so the clip cannot leak
+        /// into later commands.
+        struct Close<'a>(&'a Layer);
+        impl Drop for Close<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut inner) = self.0.0.try_borrow_mut() {
+                    inner.push(DrawCommand::PopClip);
+                }
+            }
+        }
+        self.0.borrow_mut().push(DrawCommand::PushClip(clip));
+        let _close = Close(self);
+        Ok(f(self))
+    }
+
     pub fn get_styled_text_size(&self, spans: &[TextSpan]) -> (f32, f32) {
         let s = self.scale_factor();
         let scaled_spans: Vec<TextSpan> = spans
@@ -2836,8 +3515,12 @@ impl Layer {
                 ..span.clone()
             })
             .collect();
-        let (width, height) =
-            self.0.borrow().text_stack.borrow_mut().measure_spans(&scaled_spans);
+        let (width, height) = self
+            .0
+            .borrow()
+            .text_stack
+            .borrow_mut()
+            .measure_spans(&scaled_spans);
         (width / s, height / s)
     }
 
@@ -2847,60 +3530,73 @@ impl Layer {
     /// effects apply at here (shade a specific shape/path/text run by
     /// giving it its own layer).
     ///
-    /// Rebuilds the effect's GPU resources immediately, not deferred to
-    /// the next frame — cheap relative to how rarely this is expected to
-    /// be called (an editor toggling a blur-behind-popup effect on/off,
-    /// say, not a per-frame call). [`ShaderEffect::Custom`]'s WGSL is
+    /// Switching to a different effect kind rebuilds its GPU resources
+    /// immediately, not deferred to the next frame. Changing only the
+    /// parameters of the effect already in place (a blur radius, a colour
+    /// matrix) just rewrites its uniforms, so animating them every frame
+    /// allocates nothing. [`ShaderEffect::Custom`]'s WGSL is
     /// compiled and validated here too; a bad shader logs and leaves this
     /// layer without an effect rather than panicking.
     pub fn set_effect(&self, effect: Option<ShaderEffect>) {
         let mut inner = self.0.borrow_mut();
+        if let Some(effect) = &effect
+            && inner.update_effect_uniforms(effect)
+        {
+            inner.effect = Some(effect.clone());
+            return;
+        }
         inner.effect = effect;
-        inner.rebuild_effect_gpu();
+        let wanted = if inner.is_group() { inner.size } else { (1, 1) };
+        if inner.texture_size == wanted {
+            inner.rebuild_effect_gpu();
+        } else {
+            // Gaining or losing the offscreen target also rebuilds the
+            // effect against it.
+            inner.sync_target();
+            if inner.effect.is_none() {
+                inner.rebuild_effect_gpu();
+            }
+        }
     }
 
-    /// Restrict this layer's rendering to an axis-aligned rectangle
-    /// (`(top_left, size)` in logical pixels; `None` clears). Everything
-    /// the layer draws — geometry, images, and text — outside the rect is
-    /// discarded.
-    ///
-    /// This is a hardware scissor: it *reduces* GPU work rather than
-    /// adding any, and changing it per frame is free. The everyday clip
-    /// for scroll viewports, panes, and popup bounds — reach for
-    /// [`Layer::set_clip_shape`] only when the clip genuinely isn't an
-    /// unrotated rectangle. Both can be active at once (content is
-    /// scissored while rendering, then masked while compositing).
-    pub fn set_clip_rect(&self, rect: Option<((f32, f32), (f32, f32))>) {
-        self.0.borrow_mut().clip_rect = rect.map(|((x, y), (w, h))| [x, y, w, h]);
-    }
-
-    /// Clip this layer's composited output to an arbitrary [`ClipShape`]
-    /// (`None` clears): a rounded rect, circle, polygon, or any SVG path,
-    /// with antialiased edges. Applies to the layer's *whole* output —
-    /// same unit as [`Layer::set_effect`], and an active effect is
-    /// clipped too (blur first, then mask, so blur can't bleed outside
-    /// the shape).
-    ///
-    /// Cost model: setting the shape tessellates it and renders one small
-    /// mask pass on the next frame; every composited frame while a mask is
-    /// active then pays one extra fullscreen texture sample plus a
-    /// surface-sized mask texture's memory. Cheap enough to animate the
-    /// shape per frame, but for a plain unrounded rectangle use
-    /// [`Layer::set_clip_rect`], which costs nothing at all.
+    /// Clip the whole layer to `shape` (logical pixels; `None` clears): the
+    /// outermost clip scope, applied after any effect, so a blur cannot
+    /// bleed outside it. Anything [`Layer::with_clip`] accepts works here,
+    /// with the same cost model (a pixel-aligned rectangle is a free
+    /// scissor, every other shape uses the shared stencil, and no surface
+    /// is allocated either way).
     ///
     /// [`ClipShape::Path`]'s `d` is validated here, same as
     /// [`Layer::draw_path`]; the other variants can't fail.
-    pub fn set_clip_shape(
-        &self,
-        shape: Option<ClipShape>,
-    ) -> Result<(), lyon_extra::parser::ParseError> {
+    pub fn set_clip(&self, shape: Option<ClipShape>) -> Result<(), lyon_extra::parser::ParseError> {
         if let Some(ClipShape::Path { d, .. }) = &shape {
             parse_svg_path(d)?;
         }
         let mut inner = self.0.borrow_mut();
-        inner.clip_shape = shape;
-        inner.rebuild_mask();
+        if inner.clip != shape {
+            inner.clip = shape;
+            inner.rebuild_layer_clip();
+        }
         Ok(())
+    }
+
+    /// Choose whether this layer is drawn straight into the frame
+    /// ([`CachePolicy::Auto`], the default) or kept as a texture that is
+    /// only re-rendered when it changes ([`CachePolicy::Always`]).
+    ///
+    /// A direct layer costs no memory of its own and is replayed from its
+    /// retained geometry each presented frame. A cached layer costs a
+    /// surface-sized texture but a frame where it is unchanged is a single
+    /// textured quad, which pays off for a large, mostly static layer
+    /// (a full-screen document) under a frequently animating one (a caret).
+    /// A layer with an effect is always cached.
+    pub fn set_cache_policy(&self, policy: CachePolicy) {
+        let mut inner = self.0.borrow_mut();
+        let always = policy == CachePolicy::Always;
+        if inner.cache_always != always {
+            inner.cache_always = always;
+            inner.sync_target();
+        }
     }
 
     /// Discard every pending/previously-built draw command for this layer.
@@ -2910,59 +3606,97 @@ impl Layer {
     /// own pending content every rebuilt frame.
     // Not called by the layer spike (its one `Manual` layer draws once and
     // never redraws) — kept as the real API `Manual`-layer callers need.
-    #[allow(dead_code)]
     pub fn clear(&self) {
         self.0.borrow_mut().clear();
     }
 }
 
-/// Advance one frame for every live layer in `order` (front = bottom of the
-/// visual stack, back = top): resize/rebuild as needed, render each into
-/// its own texture, then composite all of them onto `view` in the same
-/// order. `view` is expected to already hold whatever was drawn below the
-/// layer stack (this pass uses `LoadOp::Load`).
-pub(super) fn render_layers(
+/// Record one frame onto `view` (the swap-chain view, or any single-sample
+/// target): bring every live layer up to date, render the offscreen groups
+/// (layers with an effect or `CachePolicy::Always`), then draw everything
+/// bottom to top in a single multisampled pass cleared to `clear`.
+///
+/// `order` runs bottom (front) to top (back). Direct layers replay their
+/// retained ops inside the pass; groups composite their texture. Every
+/// text batch is prepared before anything is recorded: preparing a
+/// renderer after its draw was recorded would replace the buffer the
+/// recorded draw reads, and a prepare that resets the shared atlas would
+/// leave earlier batches pointing into the discarded one.
+pub(super) fn render_frame(
     encoder: &mut wgpu::CommandEncoder,
     view: &wgpu::TextureView,
-    msaa_view: &wgpu::TextureView,
+    msaa: &MsaaTarget,
     order: &mut std::collections::VecDeque<std::rc::Weak<RefCell<LayerInner>>>,
     surface_size: (u32, u32),
     scale_factor: f32,
-) {
+    clear: wgpu::Color,
+) -> RenderStats {
+    let mut stats = RenderStats::default();
+    stats.bytes.msaa_color = msaa.bytes.0;
+    stats.bytes.msaa_stencil = msaa.bytes.1;
     order.retain(|weak| weak.strong_count() > 0);
-    let live: Vec<Rc<RefCell<LayerInner>>> = order.iter().filter_map(|weak| weak.upgrade()).collect();
+    let live: Vec<Rc<RefCell<LayerInner>>> =
+        order.iter().filter_map(|weak| weak.upgrade()).collect();
 
+    // Phase 1: CPU work and queue writes only.
+    let generation_before = live
+        .first()
+        .map(|inner| inner.borrow().text_stack.borrow().atlas_generation());
     for inner in &live {
         let mut inner = inner.borrow_mut();
         inner.resize_if_needed(surface_size);
         inner.set_scale_factor(scale_factor);
-        inner.rebuild_if_needed();
-        inner.render_mask_if_needed(encoder, msaa_view);
-        inner.render_to_texture(encoder, msaa_view);
-        inner.apply_effect(encoder);
+        inner.sync_target();
+        if inner.rebuild_if_needed() {
+            stats.rebuilt_layers += 1;
+        }
+    }
+    // A later layer's prepare may have reset the shared atlas, which
+    // invalidates text prepared earlier in this phase: sweep once more (each
+    // batch only re-prepares if its generation is stale).
+    if let Some(before) = generation_before
+        && live[0].borrow().text_stack.borrow().atlas_generation() != before
+    {
+        for inner in &live {
+            inner.borrow_mut().prepare_text_batches();
+        }
     }
 
-    if live.is_empty() {
-        return;
+    // Phase 2: offscreen groups.
+    for inner in &live {
+        let mut inner = inner.borrow_mut();
+        if inner.is_group() {
+            stats.group_content_passes += inner.render_to_texture_if_needed(encoder, msaa) as u32;
+            stats.group_effect_passes += inner.apply_effect_if_needed(encoder) as u32;
+        }
+        inner.add_to_stats(&mut stats);
     }
 
+    // Phase 3: the frame.
+    let surface = [0, 0, surface_size.0, surface_size.1];
     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("atomos-layer-composite-pass"),
+        label: Some("atomos-frame-pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view,
+            view: &msaa.color_view,
             depth_slice: None,
-            resolve_target: None,
+            resolve_target: Some(view),
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Load,
-                store: wgpu::StoreOp::Store,
+                load: wgpu::LoadOp::Clear(clear),
+                store: wgpu::StoreOp::Discard,
             },
         })],
-        depth_stencil_attachment: None,
+        depth_stencil_attachment: Some(stencil_attachment(&msaa.stencil_view)),
         timestamp_writes: None,
         occlusion_query_set: None,
         multiview_mask: None,
     });
     for inner in &live {
-        inner.borrow().composite(&mut rpass);
+        let inner = inner.borrow();
+        if inner.is_group() {
+            inner.record_group(&mut rpass, surface);
+        } else {
+            inner.record_direct(&mut rpass, surface);
+        }
     }
+    stats
 }

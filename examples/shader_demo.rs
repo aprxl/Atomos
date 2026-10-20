@@ -28,22 +28,13 @@
 //! the blur radius animating (which re-runs `set_effect` every frame). See
 //! `Demo::apply_effects`.
 
-#[path = "../animation.rs"]
-mod animation;
-#[path = "../frame.rs"]
-mod frame;
-#[path = "../input.rs"]
-mod input;
-#[path = "../renderer/mod.rs"]
-mod renderer;
-
 use std::sync::Arc;
 use std::time::Duration;
 
-use animation::{Animation, Easing};
-use frame::FrameScheduler;
-use input::Input;
-use renderer::{
+use atomos::animation::{Animation, Easing};
+use atomos::frame::FrameScheduler;
+use atomos::input::Input;
+use atomos::renderer::{
     Alignment, Color, ColorMatrix, Font, FontParameters, GradientDirection, Layer,
     LayerInvalidation, PathPaint, Pixels, Renderer, Rounding, ShaderEffect, Stroke,
 };
@@ -279,9 +270,15 @@ impl Demo {
     fn apply_effects(&mut self, cells: &[Layer]) {
         let wanted: [Option<ShaderEffect>; COLS] = [
             None,
-            Some(ShaderEffect::Blur { radius: self.blur_radius() }),
+            Some(ShaderEffect::Blur {
+                radius: self.blur_radius(),
+            }),
             Some(ShaderEffect::ColorMatrix(self.matrices[self.matrix].1)),
-            Some(ShaderEffect::Custom(if self.custom_broken { BROKEN } else { RGB_SPLIT })),
+            Some(ShaderEffect::Custom(if self.custom_broken {
+                BROKEN
+            } else {
+                RGB_SPLIT
+            })),
         ];
 
         for (col, effect) in wanted.into_iter().enumerate() {
@@ -311,7 +308,10 @@ impl Demo {
             TEXT,
             Alignment::TOP_LEFT,
             mono.clone(),
-            FontParameters { weight: 1.2, ..FontParameters::new(19.0) },
+            FontParameters {
+                weight: 1.2,
+                ..FontParameters::new(19.0)
+            },
         );
         layer.draw_text(
             "effects are per-LAYER, not per-draw-call — 16 cells means 16 layers",
@@ -341,8 +341,8 @@ impl Demo {
                 (LABEL_W - 12.0, y + CELL_H / 2.0),
                 TEXT,
                 Alignment {
-                    horizontal: renderer::HorizontalAlign::Right,
-                    vertical: renderer::VerticalAlign::Center,
+                    horizontal: atomos::renderer::HorizontalAlign::Right,
+                    vertical: atomos::renderer::VerticalAlign::Center,
                 },
                 mono.clone(),
                 label,
@@ -355,14 +355,23 @@ impl Demo {
 
         // Footer.
         let foot_y = GRID_Y + ROWS as f32 * (CELL_H + CELL_GAP) + 8.0;
-        layer.draw_rectangle((0.0, foot_y), (WIDTH, HEIGHT - foot_y), PANEL, Rounding::NONE);
+        layer.draw_rectangle(
+            (0.0, foot_y),
+            (WIDTH, HEIGHT - foot_y),
+            PANEL,
+            Rounding::NONE,
+        );
 
         let animating = self.blur.is_playing();
         layer.draw_text(
             &format!(
                 "Blur {{ radius: {:>5.2} }}   [{}]",
                 self.blur_radius(),
-                if animating { "running — B pauses" } else { "paused — B resumes" }
+                if animating {
+                    "running — B pauses"
+                } else {
+                    "paused — B resumes"
+                }
             ),
             (24.0, foot_y + 12.0),
             if animating { YELLOW } else { GREEN },
@@ -386,7 +395,11 @@ impl Demo {
         layer.draw_text(
             &format!(
                 "Custom: {}   |   frame {}   |   cpu {:.2} ms   |   gpu {}",
-                if self.custom_broken { "BROKEN WGSL (C)" } else { "rgb split (C breaks it)" },
+                if self.custom_broken {
+                    "BROKEN WGSL (C)"
+                } else {
+                    "rgb split (C breaks it)"
+                },
                 self.frames,
                 frametime.as_secs_f64() * 1000.0,
                 match gpu {
@@ -397,8 +410,8 @@ impl Demo {
             (WIDTH - 24.0, foot_y + 22.0),
             if self.custom_broken { RED } else { DIM },
             Alignment {
-                horizontal: renderer::HorizontalAlign::Right,
-                vertical: renderer::VerticalAlign::Center,
+                horizontal: atomos::renderer::HorizontalAlign::Right,
+                vertical: atomos::renderer::VerticalAlign::Center,
             },
             mono,
             FontParameters::new(13.0),
@@ -491,7 +504,10 @@ impl Demo {
                     TEXT,
                     Alignment::TOP_LEFT,
                     mono.clone(),
-                    FontParameters { weight: 1.6, ..FontParameters::new(34.0) },
+                    FontParameters {
+                        weight: 1.6,
+                        ..FontParameters::new(34.0)
+                    },
                 );
                 layer.draw_text(
                     "shaders hit glyph coverage",
@@ -507,7 +523,10 @@ impl Demo {
                     GREEN,
                     Alignment::TOP_LEFT,
                     mono.clone(),
-                    FontParameters { tracking: 0.08, ..FontParameters::new(15.0) },
+                    FontParameters {
+                        tracking: 0.08,
+                        ..FontParameters::new(15.0)
+                    },
                 );
                 layer.draw_text(
                     "condensed, 9px, the hard case",
@@ -515,7 +534,10 @@ impl Demo {
                     DIM,
                     Alignment::TOP_LEFT,
                     mono,
-                    FontParameters { width: 0.85, ..FontParameters::new(11.0) },
+                    FontParameters {
+                        width: 0.85,
+                        ..FontParameters::new(11.0)
+                    },
                 );
             }
         }
@@ -571,6 +593,7 @@ impl ApplicationHandler for App {
             .collect();
 
         self.input = Input::new(window.scale_factor());
+        self.scheduler.sync_display(&window);
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.chrome = Some(chrome);
@@ -584,6 +607,15 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         if self.input.handle_event(&event) {
             self.scheduler.request_redraw();
+        }
+        self.scheduler.handle_event(&event);
+        if matches!(
+            event,
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }
+        ) && let Some(w) = &self.window
+        {
+            // The window may have changed displays.
+            self.scheduler.sync_display(w);
         }
         if let Some(r) = &mut self.renderer {
             r.handle_event(&event);
@@ -613,7 +645,10 @@ impl ApplicationHandler for App {
                 let (frametime, gpu) = self.renderer.as_ref().map_or((Duration::ZERO, None), |r| {
                     (r.get_frametime(), r.get_gpu_frametime())
                 });
-                if self.demo.update(&self.input, FrameScheduler::animation_delta(frametime)) {
+                if self
+                    .demo
+                    .update(&self.input, FrameScheduler::animation_delta(frametime))
+                {
                     self.scheduler.request_redraw();
                 }
 
@@ -622,11 +657,13 @@ impl ApplicationHandler for App {
                     self.demo.draw_chrome(chrome, frametime, gpu);
                     for row in 0..ROWS {
                         for col in 0..COLS {
-                            self.demo.draw_surface(&self.cells[row * COLS + col], row, col);
+                            self.demo
+                                .draw_surface(&self.cells[row * COLS + col], row, col);
                         }
                     }
-                    if let Err(e) = r.render() {
-                        eprintln!("render error: {e}");
+                    match r.render() {
+                        Ok(outcome) => self.scheduler.finish_frame(outcome),
+                        Err(e) => eprintln!("render error: {e}"),
                     }
                 }
 

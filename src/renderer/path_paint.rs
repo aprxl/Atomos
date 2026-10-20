@@ -87,9 +87,16 @@ impl Stroke {
 /// caller, so there's nothing to pin a [`Color::PerVertex`] corner to).
 #[derive(Clone, Debug, PartialEq)]
 pub enum PathPaint {
-    Fill { color: Color, rule: FillRule },
+    Fill {
+        color: Color,
+        rule: FillRule,
+    },
     Stroke(Stroke),
-    FillAndStroke { fill_color: Color, fill_rule: FillRule, stroke: Stroke },
+    FillAndStroke {
+        fill_color: Color,
+        fill_rule: FillRule,
+        stroke: Stroke,
+    },
 }
 
 impl PathPaint {
@@ -97,6 +104,9 @@ impl PathPaint {
     /// common case, and what every `draw_path` call used before stroking
     /// existed.
     pub fn fill(color: Color) -> Self {
-        Self::Fill { color, rule: FillRule::NonZero }
+        Self::Fill {
+            color,
+            rule: FillRule::NonZero,
+        }
     }
 }

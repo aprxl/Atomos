@@ -42,7 +42,6 @@
 // A foundation module: the entry points exist before the first caller does,
 // and deleting the knobs would just mean adding them back for the first real
 // animation. Same treatment as `input`'s query surface.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -82,7 +81,13 @@ impl Easing {
             Easing::EaseInOut => (0.42, 0.0, 0.58, 1.0),
             Easing::CubicBezier(x1, y1, x2, y2) => (x1, y1, x2, y2),
         };
-        cubic_bezier(progress.clamp(0.0, 1.0), x1.clamp(0.0, 1.0), y1, x2.clamp(0.0, 1.0), y2)
+        cubic_bezier(
+            progress.clamp(0.0, 1.0),
+            x1.clamp(0.0, 1.0),
+            y1,
+            x2.clamp(0.0, 1.0),
+            y2,
+        )
     }
 }
 
@@ -409,7 +414,10 @@ mod tests {
         assert!(anim.advance(HALF), "half-done animation still wants frames");
         assert!(close(anim.weight(), 0.5), "got {}", anim.weight());
 
-        assert!(!anim.advance(HALF), "a completed one-shot stops asking for frames");
+        assert!(
+            !anim.advance(HALF),
+            "a completed one-shot stops asking for frames"
+        );
         assert_eq!(anim.weight(), 1.0);
         assert!(anim.is_finished());
     }
@@ -421,7 +429,10 @@ mod tests {
         let mut anim = Animation::new(FULL, Easing::EaseOut);
         anim.advance(FULL * 4);
         assert_eq!(anim.weight(), 1.0);
-        assert!(!anim.advance(FULL), "already finished, no more frames wanted");
+        assert!(
+            !anim.advance(FULL),
+            "already finished, no more frames wanted"
+        );
         assert_eq!(anim.weight(), 1.0, "weight must not decay after finishing");
     }
 
@@ -431,7 +442,10 @@ mod tests {
         assert!(anim.advance(FULL + HALF));
         assert!(close(anim.progress(), 0.5), "got {}", anim.progress());
         assert!(!anim.is_finished());
-        assert!(anim.advance(FULL * 100), "looping animations run until paused");
+        assert!(
+            anim.advance(FULL * 100),
+            "looping animations run until paused"
+        );
     }
 
     #[test]
@@ -452,7 +466,10 @@ mod tests {
         anim.advance(HALF);
         anim.pause();
         assert!(!anim.advance(HALF), "paused animations want no frames");
-        assert!(close(anim.weight(), 0.5), "paused animation must not advance");
+        assert!(
+            close(anim.weight(), 0.5),
+            "paused animation must not advance"
+        );
 
         anim.resume();
         assert!(anim.advance(Duration::from_millis(250)));
@@ -499,13 +516,19 @@ mod tests {
         animations.play("blink", Animation::new(FULL, Easing::Linear).looping());
 
         assert!(animations.advance(FULL * 2));
-        assert!(close(animations.weight("fade"), 1.0), "the one-shot still advanced");
+        assert!(
+            close(animations.weight("fade"), 1.0),
+            "the one-shot still advanced"
+        );
         assert!(animations.is_finished("fade"));
         assert!(!animations.is_finished("blink"));
 
         animations.stop("blink");
         assert!(!animations.advance(HALF), "only a finished one-shot left");
-        assert!(close(animations.weight("fade"), 1.0), "finished entries are retained");
+        assert!(
+            close(animations.weight("fade"), 1.0),
+            "finished entries are retained"
+        );
     }
 
     #[test]
@@ -516,7 +539,11 @@ mod tests {
         assert!(close(animations.weight("fade"), 0.5));
 
         animations.play("fade", Animation::new(FULL, Easing::Linear));
-        assert_eq!(animations.len(), 1, "keys bound the set; nothing accumulates");
+        assert_eq!(
+            animations.len(),
+            1,
+            "keys bound the set; nothing accumulates"
+        );
         assert_eq!(animations.weight("fade"), 0.0);
     }
 

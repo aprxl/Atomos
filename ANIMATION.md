@@ -246,14 +246,38 @@ Also call `request_redraw()` explicitly on `Resized` and `ScaleFactorChanged` �
 
 ## Worked example
 
-`src/bin/input_demo.rs` has an animation panel with one caller-owned bar and one driven through the registry, plus a frame counter that visibly freezes when nothing is animating and nothing is being touched — the proof that frames are demand-driven.
+`examples/input_demo.rs` has an animation panel with one caller-owned bar and one driven through the registry, plus a frame counter that visibly freezes when nothing is animating and nothing is being touched — the proof that frames are demand-driven.
 
 ```bash
 cargo run --bin input_demo
 ```
 
-`src/bin/shader_demo.rs` drives a blur radius from an `Animation` and shows CPU and GPU frametime alongside it.
+`examples/shader_demo.rs` drives a blur radius from an `Animation` and shows CPU and GPU frametime alongside it.
 
 ## Deferred
 
 Keyframe tracks, spring physics, and animation sequencing/chaining. All build on `Animation` without changing it. Not needed until something asks for them.
+
+## Timing primitives (`atomos::timing`)
+
+`Animation` says "still running"; that is the wrong question for two common cases.
+
+- **`Stepped`** — a value with a few visible states (a caret blink is two). `advance()` returns whether the *step changed*, so the loop can sleep through the flat middle of a step. `wake_in()` says when the next step is due; hand it to `FrameScheduler::request_redraw_in` so the loop sleeps until then instead of redrawing identical frames. `restart()` resumes lit (call it when the user types).
+- **`Glide`** — a number that eases toward a target that may move mid-travel (scroll offset). `aim(to)` re-aims from wherever the value is now and does nothing if it is already heading there. `advance()` reports the landing frame as a change. `settle(to)` jumps without travel.
+
+Both keep their own wall clock rather than the clamped frame delta, so a target aimed on the first frame after an idle window is not charged the idle time. Each method has an `*_at(now)` form taking the instant explicitly, for tests and replay.
+
+```rust
+if blink.advance() { scheduler.request_redraw(); }
+scheduler.request_redraw_in(blink.wake_in());
+```
+
+`FrameScheduler::request_redraw_in(Duration)` / `request_redraw_at(Instant)` owe a frame at a future instant (the earliest request wins) and let `control_flow()` return `WaitUntil` for it.
+
+### Pacing applies to animation, not input
+
+`set_target_fps` caps how fast an *animation* may ask for its next frame. A `request_redraw()` made outside a frame (an input event, a resize) is drawn at once, ignoring the cap and any retry backoff, so a 5 fps animation demo still answers the mouse immediately. "Inside a frame" means between `begin_frame()` and `finish_frame(outcome)`, so call `finish_frame` after rendering; a loop that never does falls back to treating every request as paced.
+
+### Display ceiling (`set_max_fps`, `sync_display`)
+
+`PresentMode::Fifo` is supposed to pace presentation, but it does not on every platform: on macOS at 120 Hz the fork measured 74-252 presented frames per second, queuing frames in the compositor so the image on screen lagged the one just drawn (felt as input lag on an idle-looking machine). `set_max_fps` is a hard ceiling on **all** presented frames, input-driven ones included; `sync_display(&window)` sets it from the monitor's refresh rate. Call `sync_display` when the window is created and on `WindowEvent::Moved` / `ScaleFactorChanged`, since the window may have changed displays. `set_target_fps` remains the animation-only cap.

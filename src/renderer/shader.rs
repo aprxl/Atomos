@@ -15,7 +15,7 @@
 //! scope, so a bad shader logs and leaves the layer unaffected rather than
 //! panicking the whole renderer.
 
-use super::Color;
+use super::{Color, to_linear};
 
 /// A post-process effect a [`super::Layer`] can have applied to its whole
 /// composited output.
@@ -58,6 +58,10 @@ pub enum ShaderEffect {
     /// }
     /// ```
     ///
+    /// The `tex` a custom shader samples is **premultiplied** (colour
+    /// already multiplied by alpha), and the value it returns must be a
+    /// valid premultiplied colour (`rgb <= a`) too.
+    ///
     /// Copy that module verbatim and edit only `fs_main`'s body — the
     /// vertex stage and bindings must match exactly, since that's the
     /// contract the renderer's pipeline layout expects. Compile/validation
@@ -75,6 +79,13 @@ pub enum ShaderEffect {
 /// red channel (`r*values[0] + g*values[1] + b*values[2] + a*values[3] +
 /// values[4]`), `values[5..10]` produce green, `[10..15]` blue, `[15..20]`
 /// alpha.
+///
+/// The matrix works on **straight (unpremultiplied) linear-light** RGBA and
+/// its result is clamped to `0..=1`. Layers are stored premultiplied; the
+/// renderer converts around the transform, so offsets and alpha rows behave
+/// as written. A matrix may generate alpha (a constant-colour matrix fills
+/// the whole layer), and a transparent input pixel stays invisible under
+/// an additive offset unless the alpha row makes it visible.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorMatrix(pub [f32; 20]);
 
@@ -126,10 +137,26 @@ impl ColorMatrix {
     pub fn saturate(amount: f32) -> Self {
         let s = amount;
         Self([
-            0.213 + 0.787 * s, 0.715 - 0.715 * s, 0.072 - 0.072 * s, 0.0, 0.0, //
-            0.213 - 0.213 * s, 0.715 + 0.285 * s, 0.072 - 0.072 * s, 0.0, 0.0, //
-            0.213 - 0.213 * s, 0.715 - 0.715 * s, 0.072 + 0.928 * s, 0.0, 0.0, //
-            0.0, 0.0, 0.0, 1.0, 0.0,
+            0.213 + 0.787 * s,
+            0.715 - 0.715 * s,
+            0.072 - 0.072 * s,
+            0.0,
+            0.0, //
+            0.213 - 0.213 * s,
+            0.715 + 0.285 * s,
+            0.072 - 0.072 * s,
+            0.0,
+            0.0, //
+            0.213 - 0.213 * s,
+            0.715 - 0.715 * s,
+            0.072 + 0.928 * s,
+            0.0,
+            0.0, //
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
         ])
     }
 
@@ -167,16 +194,28 @@ impl ColorMatrix {
             return Self::IDENTITY;
         };
         let keep = 1.0 - amount;
-        let target = [
-            rgba[0] as f32 / 255.0,
-            rgba[1] as f32 / 255.0,
-            rgba[2] as f32 / 255.0,
-        ];
+        let target = [to_linear(rgba[0]), to_linear(rgba[1]), to_linear(rgba[2])];
         Self([
-            keep, 0.0, 0.0, 0.0, target[0] * amount, //
-            0.0, keep, 0.0, 0.0, target[1] * amount, //
-            0.0, 0.0, keep, 0.0, target[2] * amount, //
-            0.0, 0.0, 0.0, 1.0, 0.0,
+            keep,
+            0.0,
+            0.0,
+            0.0,
+            target[0] * amount, //
+            0.0,
+            keep,
+            0.0,
+            0.0,
+            target[1] * amount, //
+            0.0,
+            0.0,
+            keep,
+            0.0,
+            target[2] * amount, //
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
         ])
     }
 

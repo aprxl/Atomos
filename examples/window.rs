@@ -1,19 +1,14 @@
 //! Atomos — Phase 0 entry point.
 //!
 //! Owns the winit event loop and delegates all rendering to
-//! [`renderer::Renderer`]. Window event types the renderer needs to see are
+//! [`atomos::renderer::Renderer`]. Window event types the renderer needs to see are
 //! forwarded through `Renderer::handle_event`; window resize, close request,
 //! scale-factor change, and redraw are handled here so the renderer stays
 //! platform-agnostic.
 //!
-//! Frames are demand-driven, not continuous: [`frame::FrameScheduler`] keeps
+//! Frames are demand-driven, not continuous: [`atomos::frame::FrameScheduler`] keeps
 //! the loop asleep until input changes state or something asks for another
 //! frame. See its module doc for the wiring contract.
-
-mod animation;
-mod frame;
-mod input;
-mod renderer;
 
 use std::sync::Arc;
 
@@ -27,9 +22,9 @@ use winit::{
 /// Application state. The window and renderer are `None` until `resumed` runs.
 struct App {
     window: Option<Arc<Window>>,
-    renderer: Option<renderer::Renderer>,
-    input: input::Input,
-    scheduler: frame::FrameScheduler,
+    renderer: Option<atomos::renderer::Renderer>,
+    input: atomos::input::Input,
+    scheduler: atomos::frame::FrameScheduler,
 }
 
 impl Default for App {
@@ -38,8 +33,8 @@ impl Default for App {
             window: None,
             renderer: None,
             // Replaced with the window's real scale factor in `resumed`.
-            input: input::Input::new(1.0),
-            scheduler: frame::FrameScheduler::new(),
+            input: atomos::input::Input::new(1.0),
+            scheduler: atomos::frame::FrameScheduler::new(),
         }
     }
 }
@@ -55,9 +50,10 @@ impl ApplicationHandler for App {
                 )
                 .expect("failed to create window"),
         );
-        let renderer = pollster::block_on(renderer::Renderer::new(window.clone()));
+        let renderer = pollster::block_on(atomos::renderer::Renderer::new(window.clone()));
 
-        self.input = input::Input::new(window.scale_factor());
+        self.input = atomos::input::Input::new(window.scale_factor());
+        self.scheduler.sync_display(&window);
         self.window = Some(window);
         self.renderer = Some(renderer);
         // The first frame is already owed — `FrameScheduler::new` starts
@@ -82,6 +78,15 @@ impl ApplicationHandler for App {
         // Only events that genuinely changed input state wake the renderer.
         if self.input.handle_event(&event) {
             self.scheduler.request_redraw();
+        }
+        self.scheduler.handle_event(&event);
+        if matches!(
+            event,
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }
+        ) && let Some(w) = &self.window
+        {
+            // The window may have changed displays.
+            self.scheduler.sync_display(w);
         }
 
         // Forward to the renderer first so it can keep any per-window state
@@ -113,8 +118,9 @@ impl ApplicationHandler for App {
                 self.scheduler.begin_frame();
 
                 if let Some(r) = &mut self.renderer {
-                    if let Err(e) = r.render() {
-                        eprintln!("render error: {e}");
+                    match r.render() {
+                        Ok(outcome) => self.scheduler.finish_frame(outcome),
+                        Err(e) => eprintln!("render error: {e}"),
                     }
                     if let Some(w) = &self.window {
                         w.set_title(&format!(
@@ -122,6 +128,10 @@ impl ApplicationHandler for App {
                             r.get_frametime().as_secs_f64() * 1000.0
                         ));
                     }
+                }
+
+                if let Some(w) = &self.window {
+                    self.input.sync_ime(w);
                 }
 
                 // Exactly once per frame, after everything has read state.

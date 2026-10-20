@@ -8,7 +8,6 @@ pub type Rgba = [u8; 4];
 // Not constructed anywhere yet — every current caller (the layer spike)
 // uses `Color::Solid`; `Gradient`/`PerVertex` are exercised once
 // `draw_polygon`/`draw_path`/`draw_image` land.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GradientDirection {
     /// Left edge of the shape's bounding box gets `stops[0]`, right edge
@@ -43,7 +42,6 @@ pub enum Color {
     Solid(Rgba),
     /// A two-stop linear gradient across the shape's bounding box. Not
     /// constructed anywhere yet — see [`GradientDirection`]'s note.
-    #[allow(dead_code)]
     Gradient {
         stops: [Rgba; 2],
         direction: GradientDirection,
@@ -51,8 +49,28 @@ pub enum Color {
     /// Explicit `[top_left, top_right, bottom_right, bottom_left]` corner
     /// colors, bilinearly blended across the shape's bounding box. Not
     /// constructed anywhere yet — see [`GradientDirection`]'s note.
-    #[allow(dead_code)]
     PerVertex([Rgba; 4]),
+}
+
+/// One sRGB colour channel, `0..=255`, as the linear-light value the GPU
+/// works in.
+///
+/// The surface is `Rgba8UnormSrgb`, which encodes linear to sRGB on write,
+/// so a channel handed to a vertex buffer is read as *linear*. A colour
+/// authored the usual way (an sRGB hex) must be decoded first or it leaves
+/// the shader too light by exactly the sRGB curve: `0x1B` would land on
+/// `0x5B`. This is the exact piecewise transfer function, not a 2.2 power
+/// approximation, so it inverts the hardware encoder.
+///
+/// Alpha is not passed through here: it is a coverage fraction, and sRGB
+/// formats leave the alpha channel linear.
+pub fn to_linear(channel: u8) -> f32 {
+    let c = channel as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 impl Color {
@@ -82,9 +100,9 @@ impl Color {
     pub fn resolve(&self, pos: [f32; 2], min: [f32; 2], max: [f32; 2]) -> [f32; 4] {
         let unit = |c: Rgba| {
             [
-                c[0] as f32 / 255.0,
-                c[1] as f32 / 255.0,
-                c[2] as f32 / 255.0,
+                to_linear(c[0]),
+                to_linear(c[1]),
+                to_linear(c[2]),
                 c[3] as f32 / 255.0,
             ]
         };
@@ -148,5 +166,41 @@ impl Color {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The GPU's sRGB encoder, as the spec writes it.
+    fn to_srgb(linear: f32) -> f32 {
+        if linear <= 0.003_130_8 {
+            linear * 12.92
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    #[test]
+    fn every_channel_survives_the_round_trip_to_the_surface() {
+        for channel in 0..=255u8 {
+            let back = (to_srgb(to_linear(channel)) * 255.0).round() as u8;
+            assert_eq!(back, channel, "channel {channel} came back as {back}");
+        }
+    }
+
+    #[test]
+    fn the_endpoints_are_exact() {
+        assert_eq!(to_linear(0), 0.0);
+        assert_eq!(to_linear(255), 1.0);
+    }
+
+    #[test]
+    fn alpha_is_left_alone_by_resolve() {
+        let color = Color::rgba(0x1B, 0x17, 0x14, 0x84);
+        let resolved = color.resolve([0.0, 0.0], [0.0, 0.0], [1.0, 1.0]);
+        assert_eq!(resolved[3], 0x84 as f32 / 255.0);
+        assert_eq!(resolved[0], to_linear(0x1B));
     }
 }

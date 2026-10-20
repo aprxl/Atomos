@@ -1,3 +1,5 @@
+> **Historical.** Atomos began as an Emacs-successor editor. It is now only the application backend library (rendering, layout, styling, input, output); the editor and Lua runtime described below are out of scope here. See README.md.
+
 # Project Description — A Modern, Opinionated Emacs Successor
 
 > A standalone **buffer engine** with an absurdly extensible Lua scripting interface, where every piece of built-in functionality is itself a command that can be inspected, redefined, and re-executed at runtime. Shipped as a keyboard-centric GUI text editor, with all higher-level features (modal editing, Markdown previews, terminal, organization views) built on top of the same plugin API exposed to third parties.

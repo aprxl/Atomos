@@ -35,15 +35,16 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use glyphon::{
-    fontdb, Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, LayoutGlyph, Metrics,
+    Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, LayoutGlyph, Metrics,
     Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    fontdb,
 };
 
 use super::color::Color;
 use super::draw_command::DrawCommand;
 use super::font::Font;
 use super::font_parameters::FontParameters;
-use super::glyph_effects::{effect_advance_delta, EffectGlyphs, GlyphEffect};
+use super::glyph_effects::{EffectGlyphs, GlyphEffect, effect_advance_delta};
 use super::text_span::TextSpan;
 use super::{Alignment, HorizontalAlign, VerticalAlign};
 
@@ -101,6 +102,9 @@ pub(super) struct TextStack {
     atlas: TextAtlas,
     viewport: Viewport,
     effect_glyphs: EffectGlyphs,
+    // Kept to rebuild `atlas` when the glyph-ID space is recycled.
+    glyph_cache: Cache,
+    format: wgpu::TextureFormat,
     // Resolved family name for each not-yet-seen `Font::Bytes`/`Font::File`
     // — `None` means registration failed (logged once, at registration
     // time). `Font::Named` never needs an entry; it's already a name.
@@ -152,7 +156,13 @@ impl TextStack {
         let glyph_cache = Cache::new(device);
         let atlas = TextAtlas::new(device, queue, &glyph_cache, format);
         let mut viewport = Viewport::new(device, &glyph_cache);
-        viewport.update(queue, Resolution { width: size.0, height: size.1 });
+        viewport.update(
+            queue,
+            Resolution {
+                width: size.0,
+                height: size.1,
+            },
+        );
 
         let blank_buffer = build_buffer(&mut font_system, "", &Attrs::new(), 16.0);
 
@@ -162,6 +172,8 @@ impl TextStack {
             atlas,
             viewport,
             effect_glyphs: EffectGlyphs::new(),
+            glyph_cache,
+            format,
             registered_fonts: HashMap::new(),
             blank_buffer,
             shape_cache: HashMap::new(),
@@ -189,6 +201,25 @@ impl TextStack {
         }
     }
 
+    /// Discard every rasterized glyph and the atlas holding them, then
+    /// bump `atlas_generation` so every layer re-prepares its text. The IDs
+    /// and the atlas are only ever dropped together; see [`EffectGlyphs`].
+    pub(super) fn reset_glyph_atlas(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.effect_glyphs.reset();
+        self.atlas = TextAtlas::new(device, queue, &self.glyph_cache, self.format);
+        self.atlas_generation += 1;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_glyph_ids_in_use_for_test(&mut self, in_use: usize) {
+        self.effect_glyphs.set_next_id_for_test(in_use);
+    }
+
+    #[cfg(test)]
+    pub(super) fn glyph_ids_in_use_for_test(&self) -> usize {
+        self.effect_glyphs.next_id_for_test()
+    }
+
     /// Current atlas protection epoch — see the `atlas_generation` field
     /// doc. Compared by [`super::layer::LayerInner`] against the
     /// generation it last successfully prepared under.
@@ -203,7 +234,7 @@ impl TextStack {
     /// `prepare_with_custom` calls `.destroy()` on it *immediately*
     /// (synchronously, not deferred to whenever the GPU actually gets
     /// around to it) when it needs to grow — see glyphon's
-    /// `text_render.rs`. `render_layers` records every layer's render pass
+    /// `text_render.rs`. `render_frame` records every layer's render pass
     /// into one shared `wgpu::CommandEncoder` that isn't submitted until
     /// the whole frame is done, so if every layer shared one
     /// `TextRenderer`, an earlier layer's already-recorded
@@ -226,12 +257,18 @@ impl TextStack {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            None,
+            Some(super::layer::content_stencil_state()),
         )
     }
 
     pub(super) fn resize(&mut self, queue: &wgpu::Queue, size: (u32, u32)) {
-        self.viewport.update(queue, Resolution { width: size.0, height: size.1 });
+        self.viewport.update(
+            queue,
+            Resolution {
+                width: size.0,
+                height: size.1,
+            },
+        );
     }
 
     /// Measure the pixel size `text` would occupy shaped with `font`/
@@ -240,10 +277,28 @@ impl TextStack {
     /// resolve alignment (and the same shape cache, so measuring text that
     /// is also drawn this frame shapes it once, not twice). Exposed via
     /// [`super::Layer::get_text_size`].
-    pub(super) fn measure(&mut self, text: &str, font: &Font, font_parameters: &FontParameters) -> (f32, f32) {
+    pub(super) fn measure(
+        &mut self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> (f32, f32) {
         let key = self.ensure_shaped(text, font, font_parameters);
         let effect = GlyphEffect::from(font_parameters);
         measure_shaped_buffer_with(&self.shape_cache[&key].buffer, |_| effect)
+    }
+
+    /// The interaction geometry of one `draw_text`-style string, in
+    /// physical pixels (the caller converts to logical).
+    pub(super) fn layout(
+        &mut self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+    ) -> super::text_layout::TextLayout {
+        let key = self.ensure_shaped(text, font, font_parameters);
+        let effect = GlyphEffect::from(font_parameters);
+        super::text_layout::TextLayout::from_buffer(&self.shape_cache[&key].buffer, text, effect)
     }
 
     /// Look up (or shape and insert) the cached buffer for one
@@ -257,7 +312,13 @@ impl TextStack {
             return key;
         }
         let buffer = self.shape(text, font, font_parameters);
-        self.shape_cache.insert(key, CachedShape { buffer, last_used: frame });
+        self.shape_cache.insert(
+            key,
+            CachedShape {
+                buffer,
+                last_used: frame,
+            },
+        );
         key
     }
 
@@ -270,7 +331,13 @@ impl TextStack {
             return key;
         }
         let buffer = self.shape_spans(spans);
-        self.shape_cache.insert(key, CachedShape { buffer, last_used: frame });
+        self.shape_cache.insert(
+            key,
+            CachedShape {
+                buffer,
+                last_used: frame,
+            },
+        );
         key
     }
 
@@ -316,10 +383,15 @@ impl TextStack {
     /// [`super::Layer::get_styled_text_size`].
     pub(super) fn measure_spans(&mut self, spans: &[TextSpan]) -> (f32, f32) {
         let key = self.ensure_shaped_spans(spans);
-        let span_effects: Vec<GlyphEffect> =
-            spans.iter().map(|span| GlyphEffect::from(&span.font_parameters)).collect();
+        let span_effects: Vec<GlyphEffect> = spans
+            .iter()
+            .map(|span| GlyphEffect::from(&span.font_parameters))
+            .collect();
         measure_shaped_buffer_with(&self.shape_cache[&key].buffer, |glyph| {
-            span_effects.get(glyph.metadata).copied().unwrap_or(GlyphEffect::NEUTRAL)
+            span_effects
+                .get(glyph.metadata)
+                .copied()
+                .unwrap_or(GlyphEffect::NEUTRAL)
         })
     }
 
@@ -337,8 +409,10 @@ impl TextStack {
         // Resolved before building any `Attrs` below, since those borrow
         // the resolved family names by reference — `resolve_family` needs
         // `&mut self` and can't be called again once that borrow starts.
-        let families: Vec<Option<String>> =
-            spans.iter().map(|span| self.resolve_family(&span.font)).collect();
+        let families: Vec<Option<String>> = spans
+            .iter()
+            .map(|span| self.resolve_family(&span.font))
+            .collect();
 
         let attrs_per_span: Vec<Attrs> = spans
             .iter()
@@ -404,6 +478,14 @@ impl TextStack {
         commands: &[DrawCommand],
         text_renderer: &mut TextRenderer,
     ) -> Result<(), glyphon::PrepareError> {
+        // Recycle the glyph-ID space (and the bitmaps behind it) before it
+        // can run out. glyphon keys atlas entries by these `u16` IDs, so IDs
+        // are only reusable if the atlas is rebuilt in the same step; bumping
+        // the generation makes every layer re-prepare against the new one.
+        if self.effect_glyphs.needs_reset() {
+            self.reset_glyph_atlas(device, queue);
+        }
+
         let mut all_glyphs = Vec::new();
         for command in commands {
             match command {
@@ -430,7 +512,12 @@ impl TextStack {
                     // Destructured so the cached buffer (immutable) and
                     // `font_system`/`effect_glyphs` (mutable) borrows are
                     // visibly disjoint fields of `self`.
-                    let TextStack { shape_cache, font_system, effect_glyphs, .. } = self;
+                    let TextStack {
+                        shape_cache,
+                        font_system,
+                        effect_glyphs,
+                        ..
+                    } = self;
                     let buffer = &shape_cache[&key].buffer;
                     let (width, height) = measure_shaped_buffer_with(buffer, |_| effect);
                     let anchored = apply_alignment(*position, *alignment, width, height);
@@ -443,16 +530,28 @@ impl TextStack {
                     );
                     all_glyphs.push(glyphs);
                 }
-                DrawCommand::StyledText { spans, position, alignment } => {
+                DrawCommand::StyledText {
+                    spans,
+                    position,
+                    alignment,
+                } => {
                     let key = self.ensure_shaped_spans(spans);
                     let span_effects: Vec<GlyphEffect> = spans
                         .iter()
                         .map(|span| GlyphEffect::from(&span.font_parameters))
                         .collect();
-                    let TextStack { shape_cache, font_system, effect_glyphs, .. } = self;
+                    let TextStack {
+                        shape_cache,
+                        font_system,
+                        effect_glyphs,
+                        ..
+                    } = self;
                     let buffer = &shape_cache[&key].buffer;
                     let (width, height) = measure_shaped_buffer_with(buffer, |glyph| {
-                        span_effects.get(glyph.metadata).copied().unwrap_or(GlyphEffect::NEUTRAL)
+                        span_effects
+                            .get(glyph.metadata)
+                            .copied()
+                            .unwrap_or(GlyphEffect::NEUTRAL)
                     });
                     let anchored = apply_alignment(*position, *alignment, width, height);
                     let glyphs = effect_glyphs.layout_to_custom_glyphs_spans(
@@ -606,7 +705,10 @@ fn register_font_bytes(db: &mut fontdb::Database, bytes: &'static [u8]) -> Optio
 }
 
 /// [`register_font_bytes`], loading from a file instead.
-fn register_font_file(db: &mut fontdb::Database, path: &Path) -> Result<Option<String>, std::io::Error> {
+fn register_font_file(
+    db: &mut fontdb::Database,
+    path: &Path,
+) -> Result<Option<String>, std::io::Error> {
     let before: std::collections::HashSet<fontdb::ID> = db.faces().map(|f| f.id).collect();
     db.load_font_file(path)?;
     Ok(db

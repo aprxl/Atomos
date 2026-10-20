@@ -14,10 +14,10 @@
 use std::collections::HashMap;
 
 use glyphon::{
-    fontdb, Buffer, Color, ContentType, CustomGlyph, CustomGlyphId, FontSystem, LayoutGlyph,
-    RasterizeCustomGlyphRequest, RasterizedCustomGlyph,
+    Buffer, Color, ContentType, CustomGlyph, CustomGlyphId, FontSystem, LayoutGlyph,
+    RasterizeCustomGlyphRequest, RasterizedCustomGlyph, fontdb,
 };
-use swash::scale::{image::Content, image::Image, Render, ScaleContext, Source, StrikeWith};
+use swash::scale::{Render, ScaleContext, Source, StrikeWith, image::Content, image::Image};
 use swash::zeno::{Format, Transform};
 
 /// The synthetic per-glyph effect parameters carried by
@@ -36,10 +36,17 @@ pub struct GlyphEffect {
     /// see the tracking-recentering note in
     /// [`EffectGlyphs::layout_to_custom_glyphs_with`].
     pub tracking: f32,
+    /// Faux-italic shear (mirrors `FontParameters::slant`); `0.0` = none.
+    pub slant: f32,
 }
 
 impl GlyphEffect {
-    pub const NEUTRAL: Self = Self { embolden: 0.0, condense: 1.0, tracking: 0.0 };
+    pub const NEUTRAL: Self = Self {
+        embolden: 0.0,
+        condense: 1.0,
+        tracking: 0.0,
+        slant: 0.0,
+    };
 }
 
 impl From<&super::FontParameters> for GlyphEffect {
@@ -48,11 +55,28 @@ impl From<&super::FontParameters> for GlyphEffect {
             embolden: parameters.weight,
             condense: parameters.width,
             tracking: parameters.tracking,
+            slant: parameters.slant,
         }
     }
 }
 
-/// Identifies one distinct (font, glyph, size, weight, condense)
+/// glyphon identifies a custom glyph by a `u16` ([`CustomGlyphId`]), so at
+/// most this many distinct glyph variants can be live at once.
+const MAX_GLYPH_IDS: usize = u16::MAX as usize;
+
+/// Once this many IDs are handed out the owner is asked to [`reset`]
+/// (see [`EffectGlyphs::needs_reset`]) before the next preparation, leaving
+/// headroom for the variants a single preparation can add.
+///
+/// [`reset`]: EffectGlyphs::reset
+const RESET_AT_IDS: usize = MAX_GLYPH_IDS - 4096;
+
+/// Ceiling on rasterized bitmap memory before a reset is requested. Glyph
+/// bitmaps are cheap to regenerate, so the cache is a working set, not an
+/// archive.
+const BITMAP_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Identifies one distinct (font, glyph, size, weight, condense, slant)
 /// combination. Floats are stored as bits so the key can derive `Eq`/`Hash`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct EffectGlyphKey {
@@ -61,19 +85,27 @@ struct EffectGlyphKey {
     size_bits: u32,
     embolden_bits: u32,
     condense_bits: u32,
+    slant_bits: u32,
 }
 
 /// Rasterizes text through swash directly instead of cosmic-text's built-in
 /// `SwashCache`, so `embolden` (faux bold) and `transform` (faux condense)
-/// can be applied on any font. A simple map keyed by [`EffectGlyphKey`] is
-/// the honest scale for a Phase 0 spike (a handful of demo lines) — no
-/// eviction; real documents with thousands of glyphs are a later problem.
+/// can be applied on any font.
+///
+/// A map keyed by [`EffectGlyphKey`] holds each rasterized bitmap and the
+/// `u16` ID glyphon knows it by. Both are bounded together: past
+/// [`RESET_AT_IDS`] IDs or [`BITMAP_BUDGET_BYTES`] of bitmaps,
+/// [`EffectGlyphs::needs_reset`] turns true and the owner must call
+/// [`EffectGlyphs::reset`] **together with discarding the glyph atlas**,
+/// because the atlas is keyed by these IDs and a recycled ID would alias an
+/// old bitmap. Doing it as one coordinated step is what makes reuse safe.
 pub struct EffectGlyphs {
     scale_context: ScaleContext,
     cache: HashMap<EffectGlyphKey, Image>,
     ids: HashMap<EffectGlyphKey, CustomGlyphId>,
     keys_by_id: HashMap<CustomGlyphId, EffectGlyphKey>,
-    next_id: u16,
+    next_id: usize,
+    bitmap_bytes: usize,
 }
 
 impl Default for EffectGlyphs {
@@ -90,7 +122,36 @@ impl EffectGlyphs {
             ids: HashMap::new(),
             keys_by_id: HashMap::new(),
             next_id: 0,
+            bitmap_bytes: 0,
         }
+    }
+
+    /// Whether the ID space or bitmap budget is close enough to exhausted
+    /// that the owner should [`reset`](Self::reset) before preparing more
+    /// text.
+    pub fn needs_reset(&self) -> bool {
+        self.next_id >= RESET_AT_IDS || self.bitmap_bytes > BITMAP_BUDGET_BYTES
+    }
+
+    /// Forget every bitmap and ID. Only sound when the glyph atlas holding
+    /// the old IDs' bitmaps is discarded in the same step, and every layer
+    /// re-prepares its text afterwards.
+    pub fn reset(&mut self) {
+        self.cache.clear();
+        self.ids.clear();
+        self.keys_by_id.clear();
+        self.next_id = 0;
+        self.bitmap_bytes = 0;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_next_id_for_test(&mut self, next_id: usize) {
+        self.next_id = next_id;
+    }
+
+    #[cfg(test)]
+    pub(super) fn next_id_for_test(&self) -> usize {
+        self.next_id
     }
 
     /// Convert a shaped `Buffer`'s glyphs into `CustomGlyph` entries, with
@@ -98,7 +159,7 @@ impl EffectGlyphs {
     /// place the buffer's own origin on screen, matching how a normal
     /// `TextArea` positions text.
     ///
-    /// Rasterizes any not-yet-seen (font, glyph, size, weight, condense)
+    /// Rasterizes any not-yet-seen (font, glyph, size, weight, condense, slant)
     /// combination immediately, rather than lazily inside the rasterize
     /// callback — glyphon requires a `CustomGlyph`'s exact pixel width/height
     /// to be declared up front, before it asks for the bitmap, and that size
@@ -112,7 +173,9 @@ impl EffectGlyphs {
         color: [u8; 4],
     ) -> Vec<CustomGlyph> {
         let uniform_color = Color::rgba(color[0], color[1], color[2], color[3]);
-        self.layout_to_custom_glyphs_with(font_system, buffer, position, |_glyph| (effect, uniform_color))
+        self.layout_to_custom_glyphs_with(font_system, buffer, position, |_glyph| {
+            (effect, uniform_color)
+        })
     }
 
     /// Per-span variant, for `Layer::draw_styled_text`: every span in a
@@ -133,8 +196,13 @@ impl EffectGlyphs {
         span_effects: &[GlyphEffect],
     ) -> Vec<CustomGlyph> {
         self.layout_to_custom_glyphs_with(font_system, buffer, position, |glyph| {
-            let effect = span_effects.get(glyph.metadata).copied().unwrap_or(GlyphEffect::NEUTRAL);
-            let color = glyph.color_opt.unwrap_or(Color::rgba(0xFF, 0xFF, 0xFF, 0xFF));
+            let effect = span_effects
+                .get(glyph.metadata)
+                .copied()
+                .unwrap_or(GlyphEffect::NEUTRAL);
+            let color = glyph
+                .color_opt
+                .unwrap_or(Color::rgba(0xFF, 0xFF, 0xFF, 0xFF));
             (effect, color)
         })
     }
@@ -206,6 +274,7 @@ impl EffectGlyphs {
                     size_bits: physical.cache_key.font_size_bits,
                     embolden_bits: embolden.to_bits(),
                     condense_bits: condense.to_bits(),
+                    slant_bits: effect.slant.to_bits(),
                 };
 
                 if !self.cache.contains_key(&key)
@@ -216,8 +285,10 @@ impl EffectGlyphs {
                         physical.cache_key.font_weight,
                         embolden,
                         condense,
+                        effect.slant,
                     )
                 {
+                    self.bitmap_bytes += image.data.len();
                     self.cache.insert(key, image);
                 }
                 let Some(image) = self.cache.get(&key) else {
@@ -230,7 +301,12 @@ impl EffectGlyphs {
                 let id = if let Some(&id) = self.ids.get(&key) {
                     id
                 } else {
-                    let id: CustomGlyphId = self.next_id;
+                    // Unreachable in practice: `needs_reset` fires well
+                    // before. If one preparation still outgrows the
+                    // headroom, drop the glyph rather than alias an ID.
+                    let Ok(id) = CustomGlyphId::try_from(self.next_id) else {
+                        continue;
+                    };
                     self.next_id += 1;
                     self.ids.insert(key, id);
                     self.keys_by_id.insert(id, key);
@@ -242,7 +318,11 @@ impl EffectGlyphs {
                 // `color` entirely for `ContentType::Color` content (see
                 // `rasterize`'s doc), so `None` here just documents that
                 // rather than changing behavior.
-                let glyph_color = if image.content == Content::Color { None } else { Some(color) };
+                let glyph_color = if image.content == Content::Color {
+                    None
+                } else {
+                    Some(color)
+                };
 
                 glyphs.push(CustomGlyph {
                     id,
@@ -276,7 +356,10 @@ impl EffectGlyphs {
             Content::Color => ContentType::Color,
             Content::Mask | Content::SubpixelMask => ContentType::Mask,
         };
-        Some(RasterizedCustomGlyph { data: image.data.clone(), content_type })
+        Some(RasterizedCustomGlyph {
+            data: image.data.clone(),
+            content_type,
+        })
     }
 }
 
@@ -294,6 +377,15 @@ pub fn effect_advance_delta(embolden: f32, condense: f32, natural_advance: f32) 
     (condense - 1.0) * natural_advance + 2.0 * embolden
 }
 
+/// The swash [`Transform`] combining faux-condense (horizontal scale) with
+/// faux-italic (horizontal shear): `x' = condense * x + slant * y`, `y' = y`.
+/// Font outlines are y-up with the baseline at 0, so a positive `slant`
+/// shears upper parts to the right, the italic direction. `None` when both
+/// are neutral, which keeps untouched outlines on swash's fast path.
+fn effect_transform(condense: f32, slant: f32) -> Option<Transform> {
+    (condense != 1.0 || slant != 0.0).then(|| Transform::new(condense, 0.0, slant, 1.0, 0.0, 0.0))
+}
+
 /// Rasterize one glyph via swash directly, applying `embolden` (continuous
 /// faux-bold outline expansion) and, if `condense != 1.0`, a horizontal-scale
 /// `transform` (faux condense/expand). Mirrors the recipe cosmic-text's own
@@ -305,15 +397,16 @@ fn rasterize_glyph(
     weight: fontdb::Weight,
     embolden: f32,
     condense: f32,
+    slant: f32,
 ) -> Option<Image> {
     let font = font_system.get_font(key.font_id, weight)?;
     let size = f32::from_bits(key.size_bits);
-    let mut scaler = scale_context.builder(font.as_swash()).size(size).hint(true).build();
-    let transform = if condense != 1.0 {
-        Some(Transform::scale(condense, 1.0))
-    } else {
-        None
-    };
+    let mut scaler = scale_context
+        .builder(font.as_swash())
+        .size(size)
+        .hint(true)
+        .build();
+    let transform = effect_transform(condense, slant);
     // Color sources first (embedded-bitmap emoji, then COLR layered-outline
     // emoji), falling back to the plain monochrome outline every other
     // glyph uses. Each source is a no-op fallthrough when the font doesn't

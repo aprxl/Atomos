@@ -17,8 +17,8 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use wgpu::{CurrentSurfaceTexture, QuerySet};
@@ -35,32 +35,42 @@ mod path_paint;
 mod pixels;
 mod rounding;
 mod shader;
+mod stats;
+mod text_layout;
 mod text_span;
 mod text_stack;
+
+#[cfg(test)]
+mod bench;
+#[cfg(test)]
+mod clip_tests;
+#[cfg(test)]
+mod pixel_tests;
+#[cfg(test)]
+mod test_support;
 
 // `GradientDirection`/`Rgba` are vocabulary for richer `Color` use
 // (gradients/per-vertex), not yet exercised by every call site. This is a
 // `bin` crate, so nothing outside can reach these `pub` items yet either,
 // hence the blanket allow rather than one per item.
 pub use alignment::{Alignment, HorizontalAlign, VerticalAlign};
-pub use color::{Color, GradientDirection};
-#[allow(unused_imports)]
 pub use color::Rgba;
+pub use color::{Color, GradientDirection, to_linear};
 pub use font::Font;
 pub use font_parameters::FontParameters;
-pub use layer::{Layer, LayerInvalidation};
+pub use layer::{CachePolicy, Layer, LayerInvalidation};
 // Same story as `PathFileError` below: only bins that actually clip by
 // shape touch it.
-#[allow(unused_imports)]
 pub use layer::ClipShape;
 // Only needed by callers that pattern-match the error instead of just
 // `.expect()`/`?`-propagating it (like the current demo does).
-#[allow(unused_imports)]
 pub use layer::PathFileError;
 pub use path_paint::{FillRule, LineCap, LineJoin, PathPaint, Stroke};
 pub use pixels::Pixels;
 pub use rounding::Rounding;
 pub use shader::{ColorMatrix, ShaderEffect};
+pub use stats::{RenderStats, ResourceBytes};
+pub use text_layout::{TextLayout, TextLine, TextRect};
 pub use text_span::TextSpan;
 
 /// MSAA sample count for every layer's own render pass (the solid, image,
@@ -90,6 +100,25 @@ const MSAA_SAMPLE_COUNT_FALLBACK: u32 = 4;
 /// climbing even if an adapter offers more.
 const MSAA_SAMPLE_COUNT_MAX: u32 = 8;
 
+/// Upper bound on the shared multisampled colour + stencil targets, in
+/// bytes. Their cost is `width * height * samples * 5`, so 8x is 79 MiB at
+/// 1080p, 141 MiB at 1440p, but 316 MiB at 4K and over 500 MiB on a 5K display. Windows whose
+/// 8x cost would exceed this get the fallback count instead.
+const MSAA_BUDGET_BYTES: u64 = 160 * 1024 * 1024;
+
+/// `supported` unless its colour + stencil targets would exceed
+/// [`MSAA_BUDGET_BYTES`] at `size` (physical pixels), in which case the
+/// 4x floor is used. The count is fixed when the renderer is created: every
+/// pipeline is built for it.
+fn cap_msaa_sample_count(supported: u32, size: (u32, u32)) -> u32 {
+    let pixels = size.0.max(1) as u64 * size.1.max(1) as u64;
+    if supported > MSAA_SAMPLE_COUNT_FALLBACK && pixels * supported as u64 * 5 > MSAA_BUDGET_BYTES {
+        MSAA_SAMPLE_COUNT_FALLBACK
+    } else {
+        supported
+    }
+}
+
 /// Pick the highest MSAA sample count (up to [`MSAA_SAMPLE_COUNT_MAX`])
 /// this adapter actually supports for `format`, including
 /// `resolve_target` support at that count (every layer's render pass
@@ -100,29 +129,68 @@ const MSAA_SAMPLE_COUNT_MAX: u32 = 8;
 fn pick_msaa_sample_count(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> u32 {
     let flags = adapter.get_texture_format_features(format).flags;
     let can_resolve = flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE);
-    if can_resolve && flags.sample_count_supported(MSAA_SAMPLE_COUNT_MAX) {
+    // The clip stencil shares the colour attachment's sample count, so the
+    // count must be supported by both formats.
+    let stencil_flags = adapter
+        .get_texture_format_features(layer::STENCIL_FORMAT)
+        .flags;
+    if can_resolve
+        && flags.sample_count_supported(MSAA_SAMPLE_COUNT_MAX)
+        && stencil_flags.sample_count_supported(MSAA_SAMPLE_COUNT_MAX)
+    {
         MSAA_SAMPLE_COUNT_MAX
     } else {
         MSAA_SAMPLE_COUNT_FALLBACK
     }
 }
 
-/// Errors that can escape [`Renderer::render`]. These are the cases the
-/// renderer could not recover from internally; recoverable per-frame surface
-/// states (timeout, occlusion, suboptimal swap chain) are handled inside
-/// `render` and reported as `Ok(())`.
+/// Whether wgpu's legacy timestamp-query path is safe on this backend.
+///
+/// wgpu 29's Metal counter path is unusable on macOS 26: it returns zero
+/// timestamps and encoder-level writes can wedge the queue. Timing is
+/// optional diagnostics, so production rendering stays off that path until
+/// wgpu implements Metal 4's replacement.
+fn supports_timestamp_queries(backend: wgpu::Backend, features: wgpu::Features) -> bool {
+    backend != wgpu::Backend::Metal
+        && features.contains(
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+        )
+}
+
+/// What one call to [`Renderer::render`] achieved, and therefore what the
+/// caller must do next. Demand-driven loops consume their redraw request
+/// before drawing, so a frame that showed nothing has to say whether to
+/// try again or to wait; see [`crate::frame::FrameScheduler::finish_frame`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOutcome {
+    /// The frame reached the display.
+    Presented,
+    /// Nothing was shown, but a retry can succeed: the surface timed out or
+    /// was outdated (and has been reconfigured), a resize is waiting for the
+    /// GPU queue to drain, or the surface was lost and re-created. The
+    /// caller must ask for another frame.
+    Retry,
+    /// The window cannot be seen (minimized, covered, on another desktop),
+    /// so there is nothing to present. Do not poll: keep the work owed and
+    /// draw when the OS reports the window visible again
+    /// (`WindowEvent::Occluded(false)`).
+    Occluded,
+}
+
+/// Errors that can escape [`Renderer::render`]: the cases the renderer could
+/// not recover from internally. Per-frame surface states are reported as a
+/// [`FrameOutcome`] instead.
 #[derive(Debug)]
 pub enum RenderError {
-    /// The window's swap chain is gone (the surface itself was lost).
-    /// Recovering from this in-place is non-trivial; the practical response
-    /// is to tear the renderer down and rebuild it.
+    /// The window's surface was lost and could not be re-created. The
+    /// practical response is to tear the renderer down and rebuild it.
     SurfaceLost,
 }
 
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SurfaceLost => write!(f, "wgpu surface was lost"),
+            Self::SurfaceLost => write!(f, "wgpu surface was lost and could not be re-created"),
         }
     }
 }
@@ -133,15 +201,18 @@ impl std::error::Error for RenderError {}
 /// GPU resources every [`Layer`] shares (its pipelines, bind group layouts)
 /// and the registry of currently-live layers.
 pub struct Renderer {
-    /// Kept alive so the `Surface<'static>` stays valid. Not read directly
-    /// by any method today, but the field is required for soundness — the
-    /// surface is built from this Arc and would dangle if it were dropped.
-    #[allow(dead_code)]
+    /// Kept alive so the `Surface<'static>` stays valid, and used to
+    /// re-create the surface when it is lost.
     window: Arc<Window>,
+    instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
+    // A window size that arrived since the last frame and has not been
+    // configured onto the surface yet — see `Renderer::resize` for why the
+    // configure cannot happen where the size arrives.
+    pending_surface_size: Option<(u32, u32)>,
     // GPU resources shared by every `Layer` (its pipelines, bind group
     // layouts, the composite quad) — built once here rather than per layer.
     layer_pipelines: layer::LayerPipelines,
@@ -150,10 +221,10 @@ pub struct Renderer {
     // because layer passes run sequentially and the target is transient
     // (cleared per pass, discarded after resolve) — per-layer copies would
     // cost a full-surface 4x texture each. Kept alive for `msaa_view`.
-    #[allow(dead_code)]
-    msaa_texture: wgpu::Texture,
-    msaa_view: wgpu::TextureView,
+    msaa: layer::MsaaTarget,
     msaa_size: (u32, u32),
+    // What the last frame did and what its targets cost.
+    stats: RenderStats,
     // Resolved once in `new` via `pick_msaa_sample_count` — every layer's
     // solid/image/text pipeline and the shared MSAA texture above all use
     // this same value, so it's threaded through their constructors rather
@@ -314,10 +385,16 @@ impl TimestampState {
         self.next_serial += 1;
         slot.status.store(SLOT_STATUS_PENDING, Ordering::Release);
         let status = slot.status.clone();
-        slot.buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            let outcome = if result.is_ok() { SLOT_STATUS_MAPPED } else { SLOT_STATUS_FAILED };
-            status.store(outcome, Ordering::Release);
-        });
+        slot.buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let outcome = if result.is_ok() {
+                    SLOT_STATUS_MAPPED
+                } else {
+                    SLOT_STATUS_FAILED
+                };
+                status.store(outcome, Ordering::Release);
+            });
     }
 
     /// Drive map callbacks with a *non-blocking* poll and consume every
@@ -340,10 +417,8 @@ impl TimestampState {
                     slot.in_flight = false;
                     if slot.serial > self.consumed_serial {
                         self.consumed_serial = slot.serial;
-                        let elapsed_ns =
-                            ticks[1].saturating_sub(ticks[0]) as f64 * self.period_ns;
-                        self.last_gpu_frametime =
-                            Some(Duration::from_nanos(elapsed_ns as u64));
+                        let elapsed_ns = ticks[1].saturating_sub(ticks[0]) as f64 * self.period_ns;
+                        self.last_gpu_frametime = Some(Duration::from_nanos(elapsed_ns as u64));
                     }
                 }
                 // Map failed (e.g. device loss) — the buffer never mapped,
@@ -413,9 +488,10 @@ impl Renderer {
         // degrades to `None` (the animation-facing `get_frametime` is
         // wall-clock and needs no GPU features). Requesting an unsupported
         // feature would fail device creation outright, hence the check.
-        let timestamp_features = wgpu::Features::TIMESTAMP_QUERY
-            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-        let timestamps_supported = adapter.features().contains(timestamp_features);
+        let timestamp_features =
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        let timestamps_supported =
+            supports_timestamp_queries(adapter.get_info().backend, adapter.features());
 
         // `TextureFormatFeatureFlags`/`get_texture_format_features` reports
         // what the adapter's hardware can *physically* do, but wgpu only
@@ -429,8 +505,9 @@ impl Renderer {
         // feature shape as `timestamp_features` above: request it only if
         // the adapter actually offers it, and gate any use of >4x MSAA on
         // whether it was actually granted, not just adapter-capable.
-        let extended_msaa_supported =
-            adapter.features().contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
+        let extended_msaa_supported = adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
 
         let mut required_features = wgpu::Features::empty();
         if timestamps_supported {
@@ -475,7 +552,11 @@ impl Renderer {
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            // One frame in flight, not two. Every extra queued frame is a
+            // frame of display latency. Two suits a game rendering
+            // continuously for throughput; this renders on demand, a
+            // keystroke at a time, and wants the frame it just drew on screen.
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &surface_config);
 
@@ -487,7 +568,8 @@ impl Renderer {
         // feature granted is a validation error regardless of what the
         // hardware can physically do.
         let msaa_sample_count = if extended_msaa_supported {
-            pick_msaa_sample_count(&adapter, surface_config.format)
+            let supported = pick_msaa_sample_count(&adapter, surface_config.format);
+            cap_msaa_sample_count(supported, (surface_config.width, surface_config.height))
         } else {
             MSAA_SAMPLE_COUNT_FALLBACK
         };
@@ -495,8 +577,8 @@ impl Renderer {
         let layer_pipelines =
             layer::LayerPipelines::new(&device, surface_config.format, msaa_sample_count);
         let msaa_size = (surface_config.width, surface_config.height);
-        let (msaa_texture, msaa_view) =
-            layer::create_msaa_texture(&device, surface_config.format, msaa_size, msaa_sample_count);
+        let msaa =
+            layer::create_msaa_target(&device, surface_config.format, msaa_size, msaa_sample_count);
         let text_stack = Rc::new(RefCell::new(text_stack::TextStack::new(
             &device,
             &queue,
@@ -510,14 +592,16 @@ impl Renderer {
 
         Self {
             window,
+            instance,
             device,
             queue,
             surface,
             surface_config,
+            pending_surface_size: None,
             layer_pipelines,
-            msaa_texture,
-            msaa_view,
+            msaa,
             msaa_size,
+            stats: RenderStats::default(),
             msaa_sample_count,
             text_stack,
             layers,
@@ -530,24 +614,40 @@ impl Renderer {
     }
 
     /// Update the window scale factor — call this from
-    /// `WindowEvent::ScaleFactorChanged`. Layers pick up the new value
-    /// lazily (same pattern as [`Renderer::resize`]/surface size), so this
-    /// is just a cheap field write; no GPU resources need rebuilding here
-    /// (a `ScaleFactorChanged` is virtually always paired with a `Resized`
-    /// carrying the new physical size, which `resize` already handles).
+    /// `WindowEvent::ScaleFactorChanged`, before drawing that frame. Every
+    /// live layer switches immediately and rebuilds its retained content at
+    /// the new density on its next render (a `ScaleFactorChanged` is
+    /// virtually always paired with a `Resized` carrying the new physical
+    /// size, which `resize` already handles).
     pub fn set_scale_factor(&mut self, scale_factor: f64) {
         self.scale_factor = scale_factor;
+        // Pushed to every live layer now, not at the next render, so a
+        // `Layer::scale_factor` or text measurement taken before the next
+        // frame already reflects the new density. Layers store logical
+        // commands, so retained content follows without being redrawn.
+        for layer in self.layers.iter().filter_map(std::rc::Weak::upgrade) {
+            layer.borrow_mut().set_scale_factor(scale_factor as f32);
+        }
     }
 
-    /// Reconfigure the swap chain for a new window size. No-op on zero-sized
+    /// Record a new window size. The swap chain is reconfigured at the top
+    /// of a later [`Renderer::render`], never here. No-op on zero-sized
     /// (minimised) windows, which would otherwise produce invalid surfaces.
-    /// Live layers pick up the new size lazily, the next time they render
-    /// (see `layer::render_layers`).
+    /// Live layers pick up the new size lazily the next time they render
+    /// (see `layer::render_frame`).
+    ///
+    /// Deferring is the fix for a macOS hang that took the whole app with
+    /// it. `Surface::configure` waits for every submission still in flight,
+    /// and wgpu-core waits *indefinitely*. On Metal a drawable presented
+    /// while the window is invisible or being moved by a window manager can
+    /// wait forever for a vsync that never arrives (gfx-rs/wgpu#8309), so
+    /// its command buffer never completes and the process never responds
+    /// again. `render` therefore configures only once the queue has
+    /// drained, which leaves the wait nothing to block on. While a resize
+    /// is pending, frames report [`FrameOutcome::Retry`].
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
-            self.surface_config.width = width;
-            self.surface_config.height = height;
-            self.surface.configure(&self.device, &self.surface_config);
+            self.pending_surface_size = Some((width, height));
         }
     }
 
@@ -590,12 +690,47 @@ impl Renderer {
     /// Render one frame: clear the swap chain, then composite every live
     /// layer onto it in bottom-to-top order (each into its own offscreen
     /// texture first, skipped entirely for layers whose content hasn't
-    /// changed — see `layer::render_layers`).
+    /// changed — see `layer::render_frame`).
     ///
-    /// Returns `Ok(())` for every per-frame state that is handled in place
-    /// (timeout, occlusion, suboptimal/outdated swap chain). The `Result`
-    /// only carries genuinely unrecoverable surface errors.
-    pub fn render(&mut self) -> Result<(), RenderError> {
+    /// Returns a [`FrameOutcome`] saying whether the frame was shown and,
+    /// if not, whether to retry or wait for the window to become visible.
+    /// The `Err` side is reserved for genuinely unrecoverable surface
+    /// errors.
+    pub fn render(&mut self) -> Result<FrameOutcome, RenderError> {
+        // Wall-clock frame delta, the anchor for `get_frametime`. Measured
+        // before anything below can return early, because several paths do:
+        // an occluded window, a timed-out or outdated surface, a frame
+        // skipped while a resize is pending. Measuring only after a
+        // presented frame left the delta at zero through a run of early
+        // returns, which froze every animation mid-play and had the loop
+        // ask for another frame forever.
+        let now = Instant::now();
+        if let Some(previous) = self.previous_frame_at {
+            self.frame_delta = now.duration_since(previous);
+        }
+        self.previous_frame_at = Some(now);
+
+        // The one place the swap chain is reconfigured: before a frame is
+        // acquired, and only once the queue has drained (see `resize`).
+        if let Some((width, height)) = self.pending_surface_size {
+            if matches!(
+                self.device.poll(wgpu::PollType::Poll),
+                Ok(wgpu::PollStatus::QueueEmpty)
+            ) {
+                self.pending_surface_size = None;
+                self.surface_config.width = width;
+                self.surface_config.height = height;
+                self.surface.configure(&self.device, &self.surface_config);
+            } else {
+                // Draw nothing: rendering is what fills the queue, so
+                // carrying on would leave it no emptier and the swap chain
+                // could stay at the old size while the window is at the new
+                // one (the compositor scaling a stale surface). Skipping
+                // lets the queue drain; the caller retries.
+                return Ok(FrameOutcome::Retry);
+            }
+        }
+
         let frame = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => frame,
             // Still a valid, presentable frame — just not ideally sized.
@@ -607,25 +742,31 @@ impl Renderer {
             // it while still holding `frame` is exactly what's invalid. An
             // actual size change already reaches this renderer correctly
             // through `Renderer::resize` (called from
-            // `WindowEvent::Resized`), which runs between frames, never
-            // while one is held — so there's nothing to do here but use
-            // the frame as given.
+            // `WindowEvent::Resized`), which only records it; the configure
+            // happens at the top of this method, before a frame is acquired
+            // — so there's nothing to do here but use the frame as given.
             CurrentSurfaceTexture::Suboptimal(frame) => frame,
             CurrentSurfaceTexture::Outdated => {
-                // The surface has changed; reconfigure and skip this frame.
-                self.surface.configure(&self.device, &self.surface_config);
-                return Ok(());
+                // The surface has changed; queue a reconfigure (done at the
+                // top of the next frame, on a drained queue) and retry.
+                self.pending_surface_size =
+                    Some((self.surface_config.width, self.surface_config.height));
+                return Ok(FrameOutcome::Retry);
             }
-            CurrentSurfaceTexture::Timeout
-            | CurrentSurfaceTexture::Occluded
-            | CurrentSurfaceTexture::Validation => {
-                // Nothing usable this frame; try again next time.
-                return Ok(());
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Validation => {
+                return Ok(FrameOutcome::Retry);
             }
+            CurrentSurfaceTexture::Occluded => return Ok(FrameOutcome::Occluded),
             CurrentSurfaceTexture::Lost => {
-                // The surface itself is gone; the only honest signal we can
-                // give the caller is that the surface is invalid.
-                return Err(RenderError::SurfaceLost);
+                // The device is intact, so every layer and pipeline stays
+                // valid: only the window surface needs re-creating.
+                let surface = self
+                    .instance
+                    .create_surface(self.window.clone())
+                    .map_err(|_| RenderError::SurfaceLost)?;
+                surface.configure(&self.device, &self.surface_config);
+                self.surface = surface;
+                return Ok(FrameOutcome::Retry);
             }
         };
 
@@ -643,33 +784,6 @@ impl Renderer {
             encoder.write_timestamp(&timestamps.query_set, 0);
         }
 
-        {
-            // Nothing draws directly into the swap chain any more — every
-            // visible pixel comes from a layer's composite blit — so this
-            // pass only needs to clear it.
-            let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("atomos-clear-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        }
-
         // Once per frame (not per layer — every layer shares this stack):
         // tick the shaped-text cache clock and evict stale entries.
         //
@@ -683,28 +797,34 @@ impl Renderer {
         self.text_stack.borrow_mut().advance_frame();
 
         // Layers resize lazily against the current surface size (see
-        // `layer::render_layers`), so the shared MSAA scratch target does
+        // `layer::render_frame`), so the shared MSAA scratch target does
         // the same here rather than in `resize()`.
         let surface_size = (self.surface_config.width, self.surface_config.height);
         if self.msaa_size != surface_size {
-            let (msaa_texture, msaa_view) = layer::create_msaa_texture(
+            self.msaa = layer::create_msaa_target(
                 &self.device,
                 self.surface_config.format,
                 surface_size,
                 self.msaa_sample_count,
             );
-            self.msaa_texture = msaa_texture;
-            self.msaa_view = msaa_view;
             self.msaa_size = surface_size;
         }
 
-        layer::render_layers(
+        // One multisampled pass draws the whole frame, cleared to the
+        // background colour (see `layer::render_frame`).
+        self.stats = layer::render_frame(
             &mut encoder,
             &view,
-            &self.msaa_view,
+            &self.msaa,
             &mut self.layers,
             surface_size,
             self.scale_factor as f32,
+            wgpu::Color {
+                r: 0.05,
+                g: 0.05,
+                b: 0.08,
+                a: 1.0,
+            },
         );
 
         let map_slot = self
@@ -724,15 +844,7 @@ impl Renderer {
             timestamps.collect(&self.device);
         }
 
-        // Wall-clock frame delta, the anchor for `get_frametime`. Measured
-        // at the same point every frame so the delta is stable under vsync.
-        let now = Instant::now();
-        if let Some(previous) = self.previous_frame_at {
-            self.frame_delta = now.duration_since(previous);
-        }
-        self.previous_frame_at = Some(now);
-
-        Ok(())
+        Ok(FrameOutcome::Presented)
     }
 
     /// Wall-clock time between the two most recent frames — the value to
@@ -754,7 +866,16 @@ impl Renderer {
     /// queries, or before the first measurement completes. Use
     /// [`Renderer::get_frametime`] for animation stepping, not this.
     pub fn get_gpu_frametime(&self) -> Option<Duration> {
-        self.timestamps.as_ref().and_then(|timestamps| timestamps.last_gpu_frametime)
+        self.timestamps
+            .as_ref()
+            .and_then(|timestamps| timestamps.last_gpu_frametime)
+    }
+
+    /// Counters and target sizes of the most recently rendered frame:
+    /// direct versus offscreen layers, passes recorded, and the bytes the
+    /// frame's textures cost. See [`RenderStats`].
+    pub fn stats(&self) -> &RenderStats {
+        &self.stats
     }
 
     /// Wall-clock time elapsed since this `Renderer` was created.
@@ -769,4 +890,42 @@ impl Renderer {
 
     /// Reserved for future per-window state. Currently a no-op.
     pub fn handle_event(&mut self, _event: &WindowEvent) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supports_timestamp_queries;
+
+    const TIMESTAMPS: wgpu::Features =
+        wgpu::Features::TIMESTAMP_QUERY.union(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+
+    #[test]
+    fn metal_never_uses_legacy_timestamp_queries() {
+        assert!(!supports_timestamp_queries(
+            wgpu::Backend::Metal,
+            TIMESTAMPS
+        ));
+    }
+
+    #[test]
+    fn other_backends_require_both_timestamp_features() {
+        assert!(supports_timestamp_queries(
+            wgpu::Backend::Vulkan,
+            TIMESTAMPS
+        ));
+        assert!(!supports_timestamp_queries(
+            wgpu::Backend::Vulkan,
+            wgpu::Features::TIMESTAMP_QUERY
+        ));
+    }
+
+    #[test]
+    fn large_windows_fall_back_to_4x_msaa() {
+        use super::cap_msaa_sample_count as cap;
+        assert_eq!(cap(8, (1920, 1080)), 8);
+        assert_eq!(cap(8, (2560, 1440)), 8);
+        assert_eq!(cap(8, (3840, 2160)), 4);
+        assert_eq!(cap(8, (5120, 2880)), 4);
+        assert_eq!(cap(4, (7680, 4320)), 4, "never below the floor");
+    }
 }

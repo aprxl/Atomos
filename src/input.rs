@@ -29,8 +29,10 @@
 use std::collections::HashSet;
 
 use winit::{
-    event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    dpi::{LogicalPosition, LogicalSize},
+    event::{DeviceEvent, ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
+    window::Window,
 };
 
 /// Logical pixels one "line" of scrolling is worth, used to put
@@ -41,11 +43,101 @@ use winit::{
 // revisit if smooth-scroll physics ever needs the true pixel deltas.
 const PIXELS_PER_LINE: f32 = 20.0;
 
-/// How many characters [`Input::text`] will buffer within a single frame
-/// before dropping the rest. A frame's worth of real typing is a handful of
-/// characters; anything beyond this is a stuck key or a paste-like IME
-/// burst, and an unbounded buffer would just be a slow leak.
-const MAX_TEXT_PER_FRAME: usize = 256;
+/// The platform's text-input conventions, which differ in which modifier
+/// chords produce characters instead of shortcuts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Platform {
+    Windows,
+    MacOs,
+    Other,
+}
+
+impl Platform {
+    const CURRENT: Platform = if cfg!(target_os = "windows") {
+        Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        Platform::MacOs
+    } else {
+        Platform::Other
+    };
+}
+
+/// Whether the held modifiers make a key press a shortcut, so the text it
+/// carries must not be typed.
+///
+/// - **Windows** reports AltGr (used by French, German, Spanish, Swiss, ...
+///   layouts for characters like `@ ~ { } [ ] €`) as Ctrl+Alt held together,
+///   so that combination types; Ctrl or Alt alone is a shortcut.
+/// - **macOS** composes characters with Option (`å`, `€`, dead keys), so
+///   Option alone types; Control and Command are shortcuts.
+/// - **Elsewhere** AltGr is a distinct level-3 shift that winit does not
+///   report as Ctrl or Alt, so any held Ctrl, Alt or Super is a shortcut.
+///
+/// Shift never suppresses: it only selects the shifted character.
+fn suppresses_text(modifiers: ModifiersState, platform: Platform) -> bool {
+    if modifiers.super_key() {
+        return true;
+    }
+    match platform {
+        Platform::Windows => modifiers.control_key() ^ modifiers.alt_key(),
+        Platform::MacOs => modifiers.control_key(),
+        Platform::Other => modifiers.control_key() || modifiers.alt_key(),
+    }
+}
+
+/// One input occurrence, in the order the OS delivered it. Frame-level
+/// queries on [`Input`] answer "what happened this frame"; this stream
+/// answers "in what order", which an editor needs so that, say, a mode
+/// change from one key applies before the character typed right after it.
+///
+/// A key press that produces characters yields [`InputEvent::Key`] followed
+/// immediately by [`InputEvent::Text`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum InputEvent {
+    /// A physical key edge. `code` is `None` for keys winit cannot identify.
+    /// `modifiers` are those held at the moment of the event.
+    Key {
+        code: Option<KeyCode>,
+        state: ElementState,
+        repeat: bool,
+        modifiers: ModifiersState,
+    },
+    /// Characters to insert into a document: typed text, or an IME commit
+    /// (never truncated). Control characters are stripped.
+    Text(String),
+    /// Provisional IME composition, replacing any previous one wholesale.
+    /// Not part of the document until committed. `cursor` is the caret or
+    /// selection as byte offsets into `text`. Empty `text` ends the
+    /// composition.
+    Preedit {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    MouseButton {
+        button: MouseButton,
+        state: ElementState,
+        /// Logical pixels.
+        position: (f32, f32),
+        modifiers: ModifiersState,
+    },
+    MouseMoved {
+        /// Logical pixels.
+        position: (f32, f32),
+        delta: (f32, f32),
+    },
+    /// Scroll in lines.
+    Scroll { delta: (f32, f32) },
+    /// Keyboard focus changed. Losing focus force-releases everything held.
+    Focus(bool),
+}
+
+/// An in-progress IME composition. See [`Input::preedit`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preedit {
+    pub text: String,
+    /// Caret or selection as byte offsets into `text`.
+    pub cursor: Option<(usize, usize)>,
+}
 
 /// Aggregated input state for the current frame. See the module doc for the
 /// event-forwarding/`end_frame` contract.
@@ -75,6 +167,17 @@ pub struct Input {
     scroll_delta: (f32, f32),
 
     text: String,
+    /// Current IME composition; persists across frames until committed or
+    /// cancelled, unlike the per-frame edge state.
+    preedit: Option<Preedit>,
+    events: Vec<InputEvent>,
+
+    /// Caret rectangle (top-left, size) in logical pixels for the OS
+    /// candidate window, set by [`Input::set_ime_cursor_area`] and applied
+    /// by [`Input::sync_ime`].
+    ime_area: Option<((f32, f32), (f32, f32))>,
+    ime_area_dirty: bool,
+    ime_enabled: bool,
 
     focused: bool,
     cursor_in_window: bool,
@@ -83,7 +186,6 @@ pub struct Input {
 // The whole query surface is the point of this type; `main.rs` only drives
 // the event/frame plumbing, so most queries have no caller until editor code
 // lands. Same situation (and same treatment) as the renderer's draw API.
-#[allow(dead_code)]
 impl Input {
     /// `scale_factor` is the window's current DPI scale (`window.scale_factor()`);
     /// it is kept current from `ScaleFactorChanged` afterwards.
@@ -104,6 +206,11 @@ impl Input {
             raw_mouse_delta: (0.0, 0.0),
             scroll_delta: (0.0, 0.0),
             text: String::new(),
+            preedit: None,
+            events: Vec::new(),
+            ime_area: None,
+            ime_area_dirty: false,
+            ime_enabled: false,
             focused: true,
             cursor_in_window: false,
         }
@@ -120,39 +227,56 @@ impl Input {
     pub fn handle_event(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
-                if let Some(text) = &event.text
-                    && event.state.is_pressed()
-                    && self.text.len() + text.len() <= MAX_TEXT_PER_FRAME
-                {
-                    // Filter control characters (Esc, Backspace, …) — winit
-                    // reports them as `text`, but a caller appending this to
-                    // a document wants typed characters, not control bytes.
-                    self.text.extend(text.chars().filter(|c| !c.is_control()));
-                }
-
                 // Layout-independent identity: `KeyCode::KeyW` is the
                 // physical W position regardless of the active layout, which
-                // is what keybinds should be expressed against.
-                let PhysicalKey::Code(code) = event.physical_key else {
-                    // No usable physical identity, but a keyboard event is
-                    // user intent regardless — it may still have produced
-                    // text above.
-                    return true;
+                // is what keybinds should be expressed against. A key with
+                // no such identity is still user intent and may produce text.
+                let code = match event.physical_key {
+                    PhysicalKey::Code(code) => Some(code),
+                    PhysicalKey::Unidentified(_) => None,
                 };
-                match event.state {
-                    ElementState::Pressed => {
-                        self.keys_typed.insert(code);
-                        // `repeat` is the OS auto-repeat stream from a key
-                        // that's already held — not a new press edge.
-                        if !event.repeat {
-                            self.keys_pressed.insert(code);
+                if let Some(code) = code {
+                    match event.state {
+                        ElementState::Pressed => {
+                            self.keys_typed.insert(code);
+                            // `repeat` is the OS auto-repeat stream from a
+                            // key that's already held — not a new press edge.
+                            if !event.repeat {
+                                self.keys_pressed.insert(code);
+                            }
+                            self.keys_down.insert(code);
                         }
-                        self.keys_down.insert(code);
+                        ElementState::Released => {
+                            self.keys_down.remove(&code);
+                            self.keys_released.insert(code);
+                        }
                     }
-                    ElementState::Released => {
-                        self.keys_down.remove(&code);
-                        self.keys_released.insert(code);
+                }
+                self.events.push(InputEvent::Key {
+                    code,
+                    state: event.state,
+                    repeat: event.repeat,
+                    modifiers: self.modifiers,
+                });
+                if let Some(text) = &event.text
+                    && event.state.is_pressed()
+                    && !suppresses_text(self.modifiers, Platform::CURRENT)
+                {
+                    self.commit_text(text);
+                }
+                true
+            }
+
+            WindowEvent::Ime(ime) => {
+                match ime {
+                    Ime::Enabled => {}
+                    Ime::Preedit(text, cursor) => self.set_preedit(text, *cursor),
+                    Ime::Commit(text) => {
+                        // The composition ends with its commit.
+                        self.set_preedit("", None);
+                        self.commit_text(text);
                     }
+                    Ime::Disabled => self.set_preedit("", None),
                 }
                 true
             }
@@ -173,6 +297,12 @@ impl Input {
                         self.buttons_released.insert(*button);
                     }
                 }
+                self.events.push(InputEvent::MouseButton {
+                    button: *button,
+                    state: *state,
+                    position: self.mouse_position,
+                    modifiers: self.modifiers,
+                });
                 true
             }
 
@@ -181,10 +311,15 @@ impl Input {
                     (position.x / self.scale_factor) as f32,
                     (position.y / self.scale_factor) as f32,
                 );
-                if let Some(last) = self.last_mouse_position {
-                    self.mouse_delta.0 += next.0 - last.0;
-                    self.mouse_delta.1 += next.1 - last.1;
-                }
+                let delta = self
+                    .last_mouse_position
+                    .map_or((0.0, 0.0), |last| (next.0 - last.0, next.1 - last.1));
+                self.mouse_delta.0 += delta.0;
+                self.mouse_delta.1 += delta.1;
+                self.events.push(InputEvent::MouseMoved {
+                    position: next,
+                    delta,
+                });
                 self.mouse_position = next;
                 self.last_mouse_position = Some(next);
                 self.cursor_in_window = true;
@@ -192,16 +327,16 @@ impl Input {
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
-                match delta {
-                    MouseScrollDelta::LineDelta(x, y) => {
-                        self.scroll_delta.0 += x;
-                        self.scroll_delta.1 += y;
-                    }
-                    MouseScrollDelta::PixelDelta(position) => {
-                        self.scroll_delta.0 += position.x as f32 / PIXELS_PER_LINE;
-                        self.scroll_delta.1 += position.y as f32 / PIXELS_PER_LINE;
-                    }
-                }
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (*x, *y),
+                    MouseScrollDelta::PixelDelta(position) => (
+                        position.x as f32 / PIXELS_PER_LINE,
+                        position.y as f32 / PIXELS_PER_LINE,
+                    ),
+                };
+                self.scroll_delta.0 += lines.0;
+                self.scroll_delta.1 += lines.1;
+                self.events.push(InputEvent::Scroll { delta: lines });
                 true
             }
 
@@ -223,6 +358,7 @@ impl Input {
                 if !focused {
                     self.release_all();
                 }
+                self.events.push(InputEvent::Focus(*focused));
                 true
             }
 
@@ -235,6 +371,31 @@ impl Input {
             }
 
             _ => false,
+        }
+    }
+
+    fn commit_text(&mut self, text: &str) {
+        // Control characters (Esc, Backspace, ...) arrive as `text` from
+        // winit; a document wants typed characters, not control bytes.
+        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        if text.is_empty() {
+            return;
+        }
+        self.text.push_str(&text);
+        self.events.push(InputEvent::Text(text));
+    }
+
+    fn set_preedit(&mut self, text: &str, cursor: Option<(usize, usize)>) {
+        let next = (!text.is_empty()).then(|| Preedit {
+            text: text.to_owned(),
+            cursor,
+        });
+        if next != self.preedit {
+            self.events.push(InputEvent::Preedit {
+                text: text.to_owned(),
+                cursor,
+            });
+            self.preedit = next;
         }
     }
 
@@ -279,6 +440,7 @@ impl Input {
         self.raw_mouse_delta = (0.0, 0.0);
         self.scroll_delta = (0.0, 0.0);
         self.text.clear();
+        self.events.clear();
     }
 
     // ---- keyboard --------------------------------------------------------
@@ -362,6 +524,52 @@ impl Input {
     /// one wanted.
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Everything that happened this frame, in delivery order. Prefer this
+    /// over the aggregate queries when order matters (editing, key
+    /// sequences); the aggregates stay for widgets that only ask "did X
+    /// happen". Cleared by [`Input::end_frame`].
+    pub fn events(&self) -> &[InputEvent] {
+        &self.events
+    }
+
+    /// The IME composition in progress, if any. Render it at the caret,
+    /// conventionally underlined; it is not in the document until an
+    /// [`InputEvent::Text`] commit arrives.
+    pub fn preedit(&self) -> Option<&Preedit> {
+        self.preedit.as_ref()
+    }
+
+    /// Record where the caret is, in logical pixels, so the OS can place
+    /// its candidate window beside it instead of over the text being
+    /// composed. Takes effect at the next [`Input::sync_ime`].
+    pub fn set_ime_cursor_area(&mut self, top_left: (f32, f32), size: (f32, f32)) {
+        let area = Some((top_left, size));
+        if self.ime_area != area {
+            self.ime_area = area;
+            self.ime_area_dirty = true;
+        }
+    }
+
+    /// Enable IME on `window` (off by default in winit, so
+    /// `WindowEvent::Ime` never fires otherwise) and forward the latest
+    /// caret rectangle. Cheap to call every frame; it only talks to the OS
+    /// when something changed.
+    pub fn sync_ime(&mut self, window: &Window) {
+        if !self.ime_enabled {
+            window.set_ime_allowed(true);
+            self.ime_enabled = true;
+        }
+        if self.ime_area_dirty
+            && let Some((position, size)) = self.ime_area
+        {
+            window.set_ime_cursor_area(
+                LogicalPosition::new(position.0, position.1),
+                LogicalSize::new(size.0, size.1),
+            );
+            self.ime_area_dirty = false;
+        }
     }
 
     // ---- mouse -----------------------------------------------------------
@@ -452,7 +660,11 @@ mod tests {
     }
 
     fn click(state: ElementState) -> WindowEvent {
-        WindowEvent::MouseInput { device_id: DeviceId::dummy(), state, button: MouseButton::Left }
+        WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state,
+            button: MouseButton::Left,
+        }
     }
 
     #[test]
@@ -463,8 +675,14 @@ mod tests {
         assert!(input.is_mouse_pressed(MouseButton::Left));
 
         input.end_frame();
-        assert!(input.is_mouse_down(MouseButton::Left), "held state must survive the frame");
-        assert!(!input.is_mouse_pressed(MouseButton::Left), "press edge must not repeat");
+        assert!(
+            input.is_mouse_down(MouseButton::Left),
+            "held state must survive the frame"
+        );
+        assert!(
+            !input.is_mouse_pressed(MouseButton::Left),
+            "press edge must not repeat"
+        );
 
         input.handle_event(&click(ElementState::Released));
         assert!(!input.is_mouse_down(MouseButton::Left));
@@ -483,7 +701,11 @@ mod tests {
         input.handle_event(&WindowEvent::Focused(false));
 
         assert!(!input.is_focused());
-        assert_eq!(input.keys_down().count(), 0, "keys must not stay stuck across focus loss");
+        assert_eq!(
+            input.keys_down().count(),
+            0,
+            "keys must not stay stuck across focus loss"
+        );
         assert!(!input.is_mouse_down(MouseButton::Left));
         assert!(input.modifiers().is_empty());
         // Reported as edges so press/release pairing unwinds instead of hanging.
@@ -495,8 +717,16 @@ mod tests {
     fn mouse_position_is_logical_and_delta_is_per_frame() {
         let mut input = Input::new(2.0);
         input.handle_event(&cursor(200.0, 100.0));
-        assert_eq!(input.mouse_position(), (100.0, 50.0), "physical px must be scaled down");
-        assert_eq!(input.mouse_delta(), (0.0, 0.0), "first move has no previous anchor");
+        assert_eq!(
+            input.mouse_position(),
+            (100.0, 50.0),
+            "physical px must be scaled down"
+        );
+        assert_eq!(
+            input.mouse_delta(),
+            (0.0, 0.0),
+            "first move has no previous anchor"
+        );
 
         input.end_frame();
         input.handle_event(&cursor(220.0, 100.0));
@@ -512,11 +742,17 @@ mod tests {
         input.handle_event(&cursor(10.0, 10.0));
         input.end_frame();
 
-        input.handle_event(&WindowEvent::CursorLeft { device_id: DeviceId::dummy() });
+        input.handle_event(&WindowEvent::CursorLeft {
+            device_id: DeviceId::dummy(),
+        });
         input.handle_event(&cursor(900.0, 600.0));
 
         assert!(input.is_cursor_in_window());
-        assert_eq!(input.mouse_delta(), (0.0, 0.0), "re-entry is a teleport, not a drag");
+        assert_eq!(
+            input.mouse_delta(),
+            (0.0, 0.0),
+            "re-entry is a teleport, not a drag"
+        );
     }
 
     #[test]
@@ -536,5 +772,133 @@ mod tests {
         assert_eq!(input.scroll_delta(), (0.0, 3.0));
         input.end_frame();
         assert_eq!(input.scroll_delta(), (0.0, 0.0));
+    }
+
+    fn ime(event: Ime) -> WindowEvent {
+        WindowEvent::Ime(event)
+    }
+
+    #[test]
+    fn an_ime_commit_becomes_typed_text() {
+        let mut input = input();
+        input.handle_event(&ime(Ime::Commit("é".into())));
+        assert_eq!(input.text(), "é");
+        assert_eq!(input.events(), [InputEvent::Text("é".into())]);
+        input.end_frame();
+        assert_eq!(input.text(), "", "a commit is per-frame like any typing");
+        assert!(input.events().is_empty());
+    }
+
+    #[test]
+    fn a_long_commit_is_never_truncated_or_dropped() {
+        let mut input = input();
+        let long = "あ".repeat(400);
+        input.handle_event(&ime(Ime::Commit(long.clone())));
+        input.handle_event(&ime(Ime::Commit("tail".into())));
+        assert_eq!(input.text(), format!("{long}tail"));
+    }
+
+    #[test]
+    fn a_preedit_is_provisional_and_replaced_wholesale() {
+        let mut input = input();
+        input.handle_event(&ime(Ime::Preedit("ni".into(), Some((0, 2)))));
+        assert_eq!(input.text(), "", "a preedit is not in the document");
+        assert_eq!(
+            input.preedit(),
+            Some(&Preedit {
+                text: "ni".into(),
+                cursor: Some((0, 2)),
+            })
+        );
+
+        input.handle_event(&ime(Ime::Preedit("nih".into(), Some((0, 3)))));
+        assert_eq!(input.preedit().map(|p| p.text.as_str()), Some("nih"));
+
+        input.end_frame();
+        assert!(input.preedit().is_some(), "a composition spans frames");
+    }
+
+    #[test]
+    fn a_commit_ends_the_composition_before_inserting() {
+        let mut input = input();
+        input.handle_event(&ime(Ime::Preedit("ni".into(), None)));
+        input.handle_event(&ime(Ime::Commit("你".into())));
+        assert_eq!(input.preedit(), None);
+        assert_eq!(
+            input.events(),
+            [
+                InputEvent::Preedit {
+                    text: "ni".into(),
+                    cursor: None,
+                },
+                InputEvent::Preedit {
+                    text: String::new(),
+                    cursor: None,
+                },
+                InputEvent::Text("你".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn disabling_ime_cancels_the_composition() {
+        let mut input = input();
+        input.handle_event(&ime(Ime::Preedit("ni".into(), None)));
+        input.handle_event(&ime(Ime::Disabled));
+        assert_eq!(input.preedit(), None);
+    }
+
+    #[test]
+    fn control_characters_are_not_text() {
+        let mut input = input();
+        input.commit_text("\u{1b}\u{8}");
+        assert_eq!(input.text(), "");
+        assert!(input.events().is_empty());
+    }
+
+    #[test]
+    fn events_keep_delivery_order_across_kinds() {
+        let mut input = input();
+        input.handle_event(&cursor(10.0, 20.0));
+        input.handle_event(&click(ElementState::Pressed));
+        input.handle_event(&ime(Ime::Commit("a".into())));
+        input.handle_event(&WindowEvent::Focused(false));
+
+        let kinds: Vec<&str> = input
+            .events()
+            .iter()
+            .map(|event| match event {
+                InputEvent::MouseMoved { .. } => "moved",
+                InputEvent::MouseButton { .. } => "button",
+                InputEvent::Text(_) => "text",
+                InputEvent::Focus(_) => "focus",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["moved", "button", "text", "focus"]);
+    }
+
+    #[test]
+    fn windows_treats_ctrl_alt_as_altgr_text() {
+        let both = ModifiersState::CONTROL.union(ModifiersState::ALT);
+        assert!(!suppresses_text(both, Platform::Windows));
+        assert!(suppresses_text(ModifiersState::CONTROL, Platform::Windows));
+        assert!(suppresses_text(ModifiersState::ALT, Platform::Windows));
+    }
+
+    #[test]
+    fn macos_option_types_but_control_and_command_do_not() {
+        assert!(!suppresses_text(ModifiersState::ALT, Platform::MacOs));
+        assert!(suppresses_text(ModifiersState::CONTROL, Platform::MacOs));
+        assert!(suppresses_text(ModifiersState::SUPER, Platform::MacOs));
+    }
+
+    #[test]
+    fn elsewhere_every_ctrl_alt_or_super_chord_is_a_shortcut() {
+        let both = ModifiersState::CONTROL.union(ModifiersState::ALT);
+        assert!(suppresses_text(both, Platform::Other));
+        assert!(suppresses_text(ModifiersState::ALT, Platform::Other));
+        assert!(suppresses_text(ModifiersState::SUPER, Platform::Other));
+        assert!(!suppresses_text(ModifiersState::SHIFT, Platform::Other));
     }
 }

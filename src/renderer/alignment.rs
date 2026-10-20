@@ -8,7 +8,6 @@ pub enum HorizontalAlign {
     #[default]
     Left,
     Center,
-    #[allow(dead_code)] // not exercised by the current demo
     Right,
 }
 
@@ -18,7 +17,6 @@ pub enum VerticalAlign {
     #[default]
     Top,
     Center,
-    #[allow(dead_code)] // not exercised by the current demo
     Bottom,
 }
 

@@ -4,6 +4,7 @@
 
 use std::hash::{Hash, Hasher};
 
+use super::ClipShape;
 use super::Color;
 use super::Pixels;
 use super::Rounding;
@@ -12,6 +13,12 @@ use super::path_paint::{PathPaint, Stroke};
 use super::{Alignment, Font, FontParameters};
 
 /// One `Layer::draw_*` call, queued until the layer is next (re)built.
+///
+/// Every length is in **logical** pixels, exactly as the caller supplied it.
+/// The layer converts to physical pixels with [`DrawCommand::to_physical`]
+/// at the moment it builds GPU geometry, against whatever scale factor is
+/// current then. Storing physical values instead baked the scale in at call
+/// time, so retained content stayed at the old density after a DPI change.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum DrawCommand {
     Rectangle {
@@ -80,6 +87,100 @@ pub(super) enum DrawCommand {
         position: [f32; 2],
         alignment: Alignment,
     },
+    /// Everything drawn until the matching [`DrawCommand::PopClip`] is
+    /// clipped to this shape, in logical pixels. Scopes nest.
+    PushClip(ClipShape),
+    PopClip,
+}
+
+impl DrawCommand {
+    /// This command with every logical length multiplied by `s`, ready to
+    /// tessellate or shape at the physical size.
+    pub(super) fn to_physical(&self, s: f32) -> DrawCommand {
+        let pair = |p: &[f32; 2]| [p[0] * s, p[1] * s];
+        match self {
+            // Kept logical: a path clip's scale is applied when its
+            // geometry is built, which knows the layer's scale factor.
+            DrawCommand::PushClip(shape) => DrawCommand::PushClip(shape.clone()),
+            DrawCommand::PopClip => DrawCommand::PopClip,
+            DrawCommand::Rectangle {
+                top_left,
+                size,
+                color,
+                rounding,
+            } => DrawCommand::Rectangle {
+                top_left: pair(top_left),
+                size: pair(size),
+                color: color.clone(),
+                rounding: rounding.scaled(s),
+            },
+            DrawCommand::Polygon { vertices, color } => DrawCommand::Polygon {
+                vertices: vertices.iter().map(pair).collect(),
+                color: color.clone(),
+            },
+            DrawCommand::Circle {
+                center,
+                radius,
+                color,
+            } => DrawCommand::Circle {
+                center: pair(center),
+                radius: radius * s,
+                color: color.clone(),
+            },
+            DrawCommand::Path {
+                d,
+                position,
+                scale,
+                paint,
+            } => DrawCommand::Path {
+                d: d.clone(),
+                position: pair(position),
+                scale: scale * s,
+                paint: paint.clone(),
+            },
+            DrawCommand::Image {
+                pixels,
+                top_left,
+                size,
+                tint,
+            } => DrawCommand::Image {
+                pixels: pixels.clone(),
+                top_left: pair(top_left),
+                size: pair(size),
+                tint: tint.clone(),
+            },
+            DrawCommand::Text {
+                text,
+                position,
+                font,
+                font_parameters,
+                alignment,
+                color,
+            } => DrawCommand::Text {
+                text: text.clone(),
+                position: pair(position),
+                font: font.clone(),
+                font_parameters: font_parameters.scaled(s),
+                alignment: *alignment,
+                color: color.clone(),
+            },
+            DrawCommand::StyledText {
+                spans,
+                position,
+                alignment,
+            } => DrawCommand::StyledText {
+                spans: spans
+                    .iter()
+                    .map(|span| TextSpan {
+                        font_parameters: span.font_parameters.scaled(s),
+                        ..span.clone()
+                    })
+                    .collect(),
+                position: pair(position),
+                alignment: *alignment,
+            },
+        }
+    }
 }
 
 /// Manual `Hash`, since `f32` (in positions/sizes/colors) isn't `Hash` —
@@ -111,24 +212,42 @@ impl Hash for DrawCommand {
                 }
                 color.hash_bits(state);
             }
-            DrawCommand::Circle { center, radius, color } => {
+            DrawCommand::Circle {
+                center,
+                radius,
+                color,
+            } => {
                 state.write_u8(2);
                 hash_f32_pair(center, state);
                 state.write_u32(radius.to_bits());
                 color.hash_bits(state);
             }
-            DrawCommand::Path { d, position, scale, paint } => {
+            DrawCommand::Path {
+                d,
+                position,
+                scale,
+                paint,
+            } => {
                 state.write_u8(3);
                 d.hash(state);
                 hash_f32_pair(position, state);
                 state.write_u32(scale.to_bits());
                 hash_path_paint(paint, state);
             }
-            DrawCommand::Image { pixels, top_left, size, tint } => {
+            DrawCommand::Image {
+                pixels,
+                top_left,
+                size,
+                tint,
+            } => {
                 state.write_u8(4);
                 pixels.width.hash(state);
                 pixels.height.hash(state);
-                pixels.data.hash(state);
+                // Identity, not contents: the bytes are immutable and
+                // shared, and scanning a large image every frame is the
+                // cost this avoids. A fresh copy of equal pixels just
+                // rebuilds once.
+                std::ptr::hash(pixels.data.as_ptr(), state);
                 hash_f32_pair(top_left, state);
                 hash_f32_pair(size, state);
                 tint.hash_bits(state);
@@ -149,10 +268,20 @@ impl Hash for DrawCommand {
                 state.write_u32(font_parameters.weight.to_bits());
                 state.write_u32(font_parameters.width.to_bits());
                 state.write_u32(font_parameters.tracking.to_bits());
+                state.write_u32(font_parameters.slant.to_bits());
                 alignment.hash(state);
                 color.hash_bits(state);
             }
-            DrawCommand::StyledText { spans, position, alignment } => {
+            DrawCommand::PushClip(shape) => {
+                state.write_u8(7);
+                hash_clip_shape(shape, state);
+            }
+            DrawCommand::PopClip => state.write_u8(8),
+            DrawCommand::StyledText {
+                spans,
+                position,
+                alignment,
+            } => {
                 state.write_u8(6);
                 state.write_usize(spans.len());
                 for span in spans {
@@ -162,11 +291,45 @@ impl Hash for DrawCommand {
                     state.write_u32(span.font_parameters.weight.to_bits());
                     state.write_u32(span.font_parameters.width.to_bits());
                     state.write_u32(span.font_parameters.tracking.to_bits());
+                    state.write_u32(span.font_parameters.slant.to_bits());
                     span.color.hash_bits(state);
                 }
                 hash_f32_pair(position, state);
                 alignment.hash(state);
             }
+        }
+    }
+}
+
+fn hash_clip_shape<H: Hasher>(shape: &ClipShape, state: &mut H) {
+    match shape {
+        ClipShape::Rectangle {
+            top_left,
+            size,
+            rounding,
+        } => {
+            state.write_u8(0);
+            hash_f32_pair(&[top_left.0, top_left.1], state);
+            hash_f32_pair(&[size.0, size.1], state);
+            hash_f32_pair(&[rounding.top_left, rounding.top_right], state);
+            hash_f32_pair(&[rounding.bottom_right, rounding.bottom_left], state);
+        }
+        ClipShape::Circle { center, radius } => {
+            state.write_u8(1);
+            hash_f32_pair(&[center.0, center.1], state);
+            state.write_u32(radius.to_bits());
+        }
+        ClipShape::Polygon { vertices } => {
+            state.write_u8(2);
+            state.write_usize(vertices.len());
+            for (x, y) in vertices {
+                hash_f32_pair(&[*x, *y], state);
+            }
+        }
+        ClipShape::Path { d, position } => {
+            state.write_u8(3);
+            d.hash(state);
+            hash_f32_pair(&[position.0, position.1], state);
         }
     }
 }
@@ -195,7 +358,11 @@ fn hash_path_paint<H: Hasher>(paint: &PathPaint, state: &mut H) {
             state.write_u8(1);
             hash_stroke(stroke, state);
         }
-        PathPaint::FillAndStroke { fill_color, fill_rule, stroke } => {
+        PathPaint::FillAndStroke {
+            fill_color,
+            fill_rule,
+            stroke,
+        } => {
             state.write_u8(2);
             fill_color.hash_bits(state);
             state.write_u8(*fill_rule as u8);

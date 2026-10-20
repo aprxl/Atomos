@@ -1,13 +1,13 @@
 //! Clipping-API proof of concept.
 //!
 //! Run with `cargo run --bin clip_demo`. Exercises both clip paths on
-//! `renderer::Layer`:
+//! `atomos::renderer::Layer`:
 //!
-//! - **Scissor** (`set_clip_rect`, the cheap everyday one): a viewport
+//! - **Scissor** (a pixel-aligned rectangle, the cheap everyday one): a viewport
 //!   panel whose scrolling content — text and bars alike — is cut off
 //!   hard at the panel edge by the hardware scissor. The scroll runs
 //!   forever; nothing outside the rect is ever shaded.
-//! - **Mask** (`set_clip_shape`, the arbitrary-shape one): a panel of
+//! - **Mask** (`set_clip` with any shape, via the stencil): a panel of
 //!   gradient + text content clipped by a shape cycled with `M` —
 //!   rounded rect, circle, star polygon, SVG heart path. The mask
 //!   rebuilds only on the keypress; a static shape costs one small pass
@@ -19,24 +19,15 @@
 //!
 //! `Esc` quits.
 
-#[path = "../animation.rs"]
-mod animation;
-#[path = "../frame.rs"]
-mod frame;
-#[path = "../input.rs"]
-mod input;
-#[path = "../renderer/mod.rs"]
-mod renderer;
-
 use std::sync::Arc;
 use std::time::Duration;
 
-use animation::{Animation, Easing};
-use frame::FrameScheduler;
-use input::Input;
-use renderer::{
-    Alignment, ClipShape, Color, Font, FontParameters, GradientDirection, Layer,
-    LayerInvalidation, Renderer, Rounding,
+use atomos::animation::{Animation, Easing};
+use atomos::frame::FrameScheduler;
+use atomos::input::Input;
+use atomos::renderer::{
+    Alignment, ClipShape, Color, Font, FontParameters, GradientDirection, Layer, LayerInvalidation,
+    Renderer, Rounding,
 };
 use winit::{
     application::ApplicationHandler,
@@ -99,7 +90,13 @@ fn label(layer: &Layer, s: &str, position: (f32, f32), size: f32, color: Color) 
 
 fn panel(layer: &Layer, top_left: (f32, f32), size: (f32, f32), title: &str) {
     layer.draw_rectangle(top_left, size, PANEL, Rounding::uniform(8.0));
-    label(layer, title, (top_left.0 + 16.0, top_left.1 + 14.0), 12.0, DIM);
+    label(
+        layer,
+        title,
+        (top_left.0 + 16.0, top_left.1 + 14.0),
+        12.0,
+        DIM,
+    );
 }
 
 /// The shapes `M` cycles through on the mask panel. Everything is authored
@@ -138,15 +135,18 @@ impl MaskKind {
                 size: (pw - 48.0, ph - 64.0),
                 rounding: Rounding::uniform(36.0),
             },
-            MaskKind::Circle => ClipShape::Circle { center, radius: 118.0 },
+            MaskKind::Circle => ClipShape::Circle {
+                center,
+                radius: 118.0,
+            },
             MaskKind::Star => {
                 // Five-pointed star: alternate outer/inner radius vertices.
                 let (outer, inner) = (128.0, 52.0);
                 let vertices = (0..10)
                     .map(|i| {
                         let r = if i % 2 == 0 { outer } else { inner };
-                        let a = std::f32::consts::TAU * i as f32 / 10.0
-                            - std::f32::consts::FRAC_PI_2;
+                        let a =
+                            std::f32::consts::TAU * i as f32 / 10.0 - std::f32::consts::FRAC_PI_2;
                         (center.0 + r * a.cos(), center.1 + r * a.sin())
                     })
                     .collect();
@@ -192,12 +192,14 @@ impl Demo {
         animating |= self.breathe.advance(dt);
 
         if input.is_key_pressed(KeyCode::KeyM) {
-            let i = MaskKind::ALL.iter().position(|k| *k == self.mask).unwrap_or(0);
+            let i = MaskKind::ALL
+                .iter()
+                .position(|k| *k == self.mask)
+                .unwrap_or(0);
             self.mask = MaskKind::ALL[(i + 1) % MaskKind::ALL.len()];
         }
 
-        self.spot_radius = (self.spot_radius
-            + input.scroll_delta().1 * SPOT_RADIUS_PER_LINE)
+        self.spot_radius = (self.spot_radius + input.scroll_delta().1 * SPOT_RADIUS_PER_LINE)
             .clamp(SPOT_RADIUS_MIN, SPOT_RADIUS_MAX);
 
         animating
@@ -219,7 +221,7 @@ impl Demo {
             layer,
             SCISSOR_PANEL.0,
             SCISSOR_PANEL.1,
-            "SCISSOR — set_clip_rect, hardware, free",
+            "SCISSOR — aligned rectangle, hardware, free",
         );
         // The viewport slot the scissored content scrolls inside.
         layer.draw_rectangle(SCISSOR_VIEW.0, SCISSOR_VIEW.1, SLOT, Rounding::NONE);
@@ -228,10 +230,16 @@ impl Demo {
             layer,
             MASK_PANEL.0,
             MASK_PANEL.1,
-            "MASK — set_clip_shape, any geometry",
+            "STENCIL — set_clip, any geometry",
         );
         let ((mx, my), (_, mh)) = MASK_PANEL;
-        label(layer, self.mask.name(), (mx + 16.0, my + mh - 26.0), 12.0, YELLOW);
+        label(
+            layer,
+            self.mask.name(),
+            (mx + 16.0, my + mh - 26.0),
+            12.0,
+            YELLOW,
+        );
 
         panel(
             layer,
@@ -367,11 +375,8 @@ impl Demo {
     fn spotlight_shape(&self, input: &Input) -> Option<ClipShape> {
         let ((sx, sy), (sw, sh)) = SPOT_PANEL;
         let (mx, my) = input.mouse_position();
-        let inside = input.is_cursor_in_window()
-            && mx >= sx
-            && mx <= sx + sw
-            && my >= sy
-            && my <= sy + sh;
+        let inside =
+            input.is_cursor_in_window() && mx >= sx && mx <= sx + sw && my >= sy && my <= sy + sh;
         inside.then(|| ClipShape::Circle {
             center: (mx, my),
             radius: self.spot_radius + self.breathe.value(-SPOT_BREATHE, SPOT_BREATHE),
@@ -432,9 +437,16 @@ impl ApplicationHandler for App {
         let spot_layer = renderer.new_layer_top(LayerInvalidation::Automatic);
 
         // The scissor rect is panel-fixed: set once, clips forever.
-        scissor_layer.set_clip_rect(Some(SCISSOR_VIEW));
+        scissor_layer
+            .set_clip(Some(ClipShape::Rectangle {
+                top_left: SCISSOR_VIEW.0,
+                size: SCISSOR_VIEW.1,
+                rounding: Rounding::NONE,
+            }))
+            .expect("rectangles cannot fail to parse");
 
         self.input = Input::new(window.scale_factor());
+        self.scheduler.sync_display(&window);
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.background = Some(background);
@@ -446,6 +458,15 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         if self.input.handle_event(&event) {
             self.scheduler.request_redraw();
+        }
+        self.scheduler.handle_event(&event);
+        if matches!(
+            event,
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }
+        ) && let Some(w) = &self.window
+        {
+            // The window may have changed displays.
+            self.scheduler.sync_display(w);
         }
         if let Some(r) = &mut self.renderer {
             r.handle_event(&event);
@@ -473,7 +494,9 @@ impl ApplicationHandler for App {
                 self.scheduler.begin_frame();
 
                 let dt = FrameScheduler::animation_delta(
-                    self.renderer.as_ref().map_or(Duration::ZERO, Renderer::get_frametime),
+                    self.renderer
+                        .as_ref()
+                        .map_or(Duration::ZERO, Renderer::get_frametime),
                 );
                 let animating = self.demo.update(&self.input, dt);
                 if animating {
@@ -494,16 +517,17 @@ impl ApplicationHandler for App {
 
                     // Static mask: only rebuilt when `M` actually changed it.
                     if self.applied_mask != Some(self.demo.mask) {
-                        mask.set_clip_shape(Some(self.demo.mask.shape()))
+                        mask.set_clip(Some(self.demo.mask.shape()))
                             .expect("mask shapes are compile-time constants");
                         self.applied_mask = Some(self.demo.mask);
                     }
                     // Animated mask: re-set every frame — the stress case.
-                    spot.set_clip_shape(self.demo.spotlight_shape(&self.input))
+                    spot.set_clip(self.demo.spotlight_shape(&self.input))
                         .expect("circle shapes cannot fail to parse");
 
-                    if let Err(e) = r.render() {
-                        eprintln!("render error: {e}");
+                    match r.render() {
+                        Ok(outcome) => self.scheduler.finish_frame(outcome),
+                        Err(e) => eprintln!("render error: {e}"),
                     }
                 }
 

@@ -1,12 +1,12 @@
 [package]
-name = "Atomos"
+name = "atomos"
+rust-version = "1.98"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 bytemuck = { version = "1.18", features = ["derive"] }
 clap = { version = "4.6.1", features = ["derive"] }
-cosmic-text = "0.19.0"
 glyphon = "0.11.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
 lyon = "1.0.19"
@@ -14,5 +14,6 @@ lyon_extra = "1.1"
 pollster = "0.4"
 ropey = "1.6.1"
 swash = "0.2.9"
+unicode-segmentation = "1"
 wgpu = "29.0.4"
 winit = "0.30.13"
