@@ -81,7 +81,7 @@ fn a_clip_shape_cuts_the_layer_outside_it() {
         Rounding::NONE,
     );
     layer
-        .set_clip_shape(Some(ClipShape::Circle {
+        .set_clip(Some(ClipShape::Circle {
             center: (32.0, 32.0),
             radius: 10.0,
         }))
@@ -219,14 +219,19 @@ fn a_clean_layer_is_composited_without_re_rendering() {
     assert_eq!(passes(&layer), (1, 1), "clean frames run no layer passes");
     assert_near(scene.pixel(4, 4), [255, 0, 0, 255], 1);
 
-    layer.set_clip_rect(None);
+    // The layer clip applies when the group is composited, so changing it
+    // costs no content or effect pass.
+    layer
+        .set_clip(Some(ClipShape::Rectangle {
+            top_left: (0.0, 0.0),
+            size: (4.0, 4.0),
+            rounding: Rounding::NONE,
+        }))
+        .unwrap();
     scene.frame(1.0);
-    assert_eq!(passes(&layer), (1, 1), "an unchanged clip is not a change");
-
-    layer.set_clip_rect(Some(((0.0, 0.0), (4.0, 4.0))));
-    scene.frame(1.0);
-    assert_eq!(passes(&layer), (2, 2));
+    assert_eq!(passes(&layer), (1, 1));
     assert_near(scene.pixel(6, 6), [0, 0, 0, 255], 0);
+    assert_near(scene.pixel(2, 2), [255, 0, 0, 255], 1);
 }
 
 #[test]
@@ -251,6 +256,7 @@ fn changing_only_the_effect_reruns_only_the_effect() {
 fn a_dpi_change_rerenders_a_retained_layer() {
     let Some(mut scene) = scene() else { return };
     let layer = scene.layer();
+    layer.set_cache_policy(super::CachePolicy::Always);
     layer.draw_rectangle(
         (0.0, 0.0),
         (8.0, 8.0),
@@ -544,6 +550,112 @@ mod painter_order {
         assert_eq!(prepared.len(), 1);
         scene.frame(1.0);
         assert_eq!(layer.0.borrow().text_batch_states_for_test(), prepared);
-        assert_eq!(layer.0.borrow().content_passes, 1);
+        assert_eq!(layer.0.borrow().geometry_rebuilds, 1);
     }
+}
+
+#[test]
+fn a_clean_direct_layer_does_no_cpu_work_and_owns_no_target() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (8.0, 8.0),
+        Color::rgb(255, 0, 0),
+        Rounding::NONE,
+    );
+    scene.frame(1.0);
+    scene.frame(1.0);
+    scene.frame(1.0);
+    let inner = layer.0.borrow();
+    assert_eq!(inner.geometry_rebuilds, 1);
+    assert_eq!(
+        inner.content_passes, 0,
+        "direct layers have no content pass"
+    );
+    assert_eq!(inner.texture_size_for_test(), (1, 1));
+    drop(inner);
+    assert_near(scene.pixel(4, 4), [255, 0, 0, 255], 1);
+}
+
+#[test]
+fn a_direct_layer_follows_a_dpi_change_with_one_rebuild() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (8.0, 8.0),
+        Color::rgb(255, 0, 0),
+        Rounding::NONE,
+    );
+    scene.frame(1.0);
+    scene.frame(2.0);
+    scene.frame(2.0);
+    assert_eq!(layer.0.borrow().geometry_rebuilds, 2);
+    assert_near(scene.pixel(12, 4), [255, 0, 0, 255], 1);
+}
+
+#[test]
+fn a_layer_with_an_effect_becomes_a_group_and_back() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (8.0, 8.0),
+        Color::rgb(255, 0, 0),
+        Rounding::NONE,
+    );
+    layer.set_effect(Some(ShaderEffect::ColorMatrix(ColorMatrix::invert())));
+    scene.frame(1.0);
+    assert_eq!(layer.0.borrow().texture_size_for_test(), (64, 64));
+    assert_near(scene.pixel(4, 4), [0, 255, 255, 255], 1);
+
+    layer.set_effect(None);
+    scene.frame(1.0);
+    assert_eq!(layer.0.borrow().texture_size_for_test(), (1, 1));
+    assert_near(scene.pixel(4, 4), [255, 0, 0, 255], 1);
+}
+
+#[test]
+fn groups_and_direct_layers_keep_their_z_order() {
+    let Some(mut scene) = scene() else { return };
+    let bottom = scene.layer();
+    let middle = scene.layer();
+    let top = scene.layer();
+    for (layer, color) in [
+        (&bottom, Color::rgb(255, 0, 0)),
+        (&middle, Color::rgb(0, 255, 0)),
+        (&top, Color::rgb(0, 0, 255)),
+    ] {
+        layer.draw_rectangle((0.0, 0.0), (20.0, 20.0), color, Rounding::NONE);
+    }
+    // The middle layer is a cached group; the others draw directly.
+    middle.set_cache_policy(super::CachePolicy::Always);
+    scene.frame(1.0);
+    assert_near(scene.pixel(4, 4), [0, 0, 255, 255], 1);
+    top.clear();
+    scene.frame(1.0);
+    assert_near(scene.pixel(4, 4), [0, 255, 0, 255], 1);
+}
+
+#[test]
+fn a_blurred_layer_is_clipped_after_the_blur() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (64.0, 64.0),
+        Color::rgb(255, 255, 255),
+        Rounding::NONE,
+    );
+    layer.set_effect(Some(ShaderEffect::Blur { radius: 4.0 }));
+    layer
+        .set_clip(Some(ClipShape::Circle {
+            center: (32.0, 32.0),
+            radius: 10.0,
+        }))
+        .unwrap();
+    scene.frame(1.0);
+    assert_near(scene.pixel(32, 32), [255, 255, 255, 255], 2);
+    assert_near(scene.pixel(32, 50), [0, 0, 0, 255], 0);
 }

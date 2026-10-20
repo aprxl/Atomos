@@ -3,11 +3,11 @@
 //! Run with `cargo run --bin clip_demo`. Exercises both clip paths on
 //! `atomos::renderer::Layer`:
 //!
-//! - **Scissor** (`set_clip_rect`, the cheap everyday one): a viewport
+//! - **Scissor** (a pixel-aligned rectangle, the cheap everyday one): a viewport
 //!   panel whose scrolling content — text and bars alike — is cut off
 //!   hard at the panel edge by the hardware scissor. The scroll runs
 //!   forever; nothing outside the rect is ever shaded.
-//! - **Mask** (`set_clip_shape`, the arbitrary-shape one): a panel of
+//! - **Mask** (`set_clip` with any shape, via the stencil): a panel of
 //!   gradient + text content clipped by a shape cycled with `M` —
 //!   rounded rect, circle, star polygon, SVG heart path. The mask
 //!   rebuilds only on the keypress; a static shape costs one small pass
@@ -221,7 +221,7 @@ impl Demo {
             layer,
             SCISSOR_PANEL.0,
             SCISSOR_PANEL.1,
-            "SCISSOR — set_clip_rect, hardware, free",
+            "SCISSOR — aligned rectangle, hardware, free",
         );
         // The viewport slot the scissored content scrolls inside.
         layer.draw_rectangle(SCISSOR_VIEW.0, SCISSOR_VIEW.1, SLOT, Rounding::NONE);
@@ -230,7 +230,7 @@ impl Demo {
             layer,
             MASK_PANEL.0,
             MASK_PANEL.1,
-            "MASK — set_clip_shape, any geometry",
+            "STENCIL — set_clip, any geometry",
         );
         let ((mx, my), (_, mh)) = MASK_PANEL;
         label(
@@ -437,7 +437,13 @@ impl ApplicationHandler for App {
         let spot_layer = renderer.new_layer_top(LayerInvalidation::Automatic);
 
         // The scissor rect is panel-fixed: set once, clips forever.
-        scissor_layer.set_clip_rect(Some(SCISSOR_VIEW));
+        scissor_layer
+            .set_clip(Some(ClipShape::Rectangle {
+                top_left: SCISSOR_VIEW.0,
+                size: SCISSOR_VIEW.1,
+                rounding: Rounding::NONE,
+            }))
+            .expect("rectangles cannot fail to parse");
 
         self.input = Input::new(window.scale_factor());
         self.window = Some(window);
@@ -502,12 +508,12 @@ impl ApplicationHandler for App {
 
                     // Static mask: only rebuilt when `M` actually changed it.
                     if self.applied_mask != Some(self.demo.mask) {
-                        mask.set_clip_shape(Some(self.demo.mask.shape()))
+                        mask.set_clip(Some(self.demo.mask.shape()))
                             .expect("mask shapes are compile-time constants");
                         self.applied_mask = Some(self.demo.mask);
                     }
                     // Animated mask: re-set every frame — the stress case.
-                    spot.set_clip_shape(self.demo.spotlight_shape(&self.input))
+                    spot.set_clip(self.demo.spotlight_shape(&self.input))
                         .expect("circle shapes cannot fail to parse");
 
                     match r.render() {

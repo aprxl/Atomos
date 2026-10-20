@@ -1,17 +1,25 @@
-//! [`Layer`] — a retained, independently-cached drawing surface.
+//! [`Layer`] — a retained, z-ordered drawing unit.
 //!
-//! A `Layer` owns its own offscreen GPU texture and a queue of pending
-//! [`DrawCommand`]s. Calling a `draw_*` method never touches the GPU
-//! directly — it only records a command and marks the layer dirty; the
-//! actual tessellation, upload, and render-to-texture happen lazily inside
-//! [`super::Renderer::render`]. Clean textures are retained: a frame where a
-//! layer is unchanged only composites its cached content (and effect output)
-//! onto the screen, in bottom-to-top order, without re-running its passes.
+//! A `Layer` holds a queue of pending [`DrawCommand`]s in logical pixels.
+//! Calling a `draw_*` method never touches the GPU directly — it only
+//! records a command and marks the layer dirty; the actual tessellation,
+//! upload and text preparation happen lazily inside
+//! [`super::Renderer::render`].
 //!
-//! Because a layer renders into its own texture, applying a shader to
-//! "everything in the layer" later just means swapping which pipeline the
-//! composite step binds for that layer — the seam is already here, just
-//! unused for now (see `LayerPipelines::composite_pipeline`).
+//! Commands paint in the order they were issued, whatever their kind: a
+//! later shape covers earlier text and images. Layers stack bottom to top.
+//!
+//! By default a layer owns no render target. Its retained geometry is
+//! replayed straight into the frame's single multisampled pass, so a plain
+//! layer costs no texture memory. Only a layer that needs its pixels
+//! isolated — it has a [`ShaderEffect`], or asked for
+//! [`CachePolicy::Always`] — renders into an offscreen texture, which is
+//! retained until the layer changes and then composited as one quad.
+//!
+//! Clipping is a scope, not a surface: [`Layer::with_clip`] clips what a
+//! closure draws, [`Layer::set_clip`] clips the whole layer (after any
+//! effect). Pixel-aligned rectangles are hardware scissors; every other
+//! shape uses one shared stencil buffer.
 //!
 //! `Layer` is a cheap-to-clone handle (`Rc<RefCell<LayerInner>>`); dropping
 //! every clone of a given layer removes it from the renderer's composite
@@ -98,10 +106,9 @@ enum InvalidationState {
     Manual { dirty: bool },
 }
 
-/// An arbitrary clip shape for [`Layer::set_clip_shape`] — the layer's
-/// composited output is multiplied by this shape's coverage, so content
-/// only shows where the shape is. All coordinates are logical pixels, the
-/// same convention as every `draw_*` call.
+/// An arbitrary clip shape for [`Layer::with_clip`] and [`Layer::set_clip`]:
+/// content only shows where the shape is. All coordinates are logical
+/// pixels, the same convention as every `draw_*` call.
 ///
 /// Variants mirror the solid-geometry `draw_*` calls (rectangle including
 /// rounded corners, circle, polygon, SVG path), and are tessellated by the
@@ -110,8 +117,8 @@ enum InvalidationState {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClipShape {
     /// Axis-aligned rectangle, optionally rounded. For an *unrounded*
-    /// rectangle prefer [`Layer::set_clip_rect`], which is cheaper (a
-    /// hardware scissor, no mask texture at all).
+    /// rectangle on whole pixels this is a free hardware scissor; any other
+    /// shape uses the stencil.
     Rectangle {
         top_left: (f32, f32),
         size: (f32, f32),
@@ -203,41 +210,6 @@ fn vs_main(
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return textureSample(tex, samp, in.uv);
-}
-"#;
-
-/// [`COMPOSITE_SHADER_SRC`] plus a mask texture: the layer is multiplied
-/// by the mask's alpha (its rendered coverage), which is what
-/// [`Layer::set_clip_shape`] clips with. Layer textures are premultiplied
-/// and composited with `PREMULTIPLIED_ALPHA_BLENDING`, so colour and alpha
-/// are scaled together; scaling alpha alone leaves the colour to be added
-/// over whatever is below, and nothing outside the shape is cut.
-const MASKED_COMPOSITE_SHADER_SRC: &str = r#"
-struct VsOut {
-    @builtin(position) clip_pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(
-    @location(0) in_pos: vec2<f32>,
-    @location(1) in_uv: vec2<f32>,
-) -> VsOut {
-    var out: VsOut;
-    out.clip_pos = vec4<f32>(in_pos, 0.0, 1.0);
-    out.uv = in_uv;
-    return out;
-}
-
-@group(0) @binding(0) var tex: texture_2d<f32>;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var mask_tex: texture_2d<f32>;
-
-@fragment
-fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let c = textureSample(tex, samp, in.uv);
-    let m = textureSample(mask_tex, samp, in.uv).a;
-    return c * m;
 }
 "#;
 
@@ -497,13 +469,6 @@ pub(super) struct LayerPipelines {
     image_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     composite_bind_group_layout: wgpu::BindGroupLayout,
-    // Composite variant for layers with a `set_clip_shape` mask: same
-    // shader plus a mask texture at binding 2. A separate pipeline (chosen
-    // per layer in `LayerInner::composite`) rather than a 1x1-white-mask
-    // fallback bound on every unclipped layer — unclipped layers keep
-    // paying exactly what they paid before masks existed.
-    masked_composite_pipeline: wgpu::RenderPipeline,
-    masked_composite_bind_group_layout: wgpu::BindGroupLayout,
     composite_sampler: wgpu::Sampler,
     composite_quad_vbuf: wgpu::Buffer,
     // `ShaderEffect` pipelines — see `shader.rs`'s module doc. Both are
@@ -691,52 +656,10 @@ impl LayerPipelines {
         let composite_pipeline = build_composite_pipeline(
             device,
             surface_format,
+            msaa_sample_count,
             "atomos-layer-composite",
             COMPOSITE_SHADER_SRC,
             &composite_bind_group_layout,
-        );
-
-        // The masked variant's layout: the composite pair plus the mask
-        // texture. The sampler is shared — mask and source are the same
-        // size, sampled at the same UVs.
-        let masked_composite_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("atomos-layer-masked-composite-bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-        let masked_composite_pipeline = build_composite_pipeline(
-            device,
-            surface_format,
-            "atomos-layer-masked-composite",
-            MASKED_COMPOSITE_SHADER_SRC,
-            &masked_composite_bind_group_layout,
         );
 
         let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -825,8 +748,6 @@ impl LayerPipelines {
             image_pipeline,
             composite_pipeline,
             composite_bind_group_layout,
-            masked_composite_pipeline,
-            masked_composite_bind_group_layout,
             composite_sampler,
             composite_quad_vbuf,
             blur_pipeline,
@@ -891,6 +812,7 @@ fn build_stencil_clip_pipeline(
 fn build_composite_pipeline(
     device: &wgpu::Device,
     surface_format: wgpu::TextureFormat,
+    msaa_sample_count: u32,
     label: &str,
     shader_src: &str,
     bind_group_layout: &wgpu::BindGroupLayout,
@@ -932,8 +854,12 @@ fn build_composite_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
+        depth_stencil: Some(content_stencil_state()),
+        multisample: wgpu::MultisampleState {
+            count: msaa_sample_count,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
         multiview_mask: None,
         cache: None,
     })
@@ -1168,6 +1094,15 @@ enum ReplayOp {
     ClipPop,
 }
 
+/// The whole-layer clip resolved against the current scale and size: a
+/// scissor, or geometry in buffers of its own (so changing the clip never
+/// rebuilds the layer's content).
+struct LayerClipGpu {
+    op: ReplayOp,
+    vertex_buffer: Option<wgpu::Buffer>,
+    index_buffer: Option<wgpu::Buffer>,
+}
+
 /// A run of consecutive text commands with its own glyphon renderer.
 struct TextBatch {
     renderer: glyphon::TextRenderer,
@@ -1190,8 +1125,6 @@ pub(super) struct LayerInner {
     image_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     composite_bind_group_layout: wgpu::BindGroupLayout,
-    masked_composite_pipeline: wgpu::RenderPipeline,
-    masked_composite_bind_group_layout: wgpu::BindGroupLayout,
     composite_sampler: wgpu::Sampler,
     composite_quad_vbuf: wgpu::Buffer,
     format: wgpu::TextureFormat,
@@ -1256,22 +1189,26 @@ pub(super) struct LayerInner {
     // binding 0) can be rebuilt whenever the source is repointed.
     composite_source_view: wgpu::TextureView,
 
-    // `set_clip_rect`'s rect as logical-pixel `[x, y, w, h]` (mirrors
-    // `effect`'s logical-units convention) — converted to a physical
-    // scissor rect against the *current* scale factor every frame in
-    // `render_to_texture`, so DPI changes never leave it stale.
-    clip_rect: Option<[f32; 4]>,
-    // `set_clip_shape`'s shape, logical pixels; `mask_gpu` is the GPU
-    // state built from it (`None`/`None` when unclipped). Caller-driven
-    // like `effect`, not part of `pending`'s per-frame content hash.
-    clip_shape: Option<ClipShape>,
-    mask_gpu: Option<MaskGpu>,
+    // `set_clip`'s whole-layer clip, logical pixels. It is the outermost
+    // scope of the layer: wrapped around the replayed ops of a direct layer
+    // and around the composite of a group (so an effect is clipped too).
+    clip: Option<ClipShape>,
+    // How `clip` is applied, resolved at build time against the current
+    // scale and size: a scissor, or a range of the solid index buffer
+    // drawn into the stencil.
+    layer_clip: Option<LayerClipGpu>,
+    // `CachePolicy::Always`: keep this layer in an offscreen texture even
+    // without an effect.
+    cache_always: bool,
+    // Size of `texture`: the surface for a group, 1x1 for a direct layer
+    // (which draws straight into the frame and owns no real target).
+    texture_size: (u32, u32),
 
     // Current DPI scale factor — every `draw_*` method multiplies its
     // caller-supplied *logical*-pixel arguments by this before building a
     // `DrawCommand`, so `DrawCommand`/tessellation/glyph rasterization all
     // stay physical-pixel internally (crisp, no upscale blur) while callers
-    // never have to think about DPI. Kept in sync lazily by `render_layers`
+    // never have to think about DPI. Kept in sync lazily by `render_frame`
     // (same pull-based pattern as `resize_if_needed`), not pushed on
     // change.
     scale_factor: f32,
@@ -1295,6 +1232,9 @@ pub(super) struct LayerInner {
     /// uniform patches.
     #[cfg(test)]
     pub(super) effect_rebuilds: u32,
+    /// Geometry/op rebuilds, to prove clean direct layers do no CPU work.
+    #[cfg(test)]
+    pub(super) geometry_rebuilds: u32,
 }
 
 /// GPU state for one `DrawCommand::Image`, rebuilt whenever the layer
@@ -1306,26 +1246,6 @@ struct ImageDraw {
     #[allow(dead_code)] // owns the GPU resource its bind group points at
     texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
-}
-
-/// GPU state for one layer's [`ClipShape`] mask: the mask's own
-/// (surface-sized, single-sample) texture, the tessellated shape geometry
-/// that gets rendered into it, and the masked-composite bind group
-/// (composite source + sampler + mask). Rebuilt by
-/// [`LayerInner::rebuild_mask`] on shape/size/DPI change; `dirty` means the
-/// geometry hasn't been rendered into the texture yet — the actual render
-/// pass runs lazily in [`LayerInner::render_mask_if_needed`], which is
-/// where the shared MSAA scratch target is available.
-struct MaskGpu {
-    // Also consulted by `rebuild_mask`'s size check to decide whether the
-    // texture can be reused across shape changes.
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    bind_group: wgpu::BindGroup,
-    vertex_buffer: Option<wgpu::Buffer>,
-    index_buffer: Option<wgpu::Buffer>,
-    num_indices: u32,
-    dirty: bool,
 }
 
 impl LayerInner {
@@ -1343,7 +1263,8 @@ impl LayerInner {
         scale_factor: f32,
         invalidation: LayerInvalidation,
     ) -> Self {
-        let (texture, texture_view) = create_layer_texture(device, format, size);
+        // Direct layers own no real target; groups get one in `sync_target`.
+        let (texture, texture_view) = create_layer_texture(device, format, (1, 1));
         let screen_size_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("atomos-layer-screen-size-ubo"),
             contents: bytemuck::bytes_of(&ScreenSize {
@@ -1380,10 +1301,6 @@ impl LayerInner {
             image_pipeline: pipelines.image_pipeline.clone(),
             composite_pipeline: pipelines.composite_pipeline.clone(),
             composite_bind_group_layout: pipelines.composite_bind_group_layout.clone(),
-            masked_composite_pipeline: pipelines.masked_composite_pipeline.clone(),
-            masked_composite_bind_group_layout: pipelines
-                .masked_composite_bind_group_layout
-                .clone(),
             composite_sampler: pipelines.composite_sampler.clone(),
             composite_quad_vbuf: pipelines.composite_quad_vbuf.clone(),
             format,
@@ -1407,9 +1324,10 @@ impl LayerInner {
             colormatrix_bind_group_layout: pipelines.colormatrix_bind_group_layout.clone(),
             effect: None,
             effect_gpu: None,
-            clip_rect: None,
-            clip_shape: None,
-            mask_gpu: None,
+            clip: None,
+            layer_clip: None,
+            cache_always: false,
+            texture_size: (1, 1),
             scale_factor,
             pending: Vec::new(),
             invalidation: invalidation_state,
@@ -1421,6 +1339,8 @@ impl LayerInner {
             effect_passes: 0,
             #[cfg(test)]
             effect_rebuilds: 0,
+            #[cfg(test)]
+            geometry_rebuilds: 0,
         }
     }
 
@@ -1443,17 +1363,14 @@ impl LayerInner {
         }
     }
 
-    /// Resize the offscreen texture (and everything that references it) to
-    /// match the current surface size. Cached vertex/index data is left
-    /// alone — `DrawCommand` positions are already absolute pixel
-    /// coordinates, so they stay correct on a resized canvas without
-    /// re-tessellating.
+    /// Track the surface size: the screen-size uniform, the text viewport,
+    /// and everything built against the old size (clip scissors) are
+    /// refreshed. A group's texture is resized by [`LayerInner::sync_target`].
     fn resize_if_needed(&mut self, size: (u32, u32)) {
         if size == self.size {
             return;
         }
         self.size = size;
-        let (texture, texture_view) = create_layer_texture(&self.device, self.format, size);
         self.queue.write_buffer(
             &self.screen_size_buffer,
             0,
@@ -1461,30 +1378,96 @@ impl LayerInner {
                 screen_size: [size.0 as f32, size.1 as f32],
             }),
         );
+        // Shared across every layer, so this runs redundantly once per
+        // layer on an actual resize — harmless, it's just a small
+        // `Resolution` update.
+        self.text_stack.borrow_mut().resize(&self.queue, size);
+        // Clip scopes were resolved against the old size.
+        self.rebuild_layer_clip();
+        self.mark_for_rebuild();
+    }
+
+    /// Resolve `clip` against the current scale and size. Cheap, and
+    /// independent of the layer's content.
+    fn rebuild_layer_clip(&mut self) {
+        let Some(shape) = self.clip.clone() else {
+            self.layer_clip = None;
+            return;
+        };
+        if let Some(rect) = scissor_for_clip(&shape, self.scale_factor, self.size) {
+            self.layer_clip = Some(LayerClipGpu {
+                op: ReplayOp::ClipScissor(rect),
+                vertex_buffer: None,
+                index_buffer: None,
+            });
+            return;
+        }
+        let geometry = clip_shape_to_command(&shape, self.scale_factor);
+        let mut tessellator = FillTessellator::new();
+        let mut stroke_tessellator = StrokeTessellator::new();
+        let (vertices, indices) =
+            tessellate_command(&geometry, &mut tessellator, &mut stroke_tessellator);
+        let vertex_buffer = (!vertices.is_empty()).then(|| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("atomos-layer-clip-vbuf"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
+        let index_buffer = (!indices.is_empty()).then(|| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("atomos-layer-clip-ibuf"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                })
+        });
+        self.layer_clip = Some(LayerClipGpu {
+            op: ReplayOp::ClipStencil(0..indices.len() as u32),
+            vertex_buffer,
+            index_buffer,
+        });
+    }
+
+    /// Force the next `rebuild_if_needed` to rebuild geometry and ops.
+    fn mark_for_rebuild(&mut self) {
+        match &mut self.invalidation {
+            InvalidationState::Automatic { last_hash } => *last_hash = None,
+            InvalidationState::Manual { dirty } => *dirty = true,
+        }
+    }
+
+    /// Whether this layer renders into an offscreen texture that is then
+    /// composited: it has an effect, or asked to be cached. Every other
+    /// layer is drawn straight into the frame and owns no real target.
+    fn is_group(&self) -> bool {
+        self.effect.is_some() || self.cache_always
+    }
+
+    /// Give a group a surface-sized texture and a direct layer a 1x1
+    /// placeholder, reallocating (and rebuilding what samples it) only when
+    /// that changes. This is what keeps a plain layer from costing a
+    /// surface-sized allocation.
+    fn sync_target(&mut self) {
+        let wanted = if self.is_group() { self.size } else { (1, 1) };
+        if self.texture_size == wanted {
+            return;
+        }
+        self.texture_size = wanted;
+        let (texture, texture_view) = create_layer_texture(&self.device, self.format, wanted);
         self.texture = texture;
         self.texture_view = texture_view;
         self.content_texture_dirty = true;
         self.effect_texture_dirty = true;
         self.set_composite_source(self.texture_view.clone());
-        // Shared across every layer, so this runs redundantly once per
-        // layer on an actual resize — harmless, it's just a small
-        // `Resolution` update.
-        self.text_stack.borrow_mut().resize(&self.queue, size);
-
         if self.effect.is_some() {
             self.rebuild_effect_gpu();
-        }
-        // After the effect rebuild — the mask's bind group samples the
-        // final composite source (the effect's output when one is active).
-        if self.clip_shape.is_some() {
-            self.rebuild_mask();
         }
     }
 
     /// Repoint what the composite step samples from: `texture_view`
-    /// directly, or an active effect's output. The single place both the
-    /// plain composite bind group and (when a clip mask is active) the
-    /// masked one get rebuilt, so they can never disagree on the source.
+    /// directly, or an active effect's output.
     fn set_composite_source(&mut self, view: wgpu::TextureView) {
         self.composite_bind_group = create_composite_bind_group(
             &self.device,
@@ -1493,15 +1476,6 @@ impl LayerInner {
             &view,
         );
         self.composite_source_view = view;
-        if let Some(mask) = &mut self.mask_gpu {
-            mask.bind_group = create_masked_composite_bind_group(
-                &self.device,
-                &self.masked_composite_bind_group_layout,
-                &self.composite_sampler,
-                &self.composite_source_view,
-                &mask.view,
-            );
-        }
     }
 
     /// (Re)build `effect_gpu` from `self.effect` (`None` clears it) and
@@ -1773,128 +1747,14 @@ impl LayerInner {
                 InvalidationState::Automatic { last_hash } => *last_hash = None,
                 InvalidationState::Manual { dirty } => *dirty = true,
             }
-            // The scissor and a blur radius are in logical units too.
+            // The layer clip and a blur radius are in logical units too.
+            self.rebuild_layer_clip();
             self.content_texture_dirty = true;
             if let Some(effect) = self.effect.clone()
                 && !self.update_effect_uniforms(&effect)
             {
                 self.rebuild_effect_gpu();
             }
-        }
-        // A clip mask's geometry is baked at physical scale and nothing
-        // re-issues it per frame, so re-derive it from the logical-units
-        // shape here; a DPI change must not leave the mask at the old
-        // density.
-        if changed && self.clip_shape.is_some() {
-            self.rebuild_mask();
-        }
-    }
-
-    /// (Re)build `mask_gpu` from `clip_shape` (`None` clears it) at the
-    /// layer's current `size`/`scale_factor`: tessellate the shape through
-    /// the exact same code path drawn geometry uses (flat white fill — the
-    /// mask only ever reads coverage/alpha), upload it, and mark the mask
-    /// texture dirty for `render_mask_if_needed` to fill next frame.
-    fn rebuild_mask(&mut self) {
-        let Some(shape) = &self.clip_shape else {
-            self.mask_gpu = None;
-            return;
-        };
-        let command = clip_shape_to_command(shape, self.scale_factor);
-        let mut tessellator = FillTessellator::new();
-        let mut stroke_tessellator = StrokeTessellator::new();
-        let (vertices, indices) =
-            tessellate_command(&command, &mut tessellator, &mut stroke_tessellator);
-
-        let vertex_buffer = (!vertices.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("atomos-layer-mask-vbuf"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
-        let index_buffer = (!indices.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("atomos-layer-mask-ibuf"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                })
-        });
-
-        // An animated clip re-sets its shape every frame — keep the mask
-        // texture and its bind group across rebuilds so that path costs new
-        // geometry buffers and one mask pass, not a fresh surface-sized
-        // texture allocation per frame. The size check falls through to a
-        // full rebuild after a resize (`resize_if_needed` updates
-        // `self.size` before calling this).
-        if let Some(mask) = &mut self.mask_gpu
-            && mask.texture.width() == self.size.0.max(1)
-            && mask.texture.height() == self.size.1.max(1)
-        {
-            mask.vertex_buffer = vertex_buffer;
-            mask.index_buffer = index_buffer;
-            mask.num_indices = indices.len() as u32;
-            mask.dirty = true;
-            return;
-        }
-
-        let (texture, view) = create_layer_texture(&self.device, self.format, self.size);
-        let bind_group = create_masked_composite_bind_group(
-            &self.device,
-            &self.masked_composite_bind_group_layout,
-            &self.composite_sampler,
-            &self.composite_source_view,
-            &view,
-        );
-        self.mask_gpu = Some(MaskGpu {
-            texture,
-            view,
-            bind_group,
-            vertex_buffer,
-            index_buffer,
-            num_indices: indices.len() as u32,
-            dirty: true,
-        });
-    }
-
-    /// Render the clip-mask geometry into the mask texture if it changed
-    /// since last rendered — a no-op every frame the mask is unchanged, so
-    /// a static clip costs one small pass total, not one per frame. Runs
-    /// through the shared MSAA scratch target (same as `render_to_texture`)
-    /// so mask edges get the same antialiasing drawn geometry gets.
-    fn render_mask_if_needed(&mut self, encoder: &mut wgpu::CommandEncoder, msaa: &MsaaTarget) {
-        let Some(mask) = &mut self.mask_gpu else {
-            return;
-        };
-        if !mask.dirty {
-            return;
-        }
-        mask.dirty = false;
-
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("atomos-layer-mask-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &msaa.color_view,
-                depth_slice: None,
-                resolve_target: Some(&mask.view),
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Discard,
-                },
-            })],
-            depth_stencil_attachment: Some(stencil_attachment(&msaa.stencil_view)),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        if let (Some(vbuf), Some(ibuf)) = (&mask.vertex_buffer, &mask.index_buffer) {
-            rpass.set_pipeline(&self.solid_pipeline);
-            rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
-            rpass.set_vertex_buffer(0, vbuf.slice(..));
-            rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            rpass.draw_indexed(0..mask.num_indices, 0, 0..1);
         }
     }
 
@@ -2108,6 +1968,10 @@ impl LayerInner {
         }
         self.ops = ops;
         self.assign_text_batches(text_runs);
+        #[cfg(test)]
+        {
+            self.geometry_rebuilds += 1;
+        }
 
         self.num_indices = indices.len() as u32;
         // Fresh GPU buffers on every rebuild rather than `write_buffer`
@@ -2143,6 +2007,11 @@ impl LayerInner {
 
     /// Give each text run a batch, reusing batches (and their glyphon
     /// renderers) by position so an unchanged run keeps its prepared state.
+    #[cfg(test)]
+    pub(super) fn texture_size_for_test(&self) -> (u32, u32) {
+        self.texture_size
+    }
+
     #[cfg(test)]
     pub(super) fn text_batch_states_for_test(&self) -> Vec<Option<(u64, u64)>> {
         self.text_batches
@@ -2222,118 +2091,100 @@ impl LayerInner {
             multiview_mask: None,
         });
 
-        // The layer-wide scissor (`set_clip_rect`) is the outermost clip
-        // scope. Physical-px conversion happens here, against the current
-        // scale factor, so the stored logical rect never goes stale across
-        // DPI changes. `LoadOp::Clear` above ignores scissors, which is
-        // exactly right: outside the rect stays transparent.
-        let surface = [0, 0, self.size.0, self.size.1];
-        let base = match self.clip_rect {
-            Some([x, y, w, h]) => {
-                let s = self.scale_factor;
-                let rect = clamp_scissor(x * s, y * s, (x + w) * s, (y + h) * s, self.size);
-                if rect[2] == 0 || rect[3] == 0 {
-                    // Fully clipped: the clear above already emptied the
-                    // texture, and recording zero draws is the cheapest
-                    // frame there is.
-                    return;
-                }
-                rect
-            }
-            None => surface,
-        };
-        if base != surface {
-            rpass.set_scissor_rect(base[0], base[1], base[2], base[3]);
-        }
-        self.replay_ops(&mut rpass, base);
+        // A group's content is drawn unclipped; the layer clip applies when
+        // it is composited (so an effect is clipped too).
+        let mut clip = ClipStack::new([0, 0, self.size.0, self.size.1]);
+        self.replay_ops(&mut rpass, &mut clip);
     }
 
-    /// Record this layer's ops in draw order, maintaining the clip stack:
-    /// pixel-aligned rectangle clips tighten the scissor, every other shape
-    /// is drawn into the stencil and tested against by all content.
-    fn replay_ops(&self, rpass: &mut wgpu::RenderPass<'_>, base: [u32; 4]) {
-        /// What a `ClipPop` must undo.
-        enum Scope {
-            /// Restore this scissor.
-            Scissor([u32; 4]),
-            /// Redraw this shape with the decrementing pipeline.
-            Stencil(std::ops::Range<u32>),
-            /// The scope drew nothing (empty intersection, or nested past
-            /// the stencil's depth); only its closing needs tracking.
-            Skipped,
-            /// A clip that could not be applied but must stay balanced.
-            Noop,
+    /// Enter a clip scope: a pixel-aligned rectangle tightens the scissor,
+    /// any other shape is drawn into the stencil and tested against by all
+    /// content after it.
+    fn clip_open(
+        &self,
+        rpass: &mut wgpu::RenderPass<'_>,
+        clip: &mut ClipStack,
+        op: &ReplayOp,
+        buffers: (&Option<wgpu::Buffer>, &Option<wgpu::Buffer>),
+    ) {
+        if clip.skipping > 0 {
+            clip.skipping += 1;
+            clip.scopes.push(Scope::Skipped);
+            return;
         }
-        /// Deepest stencil nesting: the clear value 0 up to the 8-bit max.
-        const MAX_CLIP_DEPTH: u32 = 255;
+        match op {
+            ReplayOp::ClipScissor(rect) => {
+                let next = intersect_scissor(clip.scissor, *rect);
+                if next[2] == 0 || next[3] == 0 {
+                    clip.skipping += 1;
+                    clip.scopes.push(Scope::Skipped);
+                } else {
+                    clip.scopes.push(Scope::Scissor(clip.scissor));
+                    clip.scissor = next;
+                    rpass.set_scissor_rect(next[0], next[1], next[2], next[3]);
+                }
+            }
+            ReplayOp::ClipStencil(range) => {
+                let (Some(vbuf), Some(ibuf)) = buffers else {
+                    clip.scopes.push(Scope::Noop);
+                    return;
+                };
+                if clip.depth >= MAX_CLIP_DEPTH {
+                    clip.scopes.push(Scope::Noop);
+                    return;
+                }
+                rpass.set_pipeline(&self.stencil_incr_pipeline);
+                rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+                rpass.set_vertex_buffer(0, vbuf.slice(..));
+                rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.set_stencil_reference(clip.depth);
+                rpass.draw_indexed(range.clone(), 0, 0..1);
+                clip.depth += 1;
+                clip.scopes
+                    .push(Scope::Stencil(range.clone(), vbuf.clone(), ibuf.clone()));
+            }
+            _ => {}
+        }
+    }
 
-        let mut scissor = base;
-        let mut depth: u32 = 0;
-        let mut skipping: u32 = 0;
-        let mut scopes: Vec<Scope> = Vec::new();
+    /// Leave the innermost clip scope; a stray close is ignored.
+    fn clip_close(&self, rpass: &mut wgpu::RenderPass<'_>, clip: &mut ClipStack) {
+        match clip.scopes.pop() {
+            Some(Scope::Scissor(previous)) => {
+                clip.scissor = previous;
+                rpass.set_scissor_rect(previous[0], previous[1], previous[2], previous[3]);
+            }
+            Some(Scope::Stencil(range, vbuf, ibuf)) => {
+                rpass.set_pipeline(&self.stencil_decr_pipeline);
+                rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
+                rpass.set_vertex_buffer(0, vbuf.slice(..));
+                rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.set_stencil_reference(clip.depth);
+                rpass.draw_indexed(range, 0, 0..1);
+                clip.depth -= 1;
+            }
+            Some(Scope::Skipped) => clip.skipping -= 1,
+            Some(Scope::Noop) | None => {}
+        }
+    }
 
+    /// Close every scope still open, restoring scissor and stencil so the
+    /// next layer starts clean.
+    fn clip_close_all(&self, rpass: &mut wgpu::RenderPass<'_>, clip: &mut ClipStack) {
+        while !clip.scopes.is_empty() {
+            self.clip_close(rpass, clip);
+        }
+    }
+
+    /// Record this layer's ops in draw order.
+    fn replay_ops(&self, rpass: &mut wgpu::RenderPass<'_>, clip: &mut ClipStack) {
         for op in &self.ops {
             match op {
-                ReplayOp::ClipScissor(rect) => {
-                    if skipping > 0 {
-                        skipping += 1;
-                        scopes.push(Scope::Skipped);
-                        continue;
-                    }
-                    let next = intersect_scissor(scissor, *rect);
-                    if next[2] == 0 || next[3] == 0 {
-                        skipping += 1;
-                        scopes.push(Scope::Skipped);
-                    } else {
-                        scopes.push(Scope::Scissor(scissor));
-                        scissor = next;
-                        rpass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
-                    }
+                ReplayOp::ClipScissor(_) | ReplayOp::ClipStencil(_) => {
+                    self.clip_open(rpass, clip, op, (&self.vertex_buffer, &self.index_buffer))
                 }
-                ReplayOp::ClipStencil(range) => {
-                    if skipping > 0 {
-                        skipping += 1;
-                        scopes.push(Scope::Skipped);
-                        continue;
-                    }
-                    let (Some(vbuf), Some(ibuf)) = (&self.vertex_buffer, &self.index_buffer) else {
-                        scopes.push(Scope::Noop);
-                        continue;
-                    };
-                    if depth >= MAX_CLIP_DEPTH {
-                        scopes.push(Scope::Noop);
-                        continue;
-                    }
-                    rpass.set_pipeline(&self.stencil_incr_pipeline);
-                    rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
-                    rpass.set_vertex_buffer(0, vbuf.slice(..));
-                    rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    rpass.set_stencil_reference(depth);
-                    rpass.draw_indexed(range.clone(), 0, 0..1);
-                    depth += 1;
-                    scopes.push(Scope::Stencil(range.clone()));
-                }
-                ReplayOp::ClipPop => match scopes.pop() {
-                    Some(Scope::Scissor(previous)) => {
-                        scissor = previous;
-                        rpass.set_scissor_rect(scissor[0], scissor[1], scissor[2], scissor[3]);
-                    }
-                    Some(Scope::Stencil(range)) => {
-                        if let (Some(vbuf), Some(ibuf)) = (&self.vertex_buffer, &self.index_buffer)
-                        {
-                            rpass.set_pipeline(&self.stencil_decr_pipeline);
-                            rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
-                            rpass.set_vertex_buffer(0, vbuf.slice(..));
-                            rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                            rpass.set_stencil_reference(depth);
-                            rpass.draw_indexed(range, 0, 0..1);
-                        }
-                        depth -= 1;
-                    }
-                    Some(Scope::Skipped) => skipping -= 1,
-                    Some(Scope::Noop) | None => {}
-                },
-                _ if skipping > 0 => {}
+                ReplayOp::ClipPop => self.clip_close(rpass, clip),
+                _ if clip.skipping > 0 => {}
                 ReplayOp::Solid(range) => {
                     let (Some(vbuf), Some(ibuf)) = (&self.vertex_buffer, &self.index_buffer) else {
                         continue;
@@ -2342,13 +2193,13 @@ impl LayerInner {
                     rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
                     rpass.set_vertex_buffer(0, vbuf.slice(..));
                     rpass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    rpass.set_stencil_reference(depth);
+                    rpass.set_stencil_reference(clip.depth);
                     rpass.draw_indexed(range.clone(), 0, 0..1);
                 }
                 ReplayOp::Images(range) => {
                     rpass.set_pipeline(&self.image_pipeline);
                     rpass.set_bind_group(0, &self.screen_size_bind_group, &[]);
-                    rpass.set_stencil_reference(depth);
+                    rpass.set_stencil_reference(clip.depth);
                     for image_draw in &self.image_draws[range.clone()] {
                         rpass.set_bind_group(1, &image_draw.bind_group, &[]);
                         rpass.set_vertex_buffer(0, image_draw.vertex_buffer.slice(..));
@@ -2356,7 +2207,7 @@ impl LayerInner {
                     }
                 }
                 ReplayOp::Text(batch) => {
-                    rpass.set_stencil_reference(depth);
+                    rpass.set_stencil_reference(clip.depth);
                     if let Err(e) = self
                         .text_stack
                         .borrow()
@@ -2369,22 +2220,80 @@ impl LayerInner {
         }
     }
 
-    /// Composite this layer's already-rendered texture onto `view`
-    /// (expected to already contain everything drawn below it — the caller
-    /// is responsible for `LoadOp::Load` and drawing layers in
-    /// bottom-to-top order).
-    fn composite(&self, rpass: &mut wgpu::RenderPass<'_>) {
-        // Masked layers pay one extra fullscreen texture sample here;
-        // unclipped layers take the exact pre-mask path.
-        if let Some(mask) = &self.mask_gpu {
-            rpass.set_pipeline(&self.masked_composite_pipeline);
-            rpass.set_bind_group(0, &mask.bind_group, &[]);
-        } else {
+    /// Draw a direct layer into the frame: its ops, inside its layer clip.
+    fn record_direct(&self, rpass: &mut wgpu::RenderPass<'_>, surface: [u32; 4]) {
+        if self.ops.is_empty() {
+            return;
+        }
+        let mut clip = ClipStack::new(surface);
+        if let Some(layer_clip) = &self.layer_clip {
+            self.clip_open(
+                rpass,
+                &mut clip,
+                &layer_clip.op,
+                (&layer_clip.vertex_buffer, &layer_clip.index_buffer),
+            );
+        }
+        self.replay_ops(rpass, &mut clip);
+        self.clip_close_all(rpass, &mut clip);
+    }
+
+    /// Composite a group's finished texture (or effect output) into the
+    /// frame, inside the layer clip.
+    fn record_group(&self, rpass: &mut wgpu::RenderPass<'_>, surface: [u32; 4]) {
+        let mut clip = ClipStack::new(surface);
+        if let Some(layer_clip) = &self.layer_clip {
+            self.clip_open(
+                rpass,
+                &mut clip,
+                &layer_clip.op,
+                (&layer_clip.vertex_buffer, &layer_clip.index_buffer),
+            );
+        }
+        if clip.skipping == 0 {
             rpass.set_pipeline(&self.composite_pipeline);
             rpass.set_bind_group(0, &self.composite_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.composite_quad_vbuf.slice(..));
+            rpass.set_stencil_reference(clip.depth);
+            rpass.draw(0..6, 0..1);
         }
-        rpass.set_vertex_buffer(0, self.composite_quad_vbuf.slice(..));
-        rpass.draw(0..6, 0..1);
+        self.clip_close_all(rpass, &mut clip);
+    }
+}
+
+/// What closing a clip scope must undo.
+enum Scope {
+    /// Restore this scissor.
+    Scissor([u32; 4]),
+    /// Redraw this shape (a range of these buffers) with the decrementing
+    /// pipeline.
+    Stencil(std::ops::Range<u32>, wgpu::Buffer, wgpu::Buffer),
+    /// The scope drew nothing (empty intersection, or nested inside one);
+    /// only its closing needs tracking.
+    Skipped,
+    /// A clip that could not be applied but must stay balanced.
+    Noop,
+}
+
+/// Deepest stencil nesting: the cleared value 0 up to the 8-bit maximum.
+const MAX_CLIP_DEPTH: u32 = 255;
+
+/// Clip state while recording one render pass.
+struct ClipStack {
+    scissor: [u32; 4],
+    depth: u32,
+    skipping: u32,
+    scopes: Vec<Scope>,
+}
+
+impl ClipStack {
+    fn new(surface: [u32; 4]) -> Self {
+        Self {
+            scissor: surface,
+            depth: 0,
+            skipping: 0,
+            scopes: Vec::new(),
+        }
     }
 }
 
@@ -2461,6 +2370,16 @@ fn scissor_for_clip(shape: &ClipShape, scale: f32, size: (u32, u32)) -> Option<[
         return None;
     }
     Some(clamp_scissor(edges[0], edges[1], edges[2], edges[3], size))
+}
+
+/// How a [`Layer`] is kept between frames. See [`Layer::set_cache_policy`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// Drawn straight into the frame; offscreen only if it has an effect.
+    #[default]
+    Auto,
+    /// Always rendered to its own texture, re-rendered only when changed.
+    Always,
 }
 
 /// Format of the shared stencil attachment that clip scopes draw into.
@@ -2674,35 +2593,6 @@ fn create_composite_bind_group(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    })
-}
-
-/// The masked composite's bind group: the composite source (layer texture
-/// or effect output) at 0, the shared sampler at 1, the mask texture at 2.
-fn create_masked_composite_bind_group(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    sampler: &wgpu::Sampler,
-    source_view: &wgpu::TextureView,
-    mask_view: &wgpu::TextureView,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("atomos-layer-masked-composite-bind-group"),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(source_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(mask_view),
             },
         ],
     })
@@ -3629,56 +3519,57 @@ impl Layer {
             return;
         }
         inner.effect = effect;
-        inner.rebuild_effect_gpu();
-    }
-
-    /// Restrict this layer's rendering to an axis-aligned rectangle
-    /// (`(top_left, size)` in logical pixels; `None` clears). Everything
-    /// the layer draws — geometry, images, and text — outside the rect is
-    /// discarded.
-    ///
-    /// This is a hardware scissor: it *reduces* GPU work rather than
-    /// adding any, and changing it per frame is free. The everyday clip
-    /// for scroll viewports, panes, and popup bounds — reach for
-    /// [`Layer::set_clip_shape`] only when the clip genuinely isn't an
-    /// unrotated rectangle. Both can be active at once (content is
-    /// scissored while rendering, then masked while compositing).
-    pub fn set_clip_rect(&self, rect: Option<((f32, f32), (f32, f32))>) {
-        let mut inner = self.0.borrow_mut();
-        let rect = rect.map(|((x, y), (w, h))| [x, y, w, h]);
-        if inner.clip_rect != rect {
-            inner.clip_rect = rect;
-            inner.content_texture_dirty = true;
+        let wanted = if inner.is_group() { inner.size } else { (1, 1) };
+        if inner.texture_size == wanted {
+            inner.rebuild_effect_gpu();
+        } else {
+            // Gaining or losing the offscreen target also rebuilds the
+            // effect against it.
+            inner.sync_target();
+            if inner.effect.is_none() {
+                inner.rebuild_effect_gpu();
+            }
         }
     }
 
-    /// Clip this layer's composited output to an arbitrary [`ClipShape`]
-    /// (`None` clears): a rounded rect, circle, polygon, or any SVG path,
-    /// with antialiased edges. Applies to the layer's *whole* output —
-    /// same unit as [`Layer::set_effect`], and an active effect is
-    /// clipped too (blur first, then mask, so blur can't bleed outside
-    /// the shape).
-    ///
-    /// Cost model: setting the shape tessellates it and renders one small
-    /// mask pass on the next frame; every composited frame while a mask is
-    /// active then pays one extra fullscreen texture sample plus a
-    /// surface-sized mask texture's memory. Cheap enough to animate the
-    /// shape per frame, but for a plain unrounded rectangle use
-    /// [`Layer::set_clip_rect`], which costs nothing at all.
+    /// Clip the whole layer to `shape` (logical pixels; `None` clears): the
+    /// outermost clip scope, applied after any effect, so a blur cannot
+    /// bleed outside it. Anything [`Layer::with_clip`] accepts works here,
+    /// with the same cost model (a pixel-aligned rectangle is a free
+    /// scissor, every other shape uses the shared stencil, and no surface
+    /// is allocated either way).
     ///
     /// [`ClipShape::Path`]'s `d` is validated here, same as
     /// [`Layer::draw_path`]; the other variants can't fail.
-    pub fn set_clip_shape(
-        &self,
-        shape: Option<ClipShape>,
-    ) -> Result<(), lyon_extra::parser::ParseError> {
+    pub fn set_clip(&self, shape: Option<ClipShape>) -> Result<(), lyon_extra::parser::ParseError> {
         if let Some(ClipShape::Path { d, .. }) = &shape {
             parse_svg_path(d)?;
         }
         let mut inner = self.0.borrow_mut();
-        inner.clip_shape = shape;
-        inner.rebuild_mask();
+        if inner.clip != shape {
+            inner.clip = shape;
+            inner.rebuild_layer_clip();
+        }
         Ok(())
+    }
+
+    /// Choose whether this layer is drawn straight into the frame
+    /// ([`CachePolicy::Auto`], the default) or kept as a texture that is
+    /// only re-rendered when it changes ([`CachePolicy::Always`]).
+    ///
+    /// A direct layer costs no memory of its own and is replayed from its
+    /// retained geometry each presented frame. A cached layer costs a
+    /// surface-sized texture but a frame where it is unchanged is a single
+    /// textured quad, which pays off for a large, mostly static layer
+    /// (a full-screen document) under a frequently animating one (a caret).
+    /// A layer with an effect is always cached.
+    pub fn set_cache_policy(&self, policy: CachePolicy) {
+        let mut inner = self.0.borrow_mut();
+        let always = policy == CachePolicy::Always;
+        if inner.cache_always != always {
+            inner.cache_always = always;
+            inner.sync_target();
+        }
     }
 
     /// Discard every pending/previously-built draw command for this layer.
@@ -3693,54 +3584,85 @@ impl Layer {
     }
 }
 
-/// Advance one frame for every live layer in `order` (front = bottom of the
-/// visual stack, back = top): resize/rebuild as needed, render each into
-/// its own texture, then composite all of them onto `view` in the same
-/// order. `view` is expected to already hold whatever was drawn below the
-/// layer stack (this pass uses `LoadOp::Load`).
-pub(super) fn render_layers(
+/// Record one frame onto `view` (the swap-chain view, or any single-sample
+/// target): bring every live layer up to date, render the offscreen groups
+/// (layers with an effect or `CachePolicy::Always`), then draw everything
+/// bottom to top in a single multisampled pass cleared to `clear`.
+///
+/// `order` runs bottom (front) to top (back). Direct layers replay their
+/// retained ops inside the pass; groups composite their texture. Every
+/// text batch is prepared before anything is recorded: preparing a
+/// renderer after its draw was recorded would replace the buffer the
+/// recorded draw reads, and a prepare that resets the shared atlas would
+/// leave earlier batches pointing into the discarded one.
+pub(super) fn render_frame(
     encoder: &mut wgpu::CommandEncoder,
     view: &wgpu::TextureView,
     msaa: &MsaaTarget,
     order: &mut std::collections::VecDeque<std::rc::Weak<RefCell<LayerInner>>>,
     surface_size: (u32, u32),
     scale_factor: f32,
+    clear: wgpu::Color,
 ) {
     order.retain(|weak| weak.strong_count() > 0);
     let live: Vec<Rc<RefCell<LayerInner>>> =
         order.iter().filter_map(|weak| weak.upgrade()).collect();
 
+    // Phase 1: CPU work and queue writes only.
+    let generation_before = live
+        .first()
+        .map(|inner| inner.borrow().text_stack.borrow().atlas_generation());
     for inner in &live {
         let mut inner = inner.borrow_mut();
         inner.resize_if_needed(surface_size);
         inner.set_scale_factor(scale_factor);
+        inner.sync_target();
         inner.rebuild_if_needed();
-        inner.render_mask_if_needed(encoder, msaa);
-        inner.render_to_texture_if_needed(encoder, msaa);
-        inner.apply_effect_if_needed(encoder);
+    }
+    // A later layer's prepare may have reset the shared atlas, which
+    // invalidates text prepared earlier in this phase: sweep once more (each
+    // batch only re-prepares if its generation is stale).
+    if let Some(before) = generation_before
+        && live[0].borrow().text_stack.borrow().atlas_generation() != before
+    {
+        for inner in &live {
+            inner.borrow_mut().prepare_text_batches();
+        }
     }
 
-    if live.is_empty() {
-        return;
+    // Phase 2: offscreen groups.
+    for inner in &live {
+        let mut inner = inner.borrow_mut();
+        if inner.is_group() {
+            inner.render_to_texture_if_needed(encoder, msaa);
+            inner.apply_effect_if_needed(encoder);
+        }
     }
 
+    // Phase 3: the frame.
+    let surface = [0, 0, surface_size.0, surface_size.1];
     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("atomos-layer-composite-pass"),
+        label: Some("atomos-frame-pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view,
+            view: &msaa.color_view,
             depth_slice: None,
-            resolve_target: None,
+            resolve_target: Some(view),
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Load,
-                store: wgpu::StoreOp::Store,
+                load: wgpu::LoadOp::Clear(clear),
+                store: wgpu::StoreOp::Discard,
             },
         })],
-        depth_stencil_attachment: None,
+        depth_stencil_attachment: Some(stencil_attachment(&msaa.stencil_view)),
         timestamp_writes: None,
         occlusion_query_set: None,
         multiview_mask: None,
     });
     for inner in &live {
-        inner.borrow().composite(&mut rpass);
+        let inner = inner.borrow();
+        if inner.is_group() {
+            inner.record_group(&mut rpass, surface);
+        } else {
+            inner.record_direct(&mut rpass, surface);
+        }
     }
 }

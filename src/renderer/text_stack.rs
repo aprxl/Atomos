@@ -234,7 +234,7 @@ impl TextStack {
     /// `prepare_with_custom` calls `.destroy()` on it *immediately*
     /// (synchronously, not deferred to whenever the GPU actually gets
     /// around to it) when it needs to grow — see glyphon's
-    /// `text_render.rs`. `render_layers` records every layer's render pass
+    /// `text_render.rs`. `render_frame` records every layer's render pass
     /// into one shared `wgpu::CommandEncoder` that isn't submitted until
     /// the whole frame is done, so if every layer shared one
     /// `TextRenderer`, an earlier layer's already-recorded

@@ -79,8 +79,9 @@ draw_styled_text(spans: &[TextSpan], position: (f32,f32), alignment: Alignment)
 get_text_size(text, &Font, &FontParameters) -> (f32, f32)   // logical px, pre-alignment
 get_styled_text_size(spans: &[TextSpan]) -> (f32, f32)
 set_effect(effect: Option<ShaderEffect>)
-set_clip_rect(rect: Option<((f32,f32),(f32,f32))>)   // (top_left, size), hardware scissor
-set_clip_shape(shape: Option<ClipShape>) -> Result<(), ParseError>
+with_clip(shape: ClipShape, |layer| ..) -> Result<R, ParseError>   // clips what the closure draws
+set_clip(shape: Option<ClipShape>) -> Result<(), ParseError>      // clips the whole layer, after any effect
+set_cache_policy(policy: CachePolicy)                            // Auto (default) | Always
 clear()
 scale_factor() -> f32
 ```
@@ -133,28 +134,39 @@ scale_factor() -> f32
 
 ### Clipping
 
-Two mechanisms, both per-layer, both logical px, both clearable with `None`:
+Clipping is a scope, in logical px, and costs no extra surface:
 
-- **`set_clip_rect(Some((top_left, size)))`** — hardware scissor on the
-  layer's render pass. Clips geometry, images, and text together.
-  Effectively free (it *reduces* GPU work); changing it every frame costs
-  nothing. Default choice for scroll viewports, panes, popup bounds. Rects
-  partially outside the surface are clamped; a fully off-surface rect
-  renders nothing.
-- **`set_clip_shape(Some(ClipShape::...))`** — arbitrary-shape mask applied
-  to the layer's *composited* output (same whole-layer unit as
-  `set_effect`; an active effect is masked too, so blur can't bleed outside
-  the shape). `ClipShape::{Rectangle{top_left,size,rounding}, Circle{center,radius},
-  Polygon{vertices}, Path{d,position}}` — mirrors the solid `draw_*` calls,
-  antialiased edges included. Cost: one mask texture (surface-sized) +
-  one extra fullscreen texture sample per composited frame; re-setting the
-  shape re-tessellates and re-renders the mask (cheap enough to animate
-  per frame — the mask texture is reused). `Path` variant validates `d` and
-  can return `ParseError`; other variants never fail.
+- **`layer.with_clip(shape, |l| { ... })`** clips whatever the closure
+  draws on that layer (geometry, images and text together). Scopes nest;
+  content drawn after the closure is unclipped again. Later commands still
+  paint over earlier clipped ones.
+- **`layer.set_clip(Some(shape))`** clips the whole layer as the outermost
+  scope, applied *after* any effect, so a blur cannot bleed outside it.
 
-Rule of thumb: unrotated rectangle → `set_clip_rect`; anything else →
-`set_clip_shape`. Both can be active at once (scissor while rendering,
-mask while compositing).
+`ClipShape::{Rectangle{top_left,size,rounding}, Circle{center,radius},
+Polygon{vertices}, Path{d,position}}` mirrors the solid `draw_*` calls.
+`Path` validates `d` and can return `ParseError`; other variants never fail.
+
+How it is drawn: an unrounded rectangle whose physical edges land on whole
+pixels becomes a hardware scissor (free; it only reduces work). Anything
+else — rounded corners, circle, polygon, path, or a fractional edge — is
+drawn into one shared 8-bit stencil buffer that all content tests against,
+with edges antialiased by the same MSAA as the content. Nesting is limited
+to 255 stencil levels; deeper scopes are ignored.
+
+## Layers, memory and caching
+
+A layer owns no render target by default: its retained geometry is replayed
+into the frame's single multisampled pass each presented frame, so a plain
+layer costs only its vertex/index buffers. A layer is drawn into a
+surface-sized offscreen texture ("group") only when it has a `ShaderEffect`
+or `set_cache_policy(CachePolicy::Always)`. A group re-renders only when
+its content or effect changes, and a frame where it is unchanged is one
+textured quad. Use `Always` for a large, mostly static layer under one that
+changes constantly (a full-screen document below a blinking caret).
+
+Commands paint in issue order within a layer, and layers stack in creation
+order (`new_layer_top` / `new_layer_bottom`).
 
 ## Shader effects
 
@@ -190,15 +202,12 @@ To shade one shape, give it its own layer. Setting `None` clears.
    clean; then grep the log for `panic|wgpu error`.
 8. Use glyphon's re-exports for cosmic-text types (`glyphon::Buffer`, etc.) —
    the standalone `cosmic-text` in Cargo.toml is a different version.
-9. Clipping is **per layer**, like effects — there is no per-draw-call clip.
-   Independently clipped regions (N scroll viewports) = N layers. Reach for
-   `set_clip_rect` (free) before `set_clip_shape` (mask texture + one extra
-   fullscreen sample per frame); a `ClipShape::Rectangle` with
-   `Rounding::NONE` is a silent waste — that's exactly what `set_clip_rect`
-   does for free.
-10. Clip state is caller-driven like `set_effect`, **not** part of the
-    drawn content: it survives `clear()` and `Automatic` re-issue, and it is
-    not hashed for invalidation. Clear it explicitly with `None`.
+9. Clip scopes (`with_clip`) are part of the drawn content and reset with
+   `clear()`; reach for an unrounded, pixel-aligned rectangle (free scissor)
+   before shapes that need the stencil.
+10. The whole-layer clip (`set_clip`) is caller-driven like `set_effect`,
+    **not** part of the drawn content: it survives `clear()` and `Automatic`
+    re-issue. Clear it explicitly with `None`.
 
 ## Minimal example
 
@@ -221,11 +230,15 @@ chrome.draw_svg_icon(
 
 // A scrolling viewport: scissor once, draw past the edges freely each frame.
 let viewport = renderer.new_layer_bottom(LayerInvalidation::Automatic);
-viewport.set_clip_rect(Some(((0.0, 40.0), (1024.0, 680.0))));
+viewport.set_clip(Some(ClipShape::Rectangle {
+    top_left: (0.0, 40.0),
+    size: (1024.0, 680.0),
+    rounding: Rounding::NONE,
+}))?;
 
 // A rounded panel that actually clips its content (text included):
 let popup = renderer.new_layer_top(LayerInvalidation::Automatic);
-popup.set_clip_shape(Some(ClipShape::Rectangle {
+popup.set_clip(Some(ClipShape::Rectangle {
     top_left: (312.0, 200.0),
     size: (400.0, 320.0),
     rounding: Rounding::uniform(16.0),
@@ -233,7 +246,7 @@ popup.set_clip_shape(Some(ClipShape::Rectangle {
 ```
 
 See `examples/clip_demo.rs` for a full walkthrough of both clip paths,
-including a per-frame animated mask.
+including a per-frame animated clip.
 
 ## Text layout for editing (`Layer::layout_text`)
 

@@ -55,7 +55,7 @@ pub use color::Rgba;
 pub use color::{Color, GradientDirection, to_linear};
 pub use font::Font;
 pub use font_parameters::FontParameters;
-pub use layer::{Layer, LayerInvalidation};
+pub use layer::{CachePolicy, Layer, LayerInvalidation};
 // Same story as `PathFileError` below: only bins that actually clip by
 // shape touch it.
 pub use layer::ClipShape;
@@ -607,7 +607,7 @@ impl Renderer {
     /// of a later [`Renderer::render`], never here. No-op on zero-sized
     /// (minimised) windows, which would otherwise produce invalid surfaces.
     /// Live layers pick up the new size lazily the next time they render
-    /// (see `layer::render_layers`).
+    /// (see `layer::render_frame`).
     ///
     /// Deferring is the fix for a macOS hang that took the whole app with
     /// it. `Surface::configure` waits for every submission still in flight,
@@ -663,7 +663,7 @@ impl Renderer {
     /// Render one frame: clear the swap chain, then composite every live
     /// layer onto it in bottom-to-top order (each into its own offscreen
     /// texture first, skipped entirely for layers whose content hasn't
-    /// changed — see `layer::render_layers`).
+    /// changed — see `layer::render_frame`).
     ///
     /// Returns a [`FrameOutcome`] saying whether the frame was shown and,
     /// if not, whether to retry or wait for the window to become visible.
@@ -757,33 +757,6 @@ impl Renderer {
             encoder.write_timestamp(&timestamps.query_set, 0);
         }
 
-        {
-            // Nothing draws directly into the swap chain any more — every
-            // visible pixel comes from a layer's composite blit — so this
-            // pass only needs to clear it.
-            let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("atomos-clear-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-        }
-
         // Once per frame (not per layer — every layer shares this stack):
         // tick the shaped-text cache clock and evict stale entries.
         //
@@ -797,7 +770,7 @@ impl Renderer {
         self.text_stack.borrow_mut().advance_frame();
 
         // Layers resize lazily against the current surface size (see
-        // `layer::render_layers`), so the shared MSAA scratch target does
+        // `layer::render_frame`), so the shared MSAA scratch target does
         // the same here rather than in `resize()`.
         let surface_size = (self.surface_config.width, self.surface_config.height);
         if self.msaa_size != surface_size {
@@ -810,13 +783,21 @@ impl Renderer {
             self.msaa_size = surface_size;
         }
 
-        layer::render_layers(
+        // One multisampled pass draws the whole frame, cleared to the
+        // background colour (see `layer::render_frame`).
+        layer::render_frame(
             &mut encoder,
             &view,
             &self.msaa,
             &mut self.layers,
             surface_size,
             self.scale_factor as f32,
+            wgpu::Color {
+                r: 0.05,
+                g: 0.05,
+                b: 0.08,
+                a: 1.0,
+            },
         );
 
         let map_slot = self

@@ -2,7 +2,7 @@
 //!
 //! [`Scene`] stands in for [`super::Renderer`]'s window plumbing: a fixed
 //! `Rgba8UnormSrgb` target cleared to opaque black, 4x MSAA, and the real
-//! layer pipeline from [`super::layer::render_layers`]. Tests draw through
+//! layer pipeline from [`super::layer::render_frame`]. Tests draw through
 //! ordinary [`Layer`] handles and read single pixels back.
 //!
 //! [`Scene::new`] returns `None` when the machine has no usable adapter so
@@ -105,26 +105,15 @@ impl Scene {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.target_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        }));
         self.text.borrow_mut().advance_frame();
-        layer::render_layers(
+        layer::render_frame(
             &mut encoder,
             &self.target_view,
             &self.msaa,
             &mut self.order,
             self.size,
             scale_factor,
+            wgpu::Color::BLACK,
         );
         self.queue.submit([encoder.finish()]);
         self.device
