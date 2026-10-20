@@ -3380,7 +3380,15 @@ impl Layer {
         font: Font,
         font_parameters: FontParameters,
     ) {
-        self.push_text(text, position, color, alignment, font, font_parameters, None);
+        self.push_text(
+            text,
+            position,
+            color,
+            alignment,
+            font,
+            font_parameters,
+            None,
+        );
     }
 
     /// [`Layer::draw_text`], with lines wrapped to `max_width` (logical

@@ -433,7 +433,11 @@ mod text_layout {
         // A click far right of a wrapped line stays on it.
         let y = second.top + second.height / 2.0;
         let end = wrapped.hit_test((5000.0, y));
-        assert!(second.range.contains(&end), "{end} not in {:?}", second.range);
+        assert!(
+            second.range.contains(&end),
+            "{end} not in {:?}",
+            second.range
+        );
         assert_eq!(wrapped.hit_test((5000.0, 10_000.0)), WRAP_TEXT.len());
     }
 
@@ -475,9 +479,9 @@ mod text_layout {
         let mut inked_rows = 0;
         for line in wrapped.lines() {
             let rows = (line.top as u32)..((line.top + line.height) as u32);
-            let inked = rows.clone().any(|y| {
-                (0..(max as u32 + 1)).any(|x| scene.pixel(x, y)[0] > 128)
-            });
+            let inked = rows
+                .clone()
+                .any(|y| (0..(max as u32 + 1)).any(|x| scene.pixel(x, y)[0] > 128));
             inked_rows += usize::from(inked);
         }
         assert_eq!(inked_rows, wrapped.lines().len());
