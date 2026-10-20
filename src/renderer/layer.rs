@@ -3,9 +3,10 @@
 //! A `Layer` owns its own offscreen GPU texture and a queue of pending
 //! [`DrawCommand`]s. Calling a `draw_*` method never touches the GPU
 //! directly — it only records a command and marks the layer dirty; the
-//! actual tessellation, upload, and render-to-texture happen once per frame
-//! inside [`super::Renderer::render`], which also composites every live
-//! layer's texture onto the screen in bottom-to-top order.
+//! actual tessellation, upload, and render-to-texture happen lazily inside
+//! [`super::Renderer::render`]. Clean textures are retained: a frame where a
+//! layer is unchanged only composites its cached content (and effect output)
+//! onto the screen, in bottom-to-top order, without re-running its passes.
 //!
 //! Because a layer renders into its own texture, applying a shader to
 //! "everything in the layer" later just means swapping which pipeline the
@@ -1198,6 +1199,19 @@ pub(super) struct LayerInner {
 
     pending: Vec<DrawCommand>,
     invalidation: InvalidationState,
+
+    // The retained textures are the cache boundary. A clean layer keeps its
+    // rendered content and effect output across frames and is only
+    // composited again; these flags say which of the two passes is stale.
+    // Both start true because a new texture's contents are undefined even
+    // when nothing was drawn.
+    content_texture_dirty: bool,
+    effect_texture_dirty: bool,
+    /// Passes actually recorded, so tests can prove clean frames skip them.
+    #[cfg(test)]
+    pub(super) content_passes: u32,
+    #[cfg(test)]
+    pub(super) effect_passes: u32,
 }
 
 /// GPU state for one `DrawCommand::Image`, rebuilt whenever the layer
@@ -1321,6 +1335,12 @@ impl LayerInner {
             scale_factor,
             pending: Vec::new(),
             invalidation: invalidation_state,
+            content_texture_dirty: true,
+            effect_texture_dirty: true,
+            #[cfg(test)]
+            content_passes: 0,
+            #[cfg(test)]
+            effect_passes: 0,
         }
     }
 
@@ -1363,6 +1383,8 @@ impl LayerInner {
         );
         self.texture = texture;
         self.texture_view = texture_view;
+        self.content_texture_dirty = true;
+        self.effect_texture_dirty = true;
         self.set_composite_source(self.texture_view.clone());
         // Shared across every layer, so this runs redundantly once per
         // layer on an actual resize — harmless, it's just a small
@@ -1422,6 +1444,7 @@ impl LayerInner {
     /// from "rebuild pipeline" if profiling ever shows resize hitching
     /// with a `Custom` effect active.
     fn rebuild_effect_gpu(&mut self) {
+        self.effect_texture_dirty = true;
         let Some(effect) = self.effect.clone() else {
             self.effect_gpu = None;
             self.set_composite_source(self.texture_view.clone());
@@ -1550,10 +1573,17 @@ impl LayerInner {
     /// `texture_view` as input) and before `composite` (which reads
     /// whatever this leaves in `composite_bind_group`, already repointed
     /// by `rebuild_effect_gpu`).
-    fn apply_effect(&self, encoder: &mut wgpu::CommandEncoder) {
+    fn apply_effect_if_needed(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if !std::mem::take(&mut self.effect_texture_dirty) {
+            return;
+        }
         let Some(effect_gpu) = &self.effect_gpu else {
             return;
         };
+        #[cfg(test)]
+        {
+            self.effect_passes += 1;
+        }
         match &effect_gpu.kind {
             EffectGpuKind::Blur(blur) => {
                 run_fullscreen_pass(
@@ -1610,6 +1640,11 @@ impl LayerInner {
                 InvalidationState::Manual { dirty } => *dirty = true,
             }
             self.last_text_hash = None;
+            // The scissor and a blur radius are in logical units too.
+            self.content_texture_dirty = true;
+            if self.effect.is_some() {
+                self.rebuild_effect_gpu();
+            }
         }
         // A clip mask's geometry is baked at physical scale and nothing
         // re-issues it per frame, so re-derive it from the logical-units
@@ -1827,6 +1862,10 @@ impl LayerInner {
         }
         self.had_text = has_text;
 
+        if should_rebuild || needs_prepare {
+            self.content_texture_dirty = true;
+        }
+
         // `Automatic` layers expect a full re-description of their content
         // every frame; `Manual` layers persist theirs until `clear()`.
         if matches!(self.invalidation, InvalidationState::Automatic { .. }) {
@@ -1923,7 +1962,20 @@ impl LayerInner {
     /// swap-chain pass — cheap to skip entirely for layers with no
     /// geometry (an empty `pending` still needs its texture cleared to
     /// transparent so it doesn't keep showing stale content).
-    fn render_to_texture(&self, encoder: &mut wgpu::CommandEncoder, msaa_view: &wgpu::TextureView) {
+    fn render_to_texture_if_needed(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        msaa_view: &wgpu::TextureView,
+    ) {
+        if !std::mem::take(&mut self.content_texture_dirty) {
+            return;
+        }
+        // New content means the effect must run over it again.
+        self.effect_texture_dirty = true;
+        #[cfg(test)]
+        {
+            self.content_passes += 1;
+        }
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("atomos-layer-pass"),
             // Render into the renderer's shared multisampled scratch
@@ -3067,7 +3119,12 @@ impl Layer {
     /// unrotated rectangle. Both can be active at once (content is
     /// scissored while rendering, then masked while compositing).
     pub fn set_clip_rect(&self, rect: Option<((f32, f32), (f32, f32))>) {
-        self.0.borrow_mut().clip_rect = rect.map(|((x, y), (w, h))| [x, y, w, h]);
+        let mut inner = self.0.borrow_mut();
+        let rect = rect.map(|((x, y), (w, h))| [x, y, w, h]);
+        if inner.clip_rect != rect {
+            inner.clip_rect = rect;
+            inner.content_texture_dirty = true;
+        }
     }
 
     /// Clip this layer's composited output to an arbitrary [`ClipShape`]
@@ -3134,8 +3191,8 @@ pub(super) fn render_layers(
         inner.set_scale_factor(scale_factor);
         inner.rebuild_if_needed();
         inner.render_mask_if_needed(encoder, msaa_view);
-        inner.render_to_texture(encoder, msaa_view);
-        inner.apply_effect(encoder);
+        inner.render_to_texture_if_needed(encoder, msaa_view);
+        inner.apply_effect_if_needed(encoder);
     }
 
     if live.is_empty() {

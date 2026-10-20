@@ -194,3 +194,71 @@ fn the_glyph_id_space_is_recycled_before_it_runs_out() {
         "IDs should restart from zero after the reset"
     );
 }
+
+fn passes(layer: &super::Layer) -> (u32, u32) {
+    let inner = layer.0.borrow();
+    (inner.content_passes, inner.effect_passes)
+}
+
+#[test]
+fn a_clean_layer_is_composited_without_re_rendering() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (8.0, 8.0),
+        Color::rgb(255, 0, 0),
+        Rounding::NONE,
+    );
+    layer.set_effect(Some(ShaderEffect::ColorMatrix(ColorMatrix::IDENTITY)));
+    scene.frame(1.0);
+    assert_eq!(passes(&layer), (1, 1));
+
+    scene.frame(1.0);
+    scene.frame(1.0);
+    assert_eq!(passes(&layer), (1, 1), "clean frames run no layer passes");
+    assert_near(scene.pixel(4, 4), [255, 0, 0, 255], 1);
+
+    layer.set_clip_rect(None);
+    scene.frame(1.0);
+    assert_eq!(passes(&layer), (1, 1), "an unchanged clip is not a change");
+
+    layer.set_clip_rect(Some(((0.0, 0.0), (4.0, 4.0))));
+    scene.frame(1.0);
+    assert_eq!(passes(&layer), (2, 2));
+    assert_near(scene.pixel(6, 6), [0, 0, 0, 255], 0);
+}
+
+#[test]
+fn changing_only_the_effect_reruns_only_the_effect() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (8.0, 8.0),
+        Color::rgb(255, 0, 0),
+        Rounding::NONE,
+    );
+    layer.set_effect(Some(ShaderEffect::ColorMatrix(ColorMatrix::IDENTITY)));
+    scene.frame(1.0);
+    layer.set_effect(Some(ShaderEffect::ColorMatrix(ColorMatrix::invert())));
+    scene.frame(1.0);
+    assert_eq!(passes(&layer), (1, 2));
+    assert_near(scene.pixel(4, 4), [0, 255, 255, 255], 1);
+}
+
+#[test]
+fn a_dpi_change_rerenders_a_retained_layer() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (8.0, 8.0),
+        Color::rgb(255, 0, 0),
+        Rounding::NONE,
+    );
+    scene.frame(1.0);
+    scene.frame(2.0);
+    assert_eq!(passes(&layer).0, 2);
+    assert_near(scene.pixel(12, 4), [255, 0, 0, 255], 1);
+}
