@@ -69,11 +69,13 @@ impl TextLayout {
         text: &str,
         effect: GlyphEffect,
     ) -> Self {
-        // Byte offset at which each `\n`-separated line begins.
+        // Byte offset at which each `\n`-separated paragraph begins.
         let mut line_starts = vec![0usize];
         line_starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
 
-        let mut lines: Vec<Option<TextLine>> = vec![None; line_starts.len()];
+        // Visual lines per paragraph: one without wrapping, several when a
+        // long paragraph breaks.
+        let mut paragraphs: Vec<Vec<TextLine>> = vec![Vec::new(); line_starts.len()];
         let mut width: f32 = 0.0;
         let mut height: f32 = 0.0;
 
@@ -81,9 +83,11 @@ impl TextLayout {
             let Some(&start) = line_starts.get(run.line_i) else {
                 continue;
             };
-            let line_text = run.text;
+            let visual = &mut paragraphs[run.line_i];
             let mut cells = Vec::new();
             let mut pen_delta = 0.0f32;
+            // Byte span the glyphs cover, relative to the paragraph.
+            let (mut first, mut last) = (usize::MAX, 0usize);
             for glyph in run.glyphs {
                 let delta =
                     effect_advance_delta(effect.embolden.max(0.0), effect.condense, glyph.w);
@@ -93,13 +97,28 @@ impl TextLayout {
                     glyph.w + delta,
                 ));
                 pen_delta += delta;
+                first = first.min(glyph.start);
+                last = last.max(glyph.end);
             }
+            // A paragraph's first line starts at the paragraph; a wrapped
+            // continuation at its first glyph. The last line is extended to
+            // the paragraph end below.
+            let from = if visual.is_empty() || first == usize::MAX {
+                start
+            } else {
+                start + first
+            };
+            let to = if last == 0 {
+                start + run.text.len()
+            } else {
+                start + last
+            };
             let line_width = run.line_w + pen_delta;
-            let stops = caret_stops(text, start, line_text, run.rtl, &cells);
+            let stops = caret_stops(text, from, to, run.rtl, &cells);
             width = width.max(line_width);
             height = height.max(run.line_top + run.line_height);
-            lines[run.line_i] = Some(TextLine {
-                range: start..start + line_text.len(),
+            visual.push(TextLine {
+                range: from..to,
                 top: run.line_top,
                 height: run.line_height,
                 width: line_width,
@@ -108,17 +127,17 @@ impl TextLayout {
             });
         }
 
-        // A line the shaper produced no run for (an empty line) still has a
-        // caret position: give it the previous line's metrics.
+        // A paragraph the shaper produced no run for (an empty line) still
+        // has a caret position: give it the previous line's metrics.
         let mut previous: Option<(f32, f32)> = None;
-        let mut finished = Vec::with_capacity(lines.len());
-        for (i, line) in lines.into_iter().enumerate() {
-            let line = line.unwrap_or_else(|| {
+        let mut finished = Vec::new();
+        for (i, mut visual) in paragraphs.into_iter().enumerate() {
+            let end = line_starts.get(i + 1).map_or(text.len(), |next| next - 1);
+            if visual.is_empty() {
                 let (top, line_height) = previous.map_or((0.0, 0.0), |(top, h)| (top + h, h));
                 let start = line_starts[i];
-                let end = line_starts.get(i + 1).map_or(text.len(), |next| next - 1);
                 height = height.max(top + line_height);
-                TextLine {
+                visual.push(TextLine {
                     range: start..end.max(start),
                     top,
                     height: line_height,
@@ -128,10 +147,30 @@ impl TextLayout {
                         x: 0.0,
                     }],
                     cells: Vec::new(),
+                });
+            } else {
+                // Soft wraps: each line ends where the next begins. The shaper
+                // drops the whitespace it wraps at, so a line's glyphs may
+                // stop short of that (the caret after them stands for the
+                // gap). When they reach it exactly, the closing stop is the
+                // next line's first byte; it is dropped so a click past this
+                // line's end stays on it.
+                for k in 0..visual.len() - 1 {
+                    let next_start = visual[k + 1].range.start;
+                    let line = &mut visual[k];
+                    if line.range.end == next_start && line.stops.len() > 1 {
+                        line.stops.pop();
+                    }
+                    line.range.end = next_start;
                 }
-            });
-            previous = Some((line.top, line.height));
-            finished.push(line);
+                if let Some(last) = visual.last_mut() {
+                    last.range.end = end.max(last.range.start);
+                }
+            }
+            if let Some(last) = visual.last() {
+                previous = Some((last.top, last.height));
+            }
+            finished.extend(visual);
         }
         let lines = finished;
 
@@ -282,7 +321,7 @@ impl TextLine {
 fn caret_stops(
     text: &str,
     line_start: usize,
-    line_text: &str,
+    end: usize,
     rtl: bool,
     cells: &[(Range<usize>, f32, f32)],
 ) -> Vec<CaretStop> {
@@ -308,7 +347,6 @@ fn caret_stops(
     stops.dedup_by_key(|stop| stop.byte);
 
     // The end of the line: the far edge of the last glyph in reading order.
-    let end = line_start + line_text.len();
     let end_x = cells
         .iter()
         .max_by_key(|(bytes, ..)| bytes.end)

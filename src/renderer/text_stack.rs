@@ -164,7 +164,7 @@ impl TextStack {
             },
         );
 
-        let blank_buffer = build_buffer(&mut font_system, "", &Attrs::new(), 16.0);
+        let blank_buffer = build_buffer(&mut font_system, "", &Attrs::new(), 16.0, None);
 
         Self {
             font_system,
@@ -282,8 +282,9 @@ impl TextStack {
         text: &str,
         font: &Font,
         font_parameters: &FontParameters,
+        wrap_width: Option<f32>,
     ) -> (f32, f32) {
-        let key = self.ensure_shaped(text, font, font_parameters);
+        let key = self.ensure_shaped(text, font, font_parameters, wrap_width);
         let effect = GlyphEffect::from(font_parameters);
         measure_shaped_buffer_with(&self.shape_cache[&key].buffer, |_| effect)
     }
@@ -295,8 +296,9 @@ impl TextStack {
         text: &str,
         font: &Font,
         font_parameters: &FontParameters,
+        wrap_width: Option<f32>,
     ) -> super::text_layout::TextLayout {
-        let key = self.ensure_shaped(text, font, font_parameters);
+        let key = self.ensure_shaped(text, font, font_parameters, wrap_width);
         let effect = GlyphEffect::from(font_parameters);
         super::text_layout::TextLayout::from_buffer(&self.shape_cache[&key].buffer, text, effect)
     }
@@ -304,14 +306,21 @@ impl TextStack {
     /// Look up (or shape and insert) the cached buffer for one
     /// `draw_text`-style string, returning its cache key. The entry is
     /// stamped with the current frame either way.
-    fn ensure_shaped(&mut self, text: &str, font: &Font, font_parameters: &FontParameters) -> u64 {
-        let key = shaped_text_key(text, font, font_parameters);
+    fn ensure_shaped(
+        &mut self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+        wrap_width: Option<f32>,
+    ) -> u64 {
+        let wrap_width = sanitize_wrap(wrap_width);
+        let key = shaped_text_key(text, font, font_parameters, wrap_width);
         let frame = self.frame;
         if let Some(entry) = self.shape_cache.get_mut(&key) {
             entry.last_used = frame;
             return key;
         }
-        let buffer = self.shape(text, font, font_parameters);
+        let buffer = self.shape(text, font, font_parameters, wrap_width);
         self.shape_cache.insert(
             key,
             CachedShape {
@@ -355,7 +364,7 @@ impl TextStack {
                 Font::File(path) => match register_font_file(self.font_system.db_mut(), path) {
                     Ok(name) => name,
                     Err(e) => {
-                        eprintln!("Atomos: failed to load font {}: {e}", path.display());
+                        log::warn!("failed to load font {}: {e}", path.display());
                         None
                     }
                 },
@@ -367,14 +376,26 @@ impl TextStack {
         Some(name.clone())
     }
 
-    fn shape(&mut self, text: &str, font: &Font, font_parameters: &FontParameters) -> Buffer {
+    fn shape(
+        &mut self,
+        text: &str,
+        font: &Font,
+        font_parameters: &FontParameters,
+        wrap_width: Option<f32>,
+    ) -> Buffer {
         let family = self.resolve_family(font);
         let mut attrs = Attrs::new();
         if let Some(family) = &family {
             attrs = attrs.family(Family::Name(family));
         }
         attrs = attrs.letter_spacing(font_parameters.tracking);
-        build_buffer(&mut self.font_system, text, &attrs, font_parameters.size)
+        build_buffer(
+            &mut self.font_system,
+            text,
+            &attrs,
+            font_parameters.size,
+            wrap_width,
+        )
     }
 
     /// Measure the combined bounding box `spans` would occupy shaped
@@ -496,8 +517,9 @@ impl TextStack {
                     font_parameters,
                     alignment,
                     color,
+                    wrap_width,
                 } => {
-                    let key = self.ensure_shaped(text, font, font_parameters);
+                    let key = self.ensure_shaped(text, font, font_parameters, *wrap_width);
                     let effect = GlyphEffect::from(font_parameters);
                     let rgba = match color {
                         Color::Solid(rgba) => *rgba,
@@ -609,9 +631,15 @@ impl TextStack {
 /// alignment are deliberately absent — they're applied per glyph at
 /// placement/raster time, so changing them (fading, moving) must stay a
 /// cache hit.
-fn shaped_text_key(text: &str, font: &Font, font_parameters: &FontParameters) -> u64 {
+fn shaped_text_key(
+    text: &str,
+    font: &Font,
+    font_parameters: &FontParameters,
+    wrap_width: Option<f32>,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
     hasher.write_u8(0); // namespace tag vs. `shaped_spans_key`
+    hasher.write_u32(wrap_width.map_or(u32::MAX, f32::to_bits));
     text.hash(&mut hasher);
     font.hash(&mut hasher);
     hasher.write_u32(font_parameters.size.to_bits());
@@ -638,12 +666,27 @@ fn shaped_spans_key(spans: &[TextSpan]) -> u64 {
     hasher.finish()
 }
 
-fn build_buffer(font_system: &mut FontSystem, text: &str, attrs: &Attrs, size_px: f32) -> Buffer {
+/// A usable wrap width: finite and non-negative, or `None` for no wrapping.
+/// Normalised before it reaches the shape-cache key so `-0.0` and `0.0`
+/// (or any NaN) share an entry.
+fn sanitize_wrap(wrap_width: Option<f32>) -> Option<f32> {
+    wrap_width
+        .filter(|w| w.is_finite())
+        .map(|w| w.max(0.0) + 0.0)
+}
+
+fn build_buffer(
+    font_system: &mut FontSystem,
+    text: &str,
+    attrs: &Attrs,
+    size_px: f32,
+    wrap_width: Option<f32>,
+) -> Buffer {
     let metrics = Metrics::new(size_px, size_px * LINE_HEIGHT_RATIO);
     let mut buffer = Buffer::new(font_system, metrics);
     {
         let mut borrowed = buffer.borrow_with(font_system);
-        borrowed.set_size(None, None);
+        borrowed.set_size(wrap_width, None);
         borrowed.set_text(text, attrs, Shaping::Advanced, None);
         borrowed.shape_until_scroll(true);
     }
