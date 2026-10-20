@@ -38,13 +38,18 @@ mod shader;
 mod text_span;
 mod text_stack;
 
+#[cfg(test)]
+mod pixel_tests;
+#[cfg(test)]
+mod test_support;
+
 // `GradientDirection`/`Rgba` are vocabulary for richer `Color` use
 // (gradients/per-vertex), not yet exercised by every call site. This is a
 // `bin` crate, so nothing outside can reach these `pub` items yet either,
 // hence the blanket allow rather than one per item.
 pub use alignment::{Alignment, HorizontalAlign, VerticalAlign};
 pub use color::Rgba;
-pub use color::{Color, GradientDirection};
+pub use color::{Color, GradientDirection, to_linear};
 pub use font::Font;
 pub use font_parameters::FontParameters;
 pub use layer::{Layer, LayerInvalidation};

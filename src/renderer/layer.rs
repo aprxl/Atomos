@@ -205,11 +205,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// [`COMPOSITE_SHADER_SRC`] plus a mask texture: the layer's alpha is
-/// multiplied by the mask's alpha (its rendered coverage), which is what
-/// [`Layer::set_clip_shape`] clips with. Only alpha is scaled — the
-/// composite pipeline blends with non-premultiplied `ALPHA_BLENDING`, so
-/// scaling the color too would apply the mask twice.
+/// [`COMPOSITE_SHADER_SRC`] plus a mask texture: the layer is multiplied
+/// by the mask's alpha (its rendered coverage), which is what
+/// [`Layer::set_clip_shape`] clips with. Layer textures are premultiplied
+/// and composited with `PREMULTIPLIED_ALPHA_BLENDING`, so colour and alpha
+/// are scaled together; scaling alpha alone leaves the colour to be added
+/// over whatever is below, and nothing outside the shape is cut.
 const MASKED_COMPOSITE_SHADER_SRC: &str = r#"
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -235,7 +236,7 @@ fn vs_main(
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let c = textureSample(tex, samp, in.uv);
     let m = textureSample(mask_tex, samp, in.uv).a;
-    return vec4<f32>(c.rgb, c.a * m);
+    return c * m;
 }
 "#;
 
@@ -547,7 +548,13 @@ impl LayerPipelines {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    // A shape blends over what the layer already holds, the
+                    // same as text and images. `REPLACE` let a translucent
+                    // fill overwrite the texel, punching its alpha into an
+                    // opaque card so whatever was under the layer showed
+                    // through. Straight-alpha source in, premultiplied out
+                    // (see `build_composite_pipeline`).
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -795,10 +802,15 @@ impl LayerPipelines {
 }
 
 /// Build one of the two composite pipelines (plain and masked): a
-/// fullscreen `CompositeVertex` quad onto the swap-chain view with
-/// non-premultiplied alpha blending — a layer's texture is cleared to
-/// transparent, so untouched areas must let whatever composited before it
-/// show through.
+/// fullscreen `CompositeVertex` quad onto the swap-chain view. A layer's
+/// texture is cleared to transparent, so untouched areas must let whatever
+/// composited before it show through.
+///
+/// The blend is **premultiplied**, because a layer's texture already is:
+/// everything drawn into one blends with `ALPHA_BLENDING`, which leaves
+/// `rgb * a` behind, and so does the MSAA resolve. Treating that as straight
+/// alpha would multiply by alpha a second time, darkening translucent fills
+/// and anti-aliased edges over transparent layer.
 fn build_composite_pipeline(
     device: &wgpu::Device,
     surface_format: wgpu::TextureFormat,
@@ -829,7 +841,7 @@ fn build_composite_pipeline(
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: surface_format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
