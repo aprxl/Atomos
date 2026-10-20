@@ -1,7 +1,7 @@
 //! Headless GPU harness for pixel regression tests.
 //!
 //! [`Scene`] stands in for [`super::Renderer`]'s window plumbing: a fixed
-//! `Rgba8UnormSrgb` target cleared to opaque black, 4x MSAA, and the real
+//! `Rgba8UnormSrgb` target cleared to opaque black, the adapter-picked MSAA count, and the real
 //! layer pipeline from [`super::layer::render_frame`]. Tests draw through
 //! ordinary [`Layer`] handles and read single pixels back.
 //!
@@ -17,7 +17,6 @@ use super::text_stack::TextStack;
 use super::{Layer, LayerInvalidation};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-const MSAA: u32 = 4;
 
 pub(super) struct Scene {
     device: wgpu::Device,
@@ -29,6 +28,7 @@ pub(super) struct Scene {
     pipelines: LayerPipelines,
     text: Rc<RefCell<TextStack>>,
     order: VecDeque<Weak<RefCell<LayerInner>>>,
+    stats: super::RenderStats,
 }
 
 impl Scene {
@@ -40,15 +40,31 @@ impl Scene {
             compatible_surface: None,
         }))
         .ok()?;
+        // Same device features and sample-count choice as `Renderer::new`,
+        // so the tests exercise the MSAA count real windows get (8x where
+        // the adapter offers it), stencil included.
+        let extended = adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("atomos-test-device"),
+            required_features: if extended {
+                wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+            } else {
+                wgpu::Features::empty()
+            },
             ..Default::default()
         }))
         .ok()?;
+        let samples = if extended {
+            super::pick_msaa_sample_count(&adapter, FORMAT)
+        } else {
+            super::MSAA_SAMPLE_COUNT_FALLBACK
+        };
 
-        let pipelines = LayerPipelines::new(&device, FORMAT, MSAA);
+        let pipelines = LayerPipelines::new(&device, FORMAT, samples);
         let text = Rc::new(RefCell::new(TextStack::new(
-            &device, &queue, FORMAT, size, MSAA,
+            &device, &queue, FORMAT, size, samples,
         )));
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("atomos-test-target"),
@@ -65,7 +81,7 @@ impl Scene {
             view_formats: &[],
         });
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        let msaa = layer::create_msaa_target(&device, FORMAT, size, MSAA);
+        let msaa = layer::create_msaa_target(&device, FORMAT, size, samples);
         Some(Self {
             device,
             queue,
@@ -76,11 +92,17 @@ impl Scene {
             pipelines,
             text,
             order: VecDeque::new(),
+            stats: super::RenderStats::default(),
         })
     }
 
     pub(super) fn text(&self) -> std::cell::RefMut<'_, TextStack> {
         self.text.borrow_mut()
+    }
+
+    /// What the last frame did and cost.
+    pub(super) fn stats(&self) -> super::RenderStats {
+        self.stats
     }
 
     /// A new top layer; `Manual` so tests control when content changes.
@@ -106,7 +128,7 @@ impl Scene {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.text.borrow_mut().advance_frame();
-        layer::render_frame(
+        self.stats = layer::render_frame(
             &mut encoder,
             &self.target_view,
             &self.msaa,

@@ -44,6 +44,7 @@ use super::path_paint::{FillRule, LineCap, LineJoin, PathPaint, Stroke};
 use super::pixels::Pixels;
 use super::rounding::Rounding;
 use super::shader::ShaderEffect;
+use super::stats::RenderStats;
 use super::text_stack::TextStack;
 use super::{Alignment, Font, FontParameters, TextLayout, TextSpan, Vertex};
 
@@ -1681,12 +1682,12 @@ impl LayerInner {
     /// `texture_view` as input) and before `composite` (which reads
     /// whatever this leaves in `composite_bind_group`, already repointed
     /// by `rebuild_effect_gpu`).
-    fn apply_effect_if_needed(&mut self, encoder: &mut wgpu::CommandEncoder) {
+    fn apply_effect_if_needed(&mut self, encoder: &mut wgpu::CommandEncoder) -> bool {
         if !std::mem::take(&mut self.effect_texture_dirty) {
-            return;
+            return false;
         }
         let Some(effect_gpu) = &self.effect_gpu else {
-            return;
+            return false;
         };
         #[cfg(test)]
         {
@@ -1730,6 +1731,27 @@ impl LayerInner {
                     &self.composite_quad_vbuf,
                 );
             }
+        }
+        true
+    }
+
+    /// Add this layer's targets and counts to `stats`.
+    fn add_to_stats(&self, stats: &mut RenderStats) {
+        stats.layers += 1;
+        stats.text_batches += self.text_batches.len() as u32;
+        let texels = self.texture_size.0 as u64 * self.texture_size.1 as u64;
+        stats.bytes.group_textures += texels * 4;
+        if self.is_group() {
+            stats.group_layers += 1;
+        } else {
+            stats.direct_layers += 1;
+        }
+        if let Some(effect) = &self.effect_gpu {
+            let textures = match effect.kind {
+                EffectGpuKind::Blur(_) => 2,
+                _ => 1,
+            };
+            stats.bytes.effect_textures += texels * 4 * textures;
         }
     }
 
@@ -2058,9 +2080,9 @@ impl LayerInner {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         msaa: &MsaaTarget,
-    ) {
+    ) -> bool {
         if !std::mem::take(&mut self.content_texture_dirty) {
-            return;
+            return false;
         }
         // New content means the effect must run over it again.
         self.effect_texture_dirty = true;
@@ -2095,6 +2117,7 @@ impl LayerInner {
         // it is composited (so an effect is clipped too).
         let mut clip = ClipStack::new([0, 0, self.size.0, self.size.1]);
         self.replay_ops(&mut rpass, &mut clip);
+        true
     }
 
     /// Enter a clip scope: a pixel-aligned rectangle tightens the scissor,
@@ -2392,6 +2415,8 @@ pub(super) struct MsaaTarget {
     pub(super) color_view: wgpu::TextureView,
     _stencil: wgpu::Texture,
     pub(super) stencil_view: wgpu::TextureView,
+    /// Allocation arithmetic: `(colour, stencil)` bytes.
+    bytes: (u64, u64),
 }
 
 pub(super) fn create_msaa_target(
@@ -2402,11 +2427,13 @@ pub(super) fn create_msaa_target(
 ) -> MsaaTarget {
     let (color, color_view) = create_msaa_texture(device, format, size, sample_count);
     let (stencil, stencil_view) = create_msaa_texture(device, STENCIL_FORMAT, size, sample_count);
+    let pixels = size.0.max(1) as u64 * size.1.max(1) as u64 * sample_count as u64;
     MsaaTarget {
         _color: color,
         color_view,
         _stencil: stencil,
         stencil_view,
+        bytes: (pixels * 4, pixels),
     }
 }
 
@@ -3603,7 +3630,10 @@ pub(super) fn render_frame(
     surface_size: (u32, u32),
     scale_factor: f32,
     clear: wgpu::Color,
-) {
+) -> RenderStats {
+    let mut stats = RenderStats::default();
+    stats.bytes.msaa_color = msaa.bytes.0;
+    stats.bytes.msaa_stencil = msaa.bytes.1;
     order.retain(|weak| weak.strong_count() > 0);
     let live: Vec<Rc<RefCell<LayerInner>>> =
         order.iter().filter_map(|weak| weak.upgrade()).collect();
@@ -3617,7 +3647,9 @@ pub(super) fn render_frame(
         inner.resize_if_needed(surface_size);
         inner.set_scale_factor(scale_factor);
         inner.sync_target();
-        inner.rebuild_if_needed();
+        if inner.rebuild_if_needed() {
+            stats.rebuilt_layers += 1;
+        }
     }
     // A later layer's prepare may have reset the shared atlas, which
     // invalidates text prepared earlier in this phase: sweep once more (each
@@ -3634,9 +3666,10 @@ pub(super) fn render_frame(
     for inner in &live {
         let mut inner = inner.borrow_mut();
         if inner.is_group() {
-            inner.render_to_texture_if_needed(encoder, msaa);
-            inner.apply_effect_if_needed(encoder);
+            stats.group_content_passes += inner.render_to_texture_if_needed(encoder, msaa) as u32;
+            stats.group_effect_passes += inner.apply_effect_if_needed(encoder) as u32;
         }
+        inner.add_to_stats(&mut stats);
     }
 
     // Phase 3: the frame.
@@ -3665,4 +3698,5 @@ pub(super) fn render_frame(
             inner.record_direct(&mut rpass, surface);
         }
     }
+    stats
 }

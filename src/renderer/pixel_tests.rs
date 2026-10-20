@@ -659,3 +659,67 @@ fn a_blurred_layer_is_clipped_after_the_blur() {
     assert_near(scene.pixel(32, 32), [255, 255, 255, 255], 2);
     assert_near(scene.pixel(32, 50), [0, 0, 0, 255], 0);
 }
+
+#[test]
+fn twelve_plain_layers_cost_no_surface_sized_textures() {
+    let Some(mut scene) = scene() else { return };
+    let layers: Vec<_> = (0..12).map(|_| scene.layer()).collect();
+    for (i, layer) in layers.iter().enumerate() {
+        layer.draw_rectangle(
+            (i as f32, 0.0),
+            (4.0, 4.0),
+            Color::rgb(255, 255, 255),
+            Rounding::NONE,
+        );
+    }
+    scene.frame(1.0);
+    let stats = scene.stats();
+    assert_eq!(
+        (stats.layers, stats.direct_layers, stats.group_layers),
+        (12, 12, 0)
+    );
+    // Twelve 1x1 placeholders, nothing surface-sized.
+    assert_eq!(stats.bytes.group_textures, 12 * 4);
+    assert_eq!(stats.bytes.effect_textures, 0);
+    assert!(stats.bytes.msaa_color >= 64 * 64 * 4 * 4, "{stats:?}");
+    assert_eq!(stats.bytes.msaa_stencil * 4, stats.bytes.msaa_color);
+    // The old design: twelve 64x64 RGBA textures on top of the shared MSAA.
+    assert!(stats.bytes.total() < stats.bytes.msaa_color + 12 * 64 * 64 * 4);
+}
+
+#[test]
+fn stats_report_groups_passes_and_rebuilds() {
+    let Some(mut scene) = scene() else { return };
+    let plain = scene.layer();
+    let cached = scene.layer();
+    for layer in [&plain, &cached] {
+        layer.draw_rectangle(
+            (0.0, 0.0),
+            (4.0, 4.0),
+            Color::rgb(255, 255, 255),
+            Rounding::NONE,
+        );
+    }
+    cached.set_effect(Some(ShaderEffect::Blur { radius: 2.0 }));
+    scene.frame(1.0);
+    let first = scene.stats();
+    assert_eq!((first.direct_layers, first.group_layers), (1, 1));
+    assert_eq!(first.rebuilt_layers, 2);
+    assert_eq!(
+        (first.group_content_passes, first.group_effect_passes),
+        (1, 1)
+    );
+    assert_eq!(
+        first.bytes.effect_textures,
+        64 * 64 * 4 * 2,
+        "blur: output + ping"
+    );
+
+    scene.frame(1.0);
+    let clean = scene.stats();
+    assert_eq!(clean.rebuilt_layers, 0);
+    assert_eq!(
+        (clean.group_content_passes, clean.group_effect_passes),
+        (0, 0)
+    );
+}

@@ -35,6 +35,7 @@ mod path_paint;
 mod pixels;
 mod rounding;
 mod shader;
+mod stats;
 mod text_layout;
 mod text_span;
 mod text_stack;
@@ -66,6 +67,7 @@ pub use path_paint::{FillRule, LineCap, LineJoin, PathPaint, Stroke};
 pub use pixels::Pixels;
 pub use rounding::Rounding;
 pub use shader::{ColorMatrix, ShaderEffect};
+pub use stats::{RenderStats, ResourceBytes};
 pub use text_layout::{TextLayout, TextLine, TextRect};
 pub use text_span::TextSpan;
 
@@ -200,6 +202,8 @@ pub struct Renderer {
     // cost a full-surface 4x texture each. Kept alive for `msaa_view`.
     msaa: layer::MsaaTarget,
     msaa_size: (u32, u32),
+    // What the last frame did and what its targets cost.
+    stats: RenderStats,
     // Resolved once in `new` via `pick_msaa_sample_count` — every layer's
     // solid/image/text pipeline and the shared MSAA texture above all use
     // this same value, so it's threaded through their constructors rather
@@ -575,6 +579,7 @@ impl Renderer {
             layer_pipelines,
             msaa,
             msaa_size,
+            stats: RenderStats::default(),
             msaa_sample_count,
             text_stack,
             layers,
@@ -785,7 +790,7 @@ impl Renderer {
 
         // One multisampled pass draws the whole frame, cleared to the
         // background colour (see `layer::render_frame`).
-        layer::render_frame(
+        self.stats = layer::render_frame(
             &mut encoder,
             &view,
             &self.msaa,
@@ -842,6 +847,13 @@ impl Renderer {
         self.timestamps
             .as_ref()
             .and_then(|timestamps| timestamps.last_gpu_frametime)
+    }
+
+    /// Counters and target sizes of the most recently rendered frame:
+    /// direct versus offscreen layers, passes recorded, and the bytes the
+    /// frame's textures cost. See [`RenderStats`].
+    pub fn stats(&self) -> &RenderStats {
+        &self.stats
     }
 
     /// Wall-clock time elapsed since this `Renderer` was created.
