@@ -569,6 +569,10 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                if let Some(w) = &self.window {
+                    self.input.sync_ime(w);
+                }
+
                 // Exactly once per frame, after everything has read state.
                 self.input.end_frame();
             }

@@ -111,7 +111,27 @@ Characters typed this frame, control characters stripped. Empty on frames with n
 
 Never reconstruct text from `KeyCode`. `KeyCode` answers "which physical key"; `text()` answers "what did the user type". Only one of those is ever the right question.
 
-Capped at 256 characters per frame (`MAX_TEXT_PER_FRAME`); a burst past that is a stuck key or an IME paste, and the excess is dropped rather than buffered forever.
+Text is lossless: IME commits of any length are delivered whole. Whether a key press types depends on the platform's modifier conventions. Windows treats Ctrl+Alt together as AltGr (it types); macOS lets Option type while Control and Command are shortcuts; elsewhere any held Ctrl, Alt or Super makes the press a shortcut. Shift never suppresses.
+
+### Ordered events
+
+```rust
+events() -> &[InputEvent]
+```
+
+Everything that happened this frame in OS delivery order: `Key`, `Text`, `Preedit`, `MouseButton`, `MouseMoved`, `Scroll`, `Focus`. Use this instead of the aggregate queries whenever order matters, for example when a mode-changing key must take effect before the character typed right after it. A key press that produces characters yields `Key` immediately followed by `Text`. Each event carries only its own payload (held modifiers where relevant), not a copy of the whole input state. The aggregate queries remain for widgets that only ask "did X happen this frame". Cleared by `end_frame`.
+
+### IME
+
+```rust
+preedit() -> Option<&Preedit>
+set_ime_cursor_area(top_left: (f32, f32), size: (f32, f32))
+sync_ime(&mut self, window: &Window)
+```
+
+Call `sync_ime(&window)` once per frame (it enables IME on first use and only talks to the OS when the caret rectangle changed). Report the caret rectangle in logical pixels with `set_ime_cursor_area` so the candidate window opens beside the text being composed.
+
+While composing, `preedit()` returns the provisional text and its caret/selection (byte offsets). It is not part of the document: draw it at the caret, conventionally underlined. The final result arrives as `InputEvent::Text` (and in `text()`), and the composition ends at that moment. A composition may span frames.
 
 ## Mouse
 
