@@ -41,6 +41,8 @@ mod text_span;
 mod text_stack;
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod clip_tests;
 #[cfg(test)]
 mod pixel_tests;

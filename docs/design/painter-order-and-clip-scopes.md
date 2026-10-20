@@ -596,3 +596,46 @@ cleared to black).
   bytes).*
 - **Q7.** Opaque-coverage skipping through an explicit `set_opaque_rect`, or
   leave it out until profiling asks?
+
+---
+
+## 8. Implementation status and measured results (2026-10-20)
+
+Implemented: stages 1 to 4 and the counters of stage 0/6 (`Renderer::stats`).
+Not implemented: stage 5 (bounded group textures and the scratch pool),
+stage 6 budgets and demotion, stage 7 (bounds-disjoint batch merging).
+Decisions taken: direct replay by default (Q1), closure `with_clip` and the
+old setters removed (Q2), `Custom` effect `uv` stays surface-wide for now
+since groups are still surface-sized (Q3), stencil always attached (Q4),
+in-stream groups later (Q5).
+
+Benchmark (`cargo test --release --lib renderer::bench -- --ignored
+--nocapture --test-threads=1`), Windows, NVIDIA RTX 5070 Ti, Vulkan, 8x MSAA
+(the adapter-picked count). Serialized CPU+GPU cost per clean frame, 60
+samples after 10 warmup; the audit's workload (N layers, each a 100x100 rect
+with a clip). Memory is the allocation arithmetic from `RenderStats`.
+
+| Target | Layers | Direct: median / p95 ms | Direct MiB | Cached: median / p95 ms | Cached MiB |
+|---|---:|---|---:|---|---:|
+| 1920x1080 | 1 | 0.096 / 0.228 | 79.1 | 0.097 / 0.156 | 87.0 |
+| 1920x1080 | 12 | 0.101 / 0.162 | 79.1 | 0.102 / 0.160 | 174.0 |
+| 1920x1080 | 24 | 0.109 / 0.173 | 79.1 | 0.104 / 0.149 | 268.9 |
+| 3840x2160 | 12 | 0.195 / 0.245 | 316.4 | 0.192 / 0.304 | 696.1 |
+| 3840x2160 | 24 | 0.203 / 0.369 | 316.4 | 0.204 / 0.371 | 1,075.8 |
+
+The audit's clean-frame figures for comparison (4x MSAA, same GPU): upstream
+0.512 ms (1080p, 12 layers) and 2.750 ms (4K, 24 layers); the fork 0.234 and
+0.839 ms. A blinking caret over a full-screen text page: 1080p 0.114 ms direct
+vs 0.126 ms cached; 4K 0.214 ms direct vs 0.295 ms cached.
+
+Findings:
+
+- **R1 did not materialise on a discrete GPU.** Replaying a full text page
+  every presented frame costs no more than compositing a cached texture. An
+  integrated GPU was not tested and remains the open question.
+- **Memory is dominated by the MSAA targets, not by layers.** Colour plus
+  stencil at 8x is 79 MiB at 1080p and 316 MiB at 4K regardless of layer
+  count. Cached groups still cost a surface-sized texture each (stage 5).
+- An adaptive sample count (4x above a pixel budget) would cut the 4K figure
+  to 158 MiB; the pipelines are built for one count at startup, so this needs
+  an owner decision on quality versus memory.
