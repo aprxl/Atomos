@@ -438,9 +438,23 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let c = textureSampleLevel(tex, samp, in.uv, 0.0);
-    var result = mat.cols[0] * c.r + mat.cols[1] * c.g + mat.cols[2] * c.b + mat.cols[3] * c.a + mat.cols[4];
-    return clamp(result, vec4<f32>(0.0), vec4<f32>(1.0));
+    // Layer textures are premultiplied, but the matrix is defined on
+    // straight (unpremultiplied) linear-light RGBA, so offsets and
+    // alpha-changing rows mean what they say. Un-premultiply, transform,
+    // clamp, and premultiply again so the output is a valid premultiplied
+    // texel: transparent input with an additive offset (invert) stays
+    // invisible instead of adding colour.
+    let p = textureSampleLevel(tex, samp, in.uv, 0.0);
+    var c = vec4<f32>(0.0);
+    if (p.a > 0.0) {
+        c = vec4<f32>(p.rgb / p.a, p.a);
+    }
+    let result = clamp(
+        mat.cols[0] * c.r + mat.cols[1] * c.g + mat.cols[2] * c.b + mat.cols[3] * c.a + mat.cols[4],
+        vec4<f32>(0.0),
+        vec4<f32>(1.0),
+    );
+    return vec4<f32>(result.rgb * result.a, result.a);
 }
 "#;
 

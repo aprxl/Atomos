@@ -58,6 +58,10 @@ pub enum ShaderEffect {
     /// }
     /// ```
     ///
+    /// The `tex` a custom shader samples is **premultiplied** (colour
+    /// already multiplied by alpha), and the value it returns must be a
+    /// valid premultiplied colour (`rgb <= a`) too.
+    ///
     /// Copy that module verbatim and edit only `fs_main`'s body — the
     /// vertex stage and bindings must match exactly, since that's the
     /// contract the renderer's pipeline layout expects. Compile/validation
@@ -75,6 +79,13 @@ pub enum ShaderEffect {
 /// red channel (`r*values[0] + g*values[1] + b*values[2] + a*values[3] +
 /// values[4]`), `values[5..10]` produce green, `[10..15]` blue, `[15..20]`
 /// alpha.
+///
+/// The matrix works on **straight (unpremultiplied) linear-light** RGBA and
+/// its result is clamped to `0..=1`. Layers are stored premultiplied; the
+/// renderer converts around the transform, so offsets and alpha rows behave
+/// as written. A matrix may generate alpha (a constant-colour matrix fills
+/// the whole layer), and a transparent input pixel stays invisible under
+/// an additive offset unless the alpha row makes it visible.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorMatrix(pub [f32; 20]);
 

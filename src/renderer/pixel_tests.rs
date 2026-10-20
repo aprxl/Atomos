@@ -2,7 +2,7 @@
 //! when no adapter is available; see [`super::test_support`].
 
 use super::test_support::Scene;
-use super::{ClipShape, Color, Rounding};
+use super::{ClipShape, Color, ColorMatrix, Rounding, ShaderEffect};
 
 fn scene() -> Option<Scene> {
     Scene::new((64, 64))
@@ -124,4 +124,53 @@ fn content_drawn_before_the_first_render_uses_the_scale_it_renders_at() {
     scene.frame(2.0);
     // Drawn while the layer still reported scale 1, rendered at 2.
     assert_near(scene.pixel(12, 4), [255, 0, 0, 255], 1);
+}
+
+#[test]
+fn a_color_matrix_leaves_transparent_texels_transparent() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (8.0, 8.0),
+        Color::rgb(255, 0, 0),
+        Rounding::NONE,
+    );
+    layer.set_effect(Some(ShaderEffect::ColorMatrix(ColorMatrix::invert())));
+    scene.frame(1.0);
+    // Inverting transparent black yields white at alpha zero, which must
+    // not leak into the frame.
+    assert_near(scene.pixel(32, 32), [0, 0, 0, 255], 0);
+    // Inside the content, red inverts to cyan.
+    assert_near(scene.pixel(4, 4), [0, 255, 255, 255], 1);
+}
+
+#[test]
+fn an_identity_matrix_preserves_translucent_edges() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    layer.draw_rectangle(
+        (0.0, 0.0),
+        (20.0, 20.0),
+        Color::rgba(255, 255, 255, 128),
+        Rounding::NONE,
+    );
+    layer.set_effect(Some(ShaderEffect::ColorMatrix(ColorMatrix::IDENTITY)));
+    scene.frame(1.0);
+    assert_near(scene.pixel(4, 4), [188, 188, 188, 255], 3);
+}
+
+#[test]
+fn a_matrix_can_generate_alpha_from_nothing() {
+    let Some(mut scene) = scene() else { return };
+    let layer = scene.layer();
+    // Constant opaque blue regardless of input.
+    layer.set_effect(Some(ShaderEffect::ColorMatrix(ColorMatrix([
+        0.0, 0.0, 0.0, 0.0, 0.0, //
+        0.0, 0.0, 0.0, 0.0, 0.0, //
+        0.0, 0.0, 0.0, 0.0, 1.0, //
+        0.0, 0.0, 0.0, 0.0, 1.0,
+    ]))));
+    scene.frame(1.0);
+    assert_near(scene.pixel(32, 32), [0, 0, 255, 255], 0);
 }
