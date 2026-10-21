@@ -909,3 +909,110 @@ mod slant {
         assert_ne!(before, after, "slant is part of the draw hash");
     }
 }
+
+/// `crate::layout` through the real `Layer`: measurement, wrapping, paint
+/// and clipping against actual pixels.
+mod layout_paint {
+    use super::*;
+    use crate::layout::{Layout, Overflow, Paint, Rect, Style, Text, px};
+    use crate::renderer::{Font, FontParameters};
+
+    const WHITE: Color = Color::rgb(255, 255, 255);
+
+    #[test]
+    fn backgrounds_land_on_the_solved_rects_and_hidden_overflow_is_clipped() {
+        let Some(mut scene) = Scene::new((200, 120)) else { return };
+        let layer = scene.layer();
+        let mut ui = Layout::new();
+        let panel = ui.add(
+            ui.root(),
+            Style::new().size(60.0, 40.0).margin(10.0).overflow(Overflow::Hidden),
+        );
+        ui.set_paint(panel, Some(Paint::background(Color::rgb(0, 0, 200))));
+        // Taller than the panel: the part below must be cut off.
+        let spill = ui.add(panel, Style::new().size(60.0, 100.0).shrink(0.0));
+        ui.set_paint(spill, Some(Paint::background(Color::rgb(0, 200, 0))));
+        ui.compute(Rect::new(0.0, 0.0, 200.0, 120.0), &layer);
+        assert_eq!(ui.rect(panel), Rect::new(10.0, 10.0, 60.0, 40.0));
+        layer.clear();
+        ui.paint(&layer);
+        scene.frame(1.0);
+        assert_near(scene.pixel(40, 30), [0, 200, 0, 255], 2); // inside
+        assert_near(scene.pixel(40, 70), [0, 0, 0, 255], 0); // spill clipped
+        assert_near(scene.pixel(5, 30), [0, 0, 0, 255], 0); // outside left
+    }
+
+    #[test]
+    fn a_border_is_a_ring_over_a_background_that_fills_the_whole_box() {
+        for radius in [0.0, 8.0] {
+            let Some(mut scene) = Scene::new((100, 100)) else { return };
+            let layer = scene.layer();
+            let mut ui = Layout::new();
+            let boxed = ui.add(ui.root(), Style::new().size(60.0, 60.0).margin(10.0));
+            ui.set_paint(
+                boxed,
+                Some(
+                    Paint::background(Color::rgb(0, 0, 200))
+                        .radius(radius)
+                        .border(4.0, Color::rgb(200, 0, 0)),
+                ),
+            );
+            ui.compute(Rect::new(0.0, 0.0, 100.0, 100.0), &layer);
+            layer.clear();
+            ui.paint(&layer);
+            scene.frame(1.0);
+            assert_near(scene.pixel(40, 40), [0, 0, 200, 255], 2); // interior: background
+            assert_near(scene.pixel(40, 12), [200, 0, 0, 255], 2); // top border band
+            assert_near(scene.pixel(12, 40), [200, 0, 0, 255], 2); // left border band
+            assert_near(scene.pixel(5, 40), [0, 0, 0, 255], 0); // outside
+        }
+    }
+
+    #[test]
+    fn wrapped_text_is_measured_painted_and_stays_inside_its_box() {
+        let Some(mut scene) = Scene::new((200, 160)) else { return };
+        let layer = scene.layer();
+        let font = Font::Named("sans-serif".into());
+        let params = FontParameters::new(14.0);
+        if layer.get_text_size("M", &font, &params).0 <= 0.0 {
+            return; // no usable font on this machine
+        }
+        let sentence = "alpha beta gamma delta epsilon zeta eta theta";
+        let mut ui = Layout::new();
+        let column = ui.add(ui.root(), Style::new().width(px(90.0)).padding(4.0));
+        let paragraph = ui.add_text(
+            column,
+            Style::new(),
+            Text::new(sentence, font.clone(), params, WHITE),
+        );
+        ui.compute(Rect::new(0.0, 0.0, 200.0, 160.0), &layer);
+
+        // The leaf is as tall as the renderer says the wrapped text is.
+        let rect = ui.rect(paragraph);
+        let (_, wrapped_height) = layer.get_wrapped_text_size(sentence, rect.width, &font, &params);
+        let (_, one_line) = layer.get_text_size(sentence, &font, &params);
+        assert!(wrapped_height > one_line * 1.5, "it should have wrapped");
+        assert!((rect.height - wrapped_height).abs() <= 1.0, "{rect:?} vs {wrapped_height}");
+        assert_eq!(rect.width, 82.0, "column 90 minus 4px padding each side");
+
+        layer.clear();
+        ui.paint(&layer);
+        scene.frame(1.0);
+        let inked = |x0: u32, x1: u32, y0: u32, y1: u32| {
+            (y0..y1).any(|y| (x0..x1).any(|x| scene.pixel(x, y)[0] > 128))
+        };
+        let (left, top) = (rect.x as u32, rect.y as u32);
+        let bottom = (rect.y + rect.height) as u32;
+        // Every line has ink...
+        for line in 0..(wrapped_height / one_line).round() as u32 {
+            let y = top + (line as f32 * one_line) as u32;
+            assert!(
+                inked(left, left + rect.width as u32, y, y + one_line as u32),
+                "line {line} is blank"
+            );
+        }
+        // ...none leaks past the box's right edge or below its bottom.
+        assert!(!inked(left + rect.width as u32 + 2, 200, 0, 160), "ink right of the box");
+        assert!(!inked(0, 200, bottom + 2, 160), "ink below the box");
+    }
+}

@@ -13,6 +13,7 @@ lyon_extra = "1.1"
 log = "0.4"
 pollster = "0.4"
 swash = "0.2.9"
+taffy = { version = "=0.15.0", default-features = false, features = ["std", "taffy_tree", "flexbox"] }
 unicode-segmentation = "1"
 wgpu = "29.0.4"
 winit = "0.30.13"
