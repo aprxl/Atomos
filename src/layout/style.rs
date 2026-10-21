@@ -283,14 +283,21 @@ impl Style {
         self
     }
 
-    /// Share of leftover main-axis space, by weight. Implies a zero basis,
-    /// so the weights split the whole line instead of the leftovers after
-    /// content; use [`Style::basis`] afterwards to override.
+    /// Share of leftover main-axis space, by weight, on top of the item's
+    /// own basis (its `width`/`height`/`basis`, else its content). CSS
+    /// `flex-grow`. For "split the whole line by weight" use
+    /// [`Style::flex`].
     pub fn grow(mut self, weight: f32) -> Self {
         self.inner.flex_grow = weight;
-        if weight > 0.0 {
-            self.inner.flex_basis = Dimension::length(0.0);
-        }
+        self
+    }
+
+    /// CSS `flex: weight`: grow by `weight` from a zero basis, so
+    /// siblings split the *whole* line in proportion to their weights
+    /// regardless of content. Overrides any basis set earlier.
+    pub fn flex(mut self, weight: f32) -> Self {
+        self.inner.flex_grow = weight;
+        self.inner.flex_basis = Dimension::length(0.0);
         self
     }
 
@@ -305,13 +312,24 @@ impl Style {
         self
     }
 
-    /// An exact main-axis extent that never grows, shrinks, or is floored
-    /// by its content (CSS `min-width: auto` would floor it).
-    pub fn fixed(mut self, extent: f32) -> Self {
+    /// An exact width that never grows, shrinks, or is floored by its
+    /// content (CSS `min-width: auto` would floor it). Use for children of
+    /// a row.
+    pub fn fixed_width(mut self, extent: f32) -> Self {
+        self.inner.size.width = Dimension::length(extent);
         self.inner.flex_basis = Dimension::length(extent);
         self.inner.flex_grow = 0.0;
         self.inner.flex_shrink = 0.0;
         self.inner.min_size.width = LengthPercentageAuto::length(0.0);
+        self
+    }
+
+    /// [`Style::fixed_width`] for the height; use for children of a column.
+    pub fn fixed_height(mut self, extent: f32) -> Self {
+        self.inner.size.height = Dimension::length(extent);
+        self.inner.flex_basis = Dimension::length(extent);
+        self.inner.flex_grow = 0.0;
+        self.inner.flex_shrink = 0.0;
         self.inner.min_size.height = LengthPercentageAuto::length(0.0);
         self
     }

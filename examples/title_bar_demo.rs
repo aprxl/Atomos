@@ -62,10 +62,10 @@ impl Bar {
         ui.set_paint(rule, Some(Paint::background(RULE)));
 
         // Left half: brand (fixed 188) then the sidebar button.
-        let left = ui.add(bar, Style::row().grow(1.0));
+        let left = ui.add(bar, Style::row().flex(1.0));
         let brand = ui.add(
             left,
-            Style::row().fixed(188.0).items_center().padding_left(20.0).gap(11.0),
+            Style::row().fixed_width(188.0).items_center().padding_left(20.0).gap(11.0),
         );
         let logo = ui.add(brand, Style::new().size(30.0, 30.0).shrink(0.0));
         ui.set_paint(logo, Some(Paint::background(BLUE).radius(15.0)));
@@ -97,7 +97,7 @@ impl Bar {
         ui.add_text(search, Style::new().shrink(1.0), text("Search notes", 12.5, DIM));
 
         // Right half: Focus, then the theme switch, pinned to the edge.
-        let right = ui.add(bar, Style::row().grow(1.0).justify(Justify::End));
+        let right = ui.add(bar, Style::row().flex(1.0).justify(Justify::End));
         let focus = ui.add(
             right,
             Style::row()

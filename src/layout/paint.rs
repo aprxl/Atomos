@@ -8,7 +8,9 @@
 use taffy::style::Display;
 
 use super::{Layout, Measurer, NodeId, Rect, Space};
-use crate::renderer::{Alignment, ClipShape, Color, Font, FontParameters, Layer, Rounding};
+use crate::renderer::{
+    Alignment, ClipShape, Color, FillRule, Font, FontParameters, Layer, PathPaint, Rounding,
+};
 
 /// How a node looks. Everything is optional; a node with no `Paint` costs
 /// one `None`.
@@ -79,6 +81,29 @@ impl Text {
         self.wrap = false;
         self
     }
+}
+
+/// An SVG path for a rounded rectangle in absolute logical pixels.
+fn rounded_rect_path(r: Rect, radius: f32) -> String {
+    let (x, y, w, h) = (r.x, r.y, r.width, r.height);
+    let rad = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+    if rad < 0.01 {
+        return format!("M{x} {y} H{} V{} H{x} Z", x + w, y + h);
+    }
+    format!(
+        "M{} {y} H{} A{rad} {rad} 0 0 1 {} {} V{} A{rad} {rad} 0 0 1 {} {} H{} A{rad} {rad} 0 0 1 {x} {} V{} A{rad} {rad} 0 0 1 {} {y} Z",
+        x + rad,
+        x + w - rad,
+        x + w,
+        y + rad,
+        y + h - rad,
+        x + w - rad,
+        y + h,
+        x + rad,
+        y + h - rad,
+        y + rad,
+        x + rad
+    )
 }
 
 const MEMO: usize = 4;
@@ -246,29 +271,28 @@ impl Layout {
         let e = &self.entries[index as usize];
         let r = e.rect;
         if let Some(p) = &e.paint {
-            match &p.border {
-                Some((width, color)) if *width > 0.0 => {
-                    layer.draw_rectangle(r.position(), r.size(), color.clone(), rounding(p.radius));
-                    let inner = r.inset(*width);
-                    if let Some(bg) = &p.background {
-                        layer.draw_rectangle(
-                            inner.position(),
-                            inner.size(),
-                            bg.clone(),
-                            rounding((p.radius - width).max(0.0)),
-                        );
-                    }
-                }
-                _ => {
-                    if let Some(bg) = &p.background {
-                        layer.draw_rectangle(
-                            r.position(),
-                            r.size(),
-                            bg.clone(),
-                            rounding(p.radius),
-                        );
-                    }
-                }
+            if let Some(bg) = &p.background {
+                layer.draw_rectangle(r.position(), r.size(), bg.clone(), rounding(p.radius));
+            }
+            if let Some((width, color)) = &p.border
+                && *width > 0.0
+            {
+                // A ring (outer minus inner, even-odd), so a translucent
+                // background or border is never painted over itself.
+                let inner = r.inset(*width);
+                let d = format!(
+                    "{} {}",
+                    rounded_rect_path(r, p.radius),
+                    rounded_rect_path(inner, (p.radius - width).max(0.0))
+                );
+                let _ = layer.draw_path(
+                    &d,
+                    (0.0, 0.0),
+                    PathPaint::Fill {
+                        color: color.clone(),
+                        rule: FillRule::EvenOdd,
+                    },
+                );
             }
         }
         if let Some(super::Leaf::Text(leaf)) = self.tree.get_node_context(e.node) {

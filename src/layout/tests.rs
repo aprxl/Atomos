@@ -64,9 +64,9 @@ fn column_is_the_default_and_stacks() {
 fn row_with_fixed_and_weighted_grow() {
     let mut ui = Layout::new();
     let row = ui.add(ui.root(), Style::row().height(px(40.0)).gap(10.0));
-    let tree = ui.add(row, Style::new().fixed(100.0));
-    let a = ui.add(row, Style::new().grow(1.0));
-    let b = ui.add(row, Style::new().grow(3.0));
+    let tree = ui.add(row, Style::new().fixed_width(100.0));
+    let a = ui.add(row, Style::new().flex(1.0));
+    let b = ui.add(row, Style::new().flex(3.0));
     ui.compute(VIEW, &M);
     // 400 - 100 - 2 gaps of 10 = 280, split 1:3.
     assert_eq!(ui.rect(tree), Rect::new(0.0, 0.0, 100.0, 40.0));
@@ -90,9 +90,9 @@ fn padding_and_cross_axis_centering() {
 fn fixed_is_exact_even_when_content_is_wider() {
     let mut ui = Layout::new();
     let row = ui.add(ui.root(), Style::row().height(px(20.0)));
-    let panel = ui.add(row, Style::new().fixed(10.0));
+    let panel = ui.add(row, Style::new().fixed_width(10.0));
     ui.add_text(panel, Style::new(), text("a very long unbreakable label").no_wrap());
-    let rest = ui.add(row, Style::new().grow(1.0));
+    let rest = ui.add(row, Style::new().flex(1.0));
     ui.compute(VIEW, &M);
     // Not floored at the content's width: a collapse animation can drive
     // a panel below its minimum without it snapping.
@@ -157,7 +157,7 @@ fn flex_item_with_text_is_not_squeezed_below_its_longest_word() {
 fn min_content_is_the_window_floor() {
     let mut ui = Layout::new();
     let row = ui.add(ui.root(), Style::row());
-    ui.add(row, Style::new().fixed(200.0));
+    ui.add(row, Style::new().fixed_width(200.0));
     ui.add(row, Style::new().width(px(120.0)).shrink(0.0));
     let (w, _) = ui.min_content(&M);
     assert_eq!(w, 320.0);
@@ -169,8 +169,8 @@ fn min_content_is_the_window_floor() {
 fn hidden_node_takes_no_space_and_keeps_its_rect() {
     let mut ui = Layout::new();
     let row = ui.add(ui.root(), Style::row().height(px(20.0)));
-    let panel = ui.add(row, Style::new().fixed(100.0));
-    let rest = ui.add(row, Style::new().grow(1.0));
+    let panel = ui.add(row, Style::new().fixed_width(100.0));
+    let rest = ui.add(row, Style::new().flex(1.0));
     ui.compute(VIEW, &M);
     assert_eq!(ui.rect(rest).x, 100.0);
     ui.set_style(panel, |s| s.hidden(true));
@@ -185,7 +185,7 @@ fn siblings_share_edges_at_fractional_scale() {
     let m = Cells { scale: 1.5 };
     let mut ui = Layout::new();
     let row = ui.add(ui.root(), Style::row().height(px(10.0)));
-    let kids: Vec<_> = (0..3).map(|_| ui.add(row, Style::new().grow(1.0))).collect();
+    let kids: Vec<_> = (0..3).map(|_| ui.add(row, Style::new().flex(1.0))).collect();
     ui.compute(Rect::new(0.0, 0.0, 100.0, 50.0), &m);
     let rects: Vec<_> = kids.iter().map(|k| ui.rect(*k)).collect();
     assert_eq!(rects[0].right(), rects[1].x);
@@ -280,7 +280,7 @@ fn numbers() {
             for _ in 0..4 {
                 ui.add(row, Style::new().size(16.0, 16.0).shrink(0.0));
             }
-            labels.push(ui.add_text(row, Style::new().grow(1.0), text("some label text that wraps maybe")));
+            labels.push(ui.add_text(row, Style::new().flex(1.0), text("some label text that wraps maybe")));
             for _ in 0..4 {
                 ui.add(row, Style::new().size(20.0, 20.0).shrink(0.0));
             }
@@ -368,7 +368,7 @@ fn siblings_share_edges_at_any_origin_and_scale() {
                         Style::row().height(px(10.0)).padding_left(origin),
                     );
                     let ids: Vec<_> =
-                        (0..kids).map(|_| ui.add(row, Style::new().grow(1.0))).collect();
+                        (0..kids).map(|_| ui.add(row, Style::new().flex(1.0))).collect();
                     ui.compute(Rect::new(0.0, 0.0, width, 50.0), &m);
                     for pair in ids.windows(2) {
                         let (a, b) = (ui.rect(pair[0]), ui.rect(pair[1]));
@@ -416,13 +416,13 @@ fn a_no_op_compute_clears_the_moved_flags() {
 fn min_content_is_cached_while_nothing_changes() {
     let mut ui = Layout::new();
     let row = ui.add(ui.root(), Style::row());
-    ui.add(row, Style::new().fixed(50.0));
+    ui.add(row, Style::new().fixed_width(50.0));
     for _ in 0..5 {
         assert_eq!(ui.min_content(&M).0, 50.0);
         ui.compute(VIEW, &M);
     }
     assert_eq!(ui.solves(), 1, "asking every frame must not re-solve every frame");
-    ui.add(row, Style::new().fixed(25.0));
+    ui.add(row, Style::new().fixed_width(25.0));
     assert_eq!(ui.min_content(&M).0, 75.0, "a change invalidates the cache");
 }
 
@@ -451,4 +451,93 @@ fn text_leaves_cannot_take_children() {
     let mut ui = Layout::new();
     let t = ui.add_text(ui.root(), Style::new(), text("x"));
     ui.add(t, Style::new());
+}
+
+// --- gaps called out by the second review ---
+
+#[test]
+fn grow_keeps_the_items_own_basis_and_flex_splits_the_whole_line() {
+    let mut ui = Layout::new();
+    let row = ui.add(ui.root(), Style::row().height(px(10.0)));
+    let a = ui.add(row, Style::new().width(px(100.0)).grow(1.0));
+    let b = ui.add(row, Style::new().width(px(50.0)).grow(1.0));
+    ui.compute(VIEW, &M); // 400 wide: 250 spare, split evenly
+    assert_eq!((ui.rect(a).width, ui.rect(b).width), (225.0, 175.0));
+
+    let mut ui = Layout::new();
+    let row = ui.add(ui.root(), Style::row().height(px(10.0)));
+    let a = ui.add(row, Style::new().width(px(100.0)).flex(1.0));
+    let b = ui.add(row, Style::new().width(px(50.0)).flex(3.0));
+    ui.compute(VIEW, &M);
+    assert_eq!((ui.rect(a).width, ui.rect(b).width), (100.0, 300.0));
+}
+
+#[test]
+fn fixed_width_leaves_the_cross_axis_alone() {
+    let mut ui = Layout::new();
+    let row = ui.add(ui.root(), Style::row().height(px(80.0)));
+    let a = ui.add(row, Style::new().fixed_width(30.0).min_height(px(50.0)));
+    ui.compute(VIEW, &M);
+    assert_eq!(ui.rect(a).width, 30.0);
+    assert_eq!(ui.rect(a).height, 80.0);
+}
+
+#[test]
+fn percentages_wrap_justify_reverse_and_auto_margins() {
+    let mut ui = Layout::new();
+    let half = ui.add(ui.root(), Style::new().width(pct(0.5)).height(px(10.0)));
+    ui.compute(VIEW, &M);
+    assert_eq!(ui.rect(half).width, 200.0);
+
+    let mut ui = Layout::new();
+    let row = ui.add(ui.root(), Style::row().wrap().width(px(100.0)).align_content(Justify::Start));
+    let kids: Vec<_> = (0..3)
+        .map(|_| ui.add(row, Style::new().size(40.0, 10.0).shrink(0.0)))
+        .collect();
+    ui.compute(VIEW, &M);
+    assert_eq!(ui.rect(kids[0]).y, ui.rect(kids[1]).y);
+    assert_eq!(ui.rect(kids[2]).y, 10.0, "third wraps to a second line");
+
+    let mut ui = Layout::new();
+    let row = ui.add(ui.root(), Style::row().justify(Justify::SpaceBetween).height(px(10.0)));
+    let a = ui.add(row, Style::new().size(50.0, 10.0));
+    let b = ui.add(row, Style::new().size(50.0, 10.0));
+    ui.compute(VIEW, &M);
+    assert_eq!((ui.rect(a).x, ui.rect(b).right()), (0.0, 400.0));
+
+    let mut ui = Layout::new();
+    let row = ui.add(ui.root(), Style::row().reverse().height(px(10.0)));
+    let a = ui.add(row, Style::new().size(50.0, 10.0));
+    let b = ui.add(row, Style::new().size(50.0, 10.0));
+    ui.compute(VIEW, &M);
+    assert!(ui.rect(a).x > ui.rect(b).x);
+
+    let mut ui = Layout::new();
+    let row = ui.add(ui.root(), Style::row().height(px(10.0)));
+    let a = ui.add(row, Style::new().size(50.0, 10.0).margin_left(auto()));
+    ui.compute(VIEW, &M);
+    assert_eq!(ui.rect(a).x, 350.0, "an auto margin absorbs the free space");
+}
+
+#[test]
+fn a_long_unbreakable_word_stays_one_line_in_the_fake_and_set_text_remeasures() {
+    let mut ui = Layout::new();
+    let col = ui.add(ui.root(), Style::new().width(px(40.0)));
+    let t = ui.add_text(col, Style::new(), text("supercalifragilistic"));
+    ui.compute(VIEW, &M);
+    assert_eq!(ui.rect(t).height, 16.0);
+    ui.set_text(t, "a b c d e f g h");
+    ui.compute(VIEW, &M);
+    assert!(ui.rect(t).height > 16.0, "new text re-measured");
+}
+
+#[test]
+fn non_finite_input_cannot_poison_the_solver() {
+    let mut ui = Layout::new();
+    let a = ui.add(ui.root(), Style::new().height(px(10.0)));
+    assert!(ui.compute(Rect::new(0.0, 0.0, f32::INFINITY, f32::NAN), &M));
+    assert!(ui.rect(a).width.is_finite() && ui.rect(a).height.is_finite());
+    assert!(!ui.compute(Rect::new(0.0, 0.0, f32::INFINITY, f32::NAN), &M), "NaN must not re-solve forever");
+    ui.compute(VIEW, &Cells { scale: f32::NAN });
+    assert_eq!(ui.rect(a).width, 400.0);
 }

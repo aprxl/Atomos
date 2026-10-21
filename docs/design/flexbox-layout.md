@@ -7,7 +7,7 @@ Status: **phase 1 implemented** (`src/layout/`, `examples/layout_demo.rs`); deci
 - **Measured numbers** (release, `cargo test --release --lib layout::tests::numbers -- --ignored --nocapture`, fake text measurer, one Windows dev machine): `size_of::<taffy::Style>()` = 248 bytes with the chosen features; Atomos's per-node side entry = 80 bytes (including the 8-byte optional paint box; containers also keep a small child-index Vec of their own); solver per-node data is on top of that (not measured separately). 201 nodes (20 rows, 20 wrapping text leaves): cold solve 177 us, whole-tree re-wrap on a width change 61 us per solve, one text leaf changed 7 us, an unchanged `compute` call 3 ns. These exclude real text shaping, which the renderer's shape cache owns.
 - **Min-content text** does not need a `text_stack.rs` change after all: `Measurer::min_content_width` defaults to the widest whitespace-separated word, measured with the existing `get_text_size`. A true word-only wrap measure can replace it later if CJK or hyphenation matters.
 - `Layer` implements `Measurer`; `compute` reads the scale factor from it.
-- `Style::fixed(x)` implements the Typewritter mapping (basis x, no grow or shrink, zero minimums); `Style::grow(w)` sets a zero basis.
+- `Style::fixed_width(x)` / `fixed_height(x)` implement the Typewritter mapping (exact extent, no grow or shrink, zero main-axis minimum); `Style::flex(w)` is CSS `flex: w` (zero basis) and `Style::grow(w)` is plain `flex-grow`.
 - Hit-testing is `hit(point)` (deepest node, later siblings on top, `overflow: hidden` honoured) and `hit_tag(point)` (nearest tagged ancestor).
 - Not done: virtualisation and scroll offsets, grid, the declarative builder, porting any Typewritter component.
 

@@ -59,7 +59,7 @@ impl Ui {
         ui.set_paint(logo, Some(Paint::background(BLUE).radius(14.0)));
         let search = ui.add(
             bar,
-            Style::new().grow(1.0).max_width(px(340.0)).height(px(30.0)),
+            Style::new().flex(1.0).max_width(px(340.0)).height(px(30.0)),
         );
         ui.set_paint(search, Some(Paint::background(BG).radius(6.0)));
         for name in ["Share", "Focus"] {
@@ -76,8 +76,8 @@ impl Ui {
         }
 
         // Body: fixed sidebar and a main column whose text wraps.
-        let body = ui.add(root, Style::row().grow(1.0).gap(12.0));
-        let side = ui.add(body, Style::new().fixed(180.0).padding(12.0).gap(8.0));
+        let body = ui.add(root, Style::row().flex(1.0).gap(12.0));
+        let side = ui.add(body, Style::new().fixed_width(180.0).padding(12.0).gap(8.0));
         ui.set_paint(side, Some(Paint::background(PANEL).radius(8.0)));
         for item in ["Inbox", "Drafts", "Archive"] {
             ui.add_text(side, Style::new(), label(item, 13.0).no_wrap());
@@ -85,7 +85,7 @@ impl Ui {
         let main = ui.add(
             body,
             Style::new()
-                .grow(1.0)
+                .flex(1.0)
                 .padding(16.0)
                 .gap(10.0)
                 .overflow(Overflow::Hidden),

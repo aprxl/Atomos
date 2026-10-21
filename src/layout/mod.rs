@@ -126,9 +126,13 @@ pub trait Measurer {
     ) -> (f32, f32);
 
     /// The narrowest the text can be without breaking inside a word: the
-    /// widest word. Flex items are floored at this.
+    /// widest word. Flex items are floored at this. The default measures
+    /// each distinct word once (the result is memoised per leaf); the
+    /// renderer's shape cache evicts those entries when unused.
     fn min_content_width(&self, text: &str, font: &Font, params: &FontParameters) -> f32 {
-        text.split_whitespace()
+        // Non-breaking spaces do not break lines, so they do not split words.
+        text.split(|c: char| c.is_whitespace() && c != '\u{a0}' && c != '\u{202f}')
+            .filter(|word| !word.is_empty())
             .map(|word| self.text_size(word, font, params, None).0)
             .fold(0.0, f32::max)
     }
@@ -177,6 +181,29 @@ pub struct Constraint {
     /// A dimension the solver has already decided; answer with it.
     pub known: (Option<f32>, Option<f32>),
     pub available: (Space, Space),
+}
+
+/// A scale factor the solver can divide by; the previous one if `scale` is
+/// zero, negative or not finite.
+fn sane_scale(scale: f32, previous: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        previous
+    }
+}
+
+/// A viewport with finite, non-negative extents (non-finite values read as
+/// zero). Infinite or NaN input would otherwise produce infinite rects or
+/// a solve on every call.
+fn sane_rect(r: Rect) -> Rect {
+    let finite = |v: f32| if v.is_finite() { v } else { 0.0 };
+    Rect::new(
+        finite(r.x),
+        finite(r.y),
+        finite(r.width).max(0.0),
+        finite(r.height).max(0.0),
+    )
 }
 
 /// Handle to a node. Stale handles (to removed nodes) panic with a clear
@@ -542,7 +569,8 @@ impl Layout {
     /// styles, the text, nor the viewport have changed since the last solve.
     /// Returns whether it actually solved.
     pub fn compute(&mut self, viewport: Rect, measurer: &dyn Measurer) -> bool {
-        let scale = measurer.scale_factor().max(f32::MIN_POSITIVE);
+        let scale = sane_scale(measurer.scale_factor(), self.scale);
+        let viewport = sane_rect(viewport);
         self.set_scale(scale);
         if !self.dirty && viewport == self.viewport {
             if self.moved_count > 0 {
@@ -586,7 +614,7 @@ impl Layout {
     /// The answer is cached until something invalidates it, so asking every
     /// frame costs nothing while the tree is static.
     pub fn min_content(&mut self, measurer: &dyn Measurer) -> (f32, f32) {
-        self.set_scale(measurer.scale_factor().max(f32::MIN_POSITIVE));
+        self.set_scale(sane_scale(measurer.scale_factor(), self.scale));
         if let Some(cached) = self.min_cache {
             return cached;
         }

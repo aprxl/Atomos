@@ -61,8 +61,8 @@ fn bar_tree() -> Bar {
     // Left and right halves share the slack equally, so the search box
     // between them stays centred on the bar; each half is floored at its
     // own content, which gives Typewritter's clamp for free.
-    let left = ui.add(bar, Style::row().grow(1.0));
-    ui.add(left, Style::new().fixed(188.0)); // logo + wordmark live here
+    let left = ui.add(bar, Style::row().flex(1.0));
+    ui.add(left, Style::new().fixed_width(188.0)); // logo + wordmark live here
     let sidebar = ui.add(left, Style::new().size(34.0, 34.0).margin_top(13.0).shrink(0.0));
 
     let search = ui.add(
@@ -75,7 +75,7 @@ fn bar_tree() -> Bar {
             .margin_x(24.0),
     );
 
-    let right = ui.add(bar, Style::row().grow(1.0).justify(Justify::End));
+    let right = ui.add(bar, Style::row().flex(1.0).justify(Justify::End));
     let focus = ui.add(
         right,
         Style::new().size(80.0, 34.0).margin_top(13.0).margin_right(14.0).shrink(0.0),
