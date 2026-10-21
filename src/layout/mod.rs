@@ -37,6 +37,7 @@
 //! Semantics follow CSS flexbox with one deliberate difference: [`Style::new`]
 //! is a *column* (a `div` stacks its children), not a row.
 
+mod build;
 mod paint;
 mod style;
 #[cfg(test)]
@@ -50,6 +51,7 @@ use taffy::{Size, TaffyTree};
 
 use crate::renderer::{Font, FontParameters, Layer};
 
+pub use build::{Build, El, TextStyle};
 pub use paint::{Paint, Text};
 pub use style::{Align, Justify, Len, Overflow, Style, auto, pct, px};
 
@@ -251,6 +253,8 @@ pub struct Layout {
     moved_count: usize,
     stack: Vec<(u32, f32, f32)>,
     scratch: Vec<u32>,
+    build_frames: Vec<build::Frame>,
+    build_scratch: String,
 }
 
 impl Default for Layout {
@@ -295,6 +299,8 @@ impl Layout {
             moved_count: 0,
             stack: Vec::new(),
             scratch: Vec::new(),
+            build_frames: Vec::new(),
+            build_scratch: String::new(),
         }
     }
 

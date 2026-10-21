@@ -148,6 +148,31 @@ impl TextLeaf {
         true
     }
 
+    /// Makes the leaf show `text` in `font`/`params`/`color`/`wrap`,
+    /// comparing first so an unchanged description allocates and
+    /// invalidates nothing. Returns whether measurement must re-run.
+    pub(super) fn describe(
+        &mut self,
+        text: &str,
+        font: &Font,
+        params: &FontParameters,
+        color: &Color,
+        wrap: bool,
+    ) -> bool {
+        let mut remeasure = self.set_text(text);
+        if self.text.font != *font || self.text.params != *params || self.text.wrap != wrap {
+            self.text.font = font.clone();
+            self.text.params = *params;
+            self.text.wrap = wrap;
+            self.forget();
+            remeasure = true;
+        }
+        if self.text.color != *color {
+            self.text.color = color.clone();
+        }
+        remeasure
+    }
+
     pub(super) fn set_font(&mut self, font: Font, params: FontParameters) -> bool {
         if self.text.font == font && self.text.params == params {
             return false;
