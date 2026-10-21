@@ -25,6 +25,7 @@ use wgpu::{CurrentSurfaceTexture, QuerySet};
 use winit::{event::WindowEvent, window::Window};
 
 mod alignment;
+mod batching;
 mod color;
 mod draw_command;
 mod font;
@@ -40,6 +41,8 @@ mod text_layout;
 mod text_span;
 mod text_stack;
 
+#[cfg(test)]
+mod batching_tests;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]

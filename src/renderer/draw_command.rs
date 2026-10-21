@@ -89,6 +89,8 @@ pub(super) enum DrawCommand {
         spans: Vec<TextSpan>,
         position: [f32; 2],
         alignment: Alignment,
+        /// Width to wrap lines to, if any; part of the shape-cache key.
+        wrap_width: Option<f32>,
     },
     /// Everything drawn until the matching [`DrawCommand::PopClip`] is
     /// clipped to this shape, in logical pixels. Scopes nest.
@@ -173,6 +175,7 @@ impl DrawCommand {
                 spans,
                 position,
                 alignment,
+                wrap_width,
             } => DrawCommand::StyledText {
                 spans: spans
                     .iter()
@@ -183,6 +186,7 @@ impl DrawCommand {
                     .collect(),
                 position: pair(position),
                 alignment: *alignment,
+                wrap_width: wrap_width.map(|w| w * s),
             },
         }
     }
@@ -288,6 +292,7 @@ impl Hash for DrawCommand {
                 spans,
                 position,
                 alignment,
+                wrap_width,
             } => {
                 state.write_u8(6);
                 state.write_usize(spans.len());
@@ -303,6 +308,7 @@ impl Hash for DrawCommand {
                 }
                 hash_f32_pair(position, state);
                 alignment.hash(state);
+                state.write_u32(wrap_width.map_or(u32::MAX, f32::to_bits));
             }
         }
     }

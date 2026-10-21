@@ -189,4 +189,55 @@ impl Scene {
         let bytes = buffer.slice(..).get_mapped_range();
         [bytes[0], bytes[1], bytes[2], bytes[3]]
     }
+
+    /// Every pixel of the last frame as tightly packed sRGB RGBA rows.
+    pub(super) fn pixels(&self) -> Vec<u8> {
+        let (width, height) = self.size;
+        let row = (width * 4) as usize;
+        let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("atomos-test-readback-all"),
+            size: (padded * height as usize) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            self.target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).expect("readback receiver dropped")
+            });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll failed");
+        rx.recv()
+            .expect("readback sender dropped")
+            .expect("map failed");
+        let mapped = buffer.slice(..).get_mapped_range();
+        let mut out = Vec::with_capacity(row * height as usize);
+        for y in 0..height as usize {
+            out.extend_from_slice(&mapped[y * padded..y * padded + row]);
+        }
+        out
+    }
 }
