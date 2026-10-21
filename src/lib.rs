@@ -13,5 +13,6 @@
 pub mod animation;
 pub mod frame;
 pub mod input;
+pub mod layout;
 pub mod renderer;
 pub mod timing;
