@@ -168,6 +168,7 @@ fn random_scene(layer: &Layer, seed: u64, clipped: bool, fractional: bool) {
 fn merging_never_changes_a_pixel() {
     // Whole and fractional positions, at scale factors that put edges and
     // glyph bitmaps between pixels.
+    let mut reduced = false;
     for (scale, fractional) in [(1.0, false), (1.0, true), (1.25, true), (2.0, true)] {
         for clipped in [false, true] {
             for seed in 1..=16u64 {
@@ -193,9 +194,11 @@ fn merging_never_changes_a_pixel() {
                     "seed {seed} differs when merged (scale {scale}, fractional {fractional}, clipped {clipped})"
                 );
                 assert!(merged_ops <= plain_ops, "merging never adds ops");
+                reduced |= merged_ops < plain_ops;
             }
         }
     }
+    assert!(reduced, "the scenes must actually exercise merging");
 }
 
 #[test]

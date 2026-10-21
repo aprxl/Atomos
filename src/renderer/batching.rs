@@ -28,9 +28,10 @@ pub(super) enum Kind {
     Text,
 }
 
-/// Most rectangle comparisons spent placing one item. Past it the item
-/// starts a new group, which is always correct and only costs a batch, so a
-/// pathological layer cannot turn placement quadratic.
+/// Most steps (a group visited, or a rectangle compared) spent placing one
+/// item. Past it the item starts a new group, which is always correct and
+/// only costs a batch, so a pathological layer cannot turn placement
+/// quadratic.
 const MAX_CHECKS_PER_ITEM: usize = 2048;
 
 #[derive(Debug)]
@@ -55,12 +56,18 @@ impl Group {
     fn push(&mut self, item: usize, bounds: Option<Rect>) {
         self.items.push(item);
         if let Some(rect) = bounds {
-            self.union = [
-                self.union[0].min(rect[0]),
-                self.union[1].min(rect[1]),
-                self.union[2].max(rect[2]),
-                self.union[3].max(rect[3]),
-            ];
+            // A NaN rectangle makes the union NaN for good, so the group is
+            // never skipped by its union (`overlaps` treats NaN as overlap).
+            if rect.iter().any(|v| v.is_nan()) || self.union[0].is_nan() {
+                self.union = [f32::NAN; 4];
+            } else {
+                self.union = [
+                    self.union[0].min(rect[0]),
+                    self.union[1].min(rect[1]),
+                    self.union[2].max(rect[2]),
+                    self.union[3].max(rect[3]),
+                ];
+            }
             self.rects.push(rect);
         }
     }
@@ -126,6 +133,10 @@ impl Batcher {
             if group.kind == kind {
                 return Some(index);
             }
+            if budget == 0 {
+                return None;
+            }
+            budget -= 1;
             // Nothing drawn: free to hop over anything.
             let Some(bounds) = bounds else { continue };
             if !overlaps(bounds, &group.union) {
@@ -253,6 +264,30 @@ mod tests {
             shape(&batcher.finish()),
             vec![(Kind::Text, vec![0, 2]), (Kind::Solid, vec![1])]
         );
+    }
+
+    #[test]
+    fn a_nan_item_is_never_hopped_over() {
+        let mut batcher = Batcher::new(true);
+        batcher.place(Kind::Text, rect(0.0, 0.0, 10.0, 10.0), 0);
+        batcher.place(Kind::Solid, Some([f32::NAN; 4]), 1);
+        batcher.place(Kind::Text, rect(500.0, 500.0, 10.0, 10.0), 2);
+        assert_eq!(batcher.finish().len(), 3);
+    }
+
+    #[test]
+    fn group_walks_are_bounded_too() {
+        // Overlapping alternating kinds (so each gets its own group), far from the probe: every group is visited, but
+        // the budget stops the walk.
+        let mut batcher = Batcher::new(true);
+        batcher.place(Kind::Image, rect(-100.0, -100.0, 1.0, 1.0), 0);
+        for i in 0..6000 {
+            let kind = if i % 2 == 0 { Kind::Solid } else { Kind::Text };
+            batcher.place(kind, rect(0.0, 0.0, 1.0, 1.0), 1 + i);
+        }
+        let before = batcher.groups.len();
+        batcher.place(Kind::Image, rect(-200.0, -200.0, 1.0, 1.0), 6001);
+        assert_eq!(batcher.groups.len(), before + 1);
     }
 
     #[test]
