@@ -541,3 +541,15 @@ fn non_finite_input_cannot_poison_the_solver() {
     ui.compute(VIEW, &Cells { scale: f32::NAN });
     assert_eq!(ui.rect(a).width, 400.0);
 }
+
+#[test]
+fn fixed_extents_hold_under_either_parent_axis() {
+    let mut ui = Layout::new();
+    let row = ui.add(ui.root(), Style::row().height(px(100.0)));
+    let a = ui.add(row, Style::new().fixed_width(100.0).fixed_height(20.0));
+    let col = ui.add(ui.root(), Style::new().width(px(300.0)));
+    let b = ui.add(col, Style::new().fixed_width(100.0).fixed_height(5.0));
+    ui.compute(VIEW, &M);
+    assert_eq!((ui.rect(a).width, ui.rect(a).height), (100.0, 20.0));
+    assert_eq!((ui.rect(b).width, ui.rect(b).height), (100.0, 5.0));
+}

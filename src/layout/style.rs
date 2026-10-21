@@ -312,25 +312,21 @@ impl Style {
         self
     }
 
-    /// An exact width that never grows, shrinks, or is floored by its
-    /// content (CSS `min-width: auto` would floor it). Use for children of
-    /// a row.
+    /// An exact width: size, minimum and maximum all `extent`, so it never
+    /// grows, shrinks, or is floored by content, whichever way the parent
+    /// lays out. Touches the width only.
     pub fn fixed_width(mut self, extent: f32) -> Self {
         self.inner.size.width = Dimension::length(extent);
-        self.inner.flex_basis = Dimension::length(extent);
-        self.inner.flex_grow = 0.0;
-        self.inner.flex_shrink = 0.0;
-        self.inner.min_size.width = LengthPercentageAuto::length(0.0);
+        self.inner.min_size.width = LengthPercentageAuto::length(extent);
+        self.inner.max_size.width = LengthPercentageAuto::length(extent);
         self
     }
 
-    /// [`Style::fixed_width`] for the height; use for children of a column.
+    /// [`Style::fixed_width`] for the height.
     pub fn fixed_height(mut self, extent: f32) -> Self {
         self.inner.size.height = Dimension::length(extent);
-        self.inner.flex_basis = Dimension::length(extent);
-        self.inner.flex_grow = 0.0;
-        self.inner.flex_shrink = 0.0;
-        self.inner.min_size.height = LengthPercentageAuto::length(0.0);
+        self.inner.min_size.height = LengthPercentageAuto::length(extent);
+        self.inner.max_size.height = LengthPercentageAuto::length(extent);
         self
     }
 
