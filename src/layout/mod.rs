@@ -233,9 +233,11 @@ struct Entry {
     /// Absolute, snapped, logical pixels. Kept while hidden.
     rect: Rect,
     moved: bool,
-    tag: u32,
+    tag: u64,
     clip: bool,
     paint: Option<Box<Paint>>,
+    /// Hash recorded by `Build::memo`; `0` when not memoised.
+    memo: u64,
 }
 
 /// The tree. Built by the app, mutated freely, solved on demand.
@@ -255,6 +257,9 @@ pub struct Layout {
     scratch: Vec<u32>,
     build_frames: Vec<build::Frame>,
     build_scratch: String,
+    text_stack: build::TextStack,
+    /// Something that only repaints changed (a colour, a paint).
+    repaint: bool,
 }
 
 impl Default for Layout {
@@ -284,6 +289,7 @@ impl Layout {
             tag: 0,
             clip: false,
             paint: None,
+            memo: 0,
         };
         Self {
             tree,
@@ -301,6 +307,8 @@ impl Layout {
             scratch: Vec::new(),
             build_frames: Vec::new(),
             build_scratch: String::new(),
+            text_stack: build::TextStack::new(),
+            repaint: false,
         }
     }
 
@@ -386,6 +394,7 @@ impl Layout {
             tag: 0,
             clip: style.clip,
             paint: None,
+            memo: 0,
         };
         let index = if let Some(index) = self.free.pop() {
             let generation = self.entries[index as usize].generation + 1;
@@ -470,8 +479,12 @@ impl Layout {
         let before = Style {
             inner: self.tree.style(node).expect("node exists").clone(),
             clip,
+            ..Style::default()
         };
         let mut after = edit(before.clone());
+        // Look and id are the builder's concern, not the solver's.
+        after.look = before.look.clone();
+        after.id = before.id;
         if id.index == self.root {
             // The root's size is the viewport's; it is not the caller's.
             after.inner.size = before.inner.size;
@@ -489,6 +502,7 @@ impl Layout {
         Style {
             inner: self.tree.style(e.node).expect("node exists").clone(),
             clip: e.clip,
+            ..Style::default()
         }
     }
 
@@ -527,11 +541,11 @@ impl Layout {
     }
 
     /// A user tag for hit-testing: `0` means none.
-    pub fn set_tag(&mut self, id: NodeId, tag: u32) {
+    pub fn set_tag(&mut self, id: NodeId, tag: u64) {
         self.entry_mut(id).tag = tag;
     }
 
-    pub fn tag(&self, id: NodeId) -> u32 {
+    pub fn tag(&self, id: NodeId) -> u64 {
         self.entry(id).tag
     }
 
@@ -560,6 +574,14 @@ impl Layout {
     /// Children of `id`, in order.
     pub fn children(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         self.entry(id).children.iter().map(|c| self.id_of(*c))
+    }
+
+    /// Did anything that changes the picture without moving it (a colour, a
+    /// paint) change since the last call? Clears the flag. A solve that
+    /// returned `true` repaints too; poll both:
+    /// `if layout.compute(..) | layout.take_repaint() { repaint }`.
+    pub fn take_repaint(&mut self) -> bool {
+        std::mem::take(&mut self.repaint)
     }
 
     /// Number of live nodes, root included.
@@ -764,7 +786,7 @@ impl Layout {
 
     /// Like [`Layout::hit`], but climbs to the nearest ancestor (or self)
     /// that has a nonzero tag, and returns that tag.
-    pub fn hit_tag(&self, point: (f32, f32)) -> Option<u32> {
+    pub fn hit_tag(&self, point: (f32, f32)) -> Option<u64> {
         let mut at = self.hit(point)?.index;
         loop {
             let e = &self.entries[at as usize];

@@ -158,7 +158,7 @@ impl TextLeaf {
         params: &FontParameters,
         color: &Color,
         wrap: bool,
-    ) -> bool {
+    ) -> (bool, bool) {
         let mut remeasure = self.set_text(text);
         if self.text.font != *font || self.text.params != *params || self.text.wrap != wrap {
             self.text.font = font.clone();
@@ -167,10 +167,11 @@ impl TextLeaf {
             self.forget();
             remeasure = true;
         }
-        if self.text.color != *color {
+        let recolor = self.text.color != *color;
+        if recolor {
             self.text.color = color.clone();
         }
-        remeasure
+        (remeasure, recolor)
     }
 
     pub(super) fn set_font(&mut self, font: Font, params: FontParameters) -> bool {
@@ -246,7 +247,12 @@ impl Layout {
     pub fn set_paint(&mut self, id: NodeId, paint: Option<Paint>) {
         let slot = &mut self.entry_mut(id).paint;
         if slot.as_deref() != paint.as_ref() {
-            *slot = paint.map(Box::new);
+            match (slot.as_deref_mut(), paint) {
+                // Assign in place: no allocation when a paint changes.
+                (Some(old), Some(new)) => *old = new,
+                (_, new) => *slot = new.map(Box::new),
+            }
+            self.repaint = true;
         }
     }
 

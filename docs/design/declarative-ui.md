@@ -1,6 +1,6 @@
 # Declarative UI for Atomos: builder, events, scrolling, virtual lists
 
-Status: **proposal, awaiting owner decisions (section 8); builder prototype done (section 10)**. Date: 2026-10-20. Builds on
+Status: **approved 2026-10-21; implementation in progress**. Done: builder core, unified style, text inheritance, memo, R1 spike (sections 10-11). Next: input routing, scroll, lists, slots. Date: 2026-10-20. Builds on
 `docs/design/flexbox-layout.md` (the retained `Layout`, phase 1 done) and
 `docs/design/painter-order-and-clip-scopes.md` (direct-replay layers, scoped clips). Replaces the "sugar,
 phase 2" sketch in flexbox-layout.md section 3b: the builder becomes **the** way to write Atomos UI, and the
@@ -818,4 +818,47 @@ Findings that change the plan:
 5. Creating an `Id`-less keyed list (items without `.id(..)`) reconciles by position, as designed; the demo uses ids on
    the dynamic sidebar items.
 
-**Still to prove, in this order:** row islands in one taffy tree (R1), scroll without re-solve, a 50k-row uniform list.
+**R1 resolved (`tests/r1_spike.rs`):** detached subtrees in the same `TaffyTree` keep independent caches. Solving the
+main root and an island separately, re-solving without changes hits the cache for both, and dirtying a leaf in one does
+not re-measure the other. Row islands can share one tree; no per-list tree is needed.
+
+**Still to prove, in this order:** scroll without re-solve, a 50k-row uniform list.
+
+---
+
+## 11. Styling (approved direction, supersedes the `El { style, paint }` split in 3.2)
+
+April approved this on 2026-10-21. One schema owned by Atomos; the app owns its values.
+
+**One chain, two halves.** `Style` is the only thing callers write. It has a layout half (everything taffy sees, plus
+`overflow`) and a look half (`bg`, `border` colour, `radius`, later `opacity` and state variants). `Style::el()` splits
+them: the layout half is compared to decide whether to re-solve, the look half is stored as `Paint` and compared to
+decide whether to repaint. A colour or hover change therefore never dirties the solver. Test: `look_change_does_not_resolve`.
+
+```rust
+Style::row().height(px(36.0)).padding_x(10.0).gap(8.0)   // layout half
+    .bg(t.bar).radius(6.0).border(1.0, t.edge)           // look half
+    .id(SAVE)                                            // identity, 64-bit
+```
+
+**Borders take space.** `.border(w, colour)` also writes `w` into the layout half's border widths, so the box model
+matches what is drawn. The imperative `Layout::set_paint` keeps today's meaning (drawn inside, space reserved by the
+caller) because existing code and the ring pixel test depend on it.
+
+**Themes are plain structs.** `Theme { bar: Style, button: Style, label: TextStyle, .. }` built once; components take
+`&Theme`, copy a preset and tweak it (`t.button.clone().id(SAVE)`). Switching theme swaps the struct and bumps a
+revision. No cascade, selectors or strings. A preset is only a `Style` value; comparing one allocates nothing.
+
+**Text style inherits, nothing else does.** `b.with_text(&style, |b| ..)` sets the style for the text below it;
+`b.text(el, "..")` uses it and `b.text_with(el, &style, "..")` overrides. A text style is `{ font, params, color, wrap }`.
+
+**Inheritance and memo.** A memo-skipped subtree would keep a stale inherited font after a theme change. The builder
+keeps a hash of the current inherited text style (computed once per `with_text`, not per node) and mixes it into every
+`memo` hash, so a changed inherited style forces the memo'd element to run. Test: `memo_reruns_when_inherited_text_changes`.
+
+**State variants** (`.hover(..)`, `.pressed(..)`) arrive with input routing (phase 2); they are look-half fields, so
+they cost no rebuild and no solve.
+
+**Where the builder lives.** The prototype showed the builder needs `Layout`'s private fields, so it stays in
+`src/layout/build.rs` instead of moving to `src/ui/` as the plan in section 9 said. `Ui` (events, scroll, slots) can
+still be a separate module later and wrap `Layout`.

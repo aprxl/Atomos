@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use atomos::frame::FrameScheduler;
 use atomos::input::Input;
-use atomos::layout::{Build, Layout, Overflow, Paint, Rect, Style, TextStyle, px};
+use atomos::layout::{Build, Layout, Overflow, Rect, Style, TextStyle, px};
 use atomos::renderer::{Color, Font, FontParameters, Layer, LayerInvalidation, Renderer};
 use atomos::ui;
 use winit::{
@@ -52,35 +52,38 @@ fn theme() -> Theme {
 /// The entire UI. Runs every frame; only differences touch the tree.
 fn view(b: &mut Build, t: &Theme, s: &State) {
     ui!(b;
-        div(Style::new().padding(12.0).gap(12.0).el().paint(Paint::background(BG))) {
+        div(Style::new().padding(12.0).gap(12.0).bg(BG)) {
             div(Style::row().height(px(48.0)).items_center().padding_x(14.0).gap(12.0)
-                    .el().paint(Paint::background(PANEL).radius(8.0))) {
-                el(Style::new().size(28.0, 28.0).shrink(0.0).el().paint(Paint::background(BLUE).radius(14.0)));
+                    .bg(PANEL).radius(8.0)) {
+                el(Style::new().size(28.0, 28.0).shrink(0.0).bg(BLUE).radius(14.0));
                 el(Style::new().flex(1.0).max_width(px(340.0)).height(px(30.0))
-                    .el().paint(Paint::background(BG).radius(6.0)));
-                for name in ["Share", "Focus"] => {
-                    div(Style::row().height(px(30.0)).padding_x(12.0).items_center().shrink(0.0)
-                            .el().paint(Paint::background(BG).radius(6.0))) {
-                        text(Style::new().el(), &t.label, name);
+                    .bg(BG).radius(6.0));
+                with_text(&t.label) {
+                    for name in ["Share", "Focus"] => {
+                        div(Style::row().height(px(30.0)).padding_x(12.0).items_center().shrink(0.0)
+                                .bg(BG).radius(6.0)) {
+                            text(Style::new(), name);
+                        }
                     }
                 }
             }
-            div(Style::row().flex(1.0).gap(12.0).el()) {
-                div(Style::new().fixed_width(180.0).padding(12.0).gap(8.0)
-                        .el().paint(Paint::background(PANEL).radius(8.0))) {
-                    for (id, name) in &s.items => {
-                        text(Style::new().el().id(*id), &t.label, name);
+            div(Style::row().flex(1.0).gap(12.0)) {
+                div(Style::new().fixed_width(180.0).padding(12.0).gap(8.0).bg(PANEL).radius(8.0)) {
+                    with_text(&t.label) {
+                        for (id, name) in &s.items => {
+                            text(Style::new().id(*id as u64), name);
+                        }
                     }
                 }
                 div(Style::new().flex(1.0).padding(16.0).gap(10.0).overflow(Overflow::Hidden)
-                        .el().paint(Paint::background(PANEL).radius(8.0))) {
-                    text(Style::new().el(), &t.title, "Declarative builder");
-                    text(Style::new().el(), &t.small,
-                        "This whole view is a single function, re-run every frame. \
-                         Unchanged elements are compared and skipped, so nothing is \
-                         allocated, solved or painted until something really changes.");
-                    text(Style::new().margin_top(8.0).el(), &t.small,
-                        "window {:.0} x {:.0}, {} items", s.window.0, s.window.1, s.items.len());
+                        .bg(PANEL).radius(8.0)) {
+                    text_with(Style::new(), &t.title, "Declarative builder");
+                    with_text(&t.small) {
+                        text(Style::new(),
+                            "This whole view is a single function, re-run every frame.                              Unchanged elements are compared and skipped, so nothing is                              allocated, solved or painted until something really changes.");
+                        text(Style::new().margin_top(8.0),
+                            "window {:.0} x {:.0}, {} items", s.window.0, s.window.1, s.items.len());
+                    }
                 }
             }
         }
@@ -158,7 +161,8 @@ impl ApplicationHandler for App {
                     let (theme, state) = (&self.theme, &self.state);
                     self.layout.build(|b| view(b, theme, state));
                     let view = Rect::new(0.0, 0.0, size.width, size.height);
-                    if self.layout.compute(view, layer) {
+                    let solved = self.layout.compute(view, layer);
+                    if solved | self.layout.take_repaint() {
                         layer.clear();
                         self.layout.paint(layer);
                     }

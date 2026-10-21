@@ -5,6 +5,7 @@ use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
 use std::cell::Cell;
 
 use atomos::layout::{Build, Layout, Measurer, Rect, Style, TextStyle, px};
+use std::cell::Cell as Counter;
 use atomos::renderer::{Color, Font, FontParameters};
 use atomos::ui;
 
@@ -50,17 +51,19 @@ struct Item { id: u32, name: String }
 
 fn view(b: &mut Build, t: &TextStyle, items: &[Item], line: usize, modified: bool) {
     ui!(b;
-        div(Style::new().el()) {
-            div(Style::row().height(px(30.0)).gap(8.0).el()) {
-                text(Style::new().el(), t, "Save");
-                if modified => { text(Style::new().el(), t, "*"); }
-            }
-            div(Style::new().flex(1.0).el()) {
-                for it in items => {
-                    text(Style::new().el().id(it.id), t, &it.name);
+        with_text(t) {
+            div(Style::new()) {
+                div(Style::row().height(px(30.0)).gap(8.0)) {
+                    text(Style::new(), "Save");
+                    if modified => { text(Style::new(), "*"); }
                 }
+                div(Style::new().flex(1.0)) {
+                    for it in items => {
+                        text(Style::new().id(it.id as u64), &it.name);
+                    }
+                }
+                text(Style::new().height(px(16.0)), "{}:{}", line, 7);
             }
-            text(Style::new().height(px(16.0)).el(), t, "{}:{}", line, 7);
         }
     );
 }
@@ -144,4 +147,94 @@ fn removing_items_trims_the_tail_and_resolves() {
     ui.build(|b| view(b, &t, &its[..3], 1, false));
     assert_eq!(ui.len(), len - 7);
     assert!(ui.compute(VIEW, &Cells));
+}
+
+#[test]
+fn look_change_does_not_resolve_but_requests_repaint() {
+    let mut ui = Layout::new();
+    let red = Color::rgb(255, 0, 0);
+    let blue = Color::rgb(0, 0, 255);
+    let describe = |ui: &mut Layout, c: Color| {
+        ui.build(|b| b.div(Style::new().height(px(40.0)).bg(c).radius(4.0), |_| {}));
+    };
+    describe(&mut ui, red.clone());
+    ui.compute(VIEW, &Cells);
+    assert!(ui.take_repaint());
+    let solves = ui.solves();
+    describe(&mut ui, red);
+    assert!(!ui.compute(VIEW, &Cells));
+    assert!(!ui.take_repaint(), "unchanged look asked for a repaint");
+    describe(&mut ui, blue);
+    assert!(!ui.compute(VIEW, &Cells), "a colour change re-solved");
+    assert_eq!(ui.solves(), solves);
+    assert!(ui.take_repaint());
+}
+
+#[test]
+fn border_takes_space_in_layout() {
+    let mut ui = Layout::new();
+    ui.build(|b| {
+        b.div(Style::new().flex(1.0).border(3.0, Color::rgb(1, 2, 3)), |b| {
+            b.el(Style::new().flex(1.0));
+        })
+    });
+    ui.compute(VIEW, &Cells);
+    let outer = ui.children(ui.root()).next().unwrap();
+    let inner = ui.children(outer).next().unwrap();
+    assert_eq!(ui.rect(inner), Rect::new(3.0, 3.0, VIEW.width - 6.0, VIEW.height - 6.0));
+}
+
+fn memo_view(b: &mut Build, runs: &Counter<u32>, rev: u32, text: &TextStyle) {
+    b.with_text(text, |b| {
+        b.memo(rev, |b| {
+            b.div(Style::new(), |b| {
+                runs.set(runs.get() + 1);
+                b.text(Style::new(), "memo'd child");
+            });
+        });
+    });
+}
+
+#[test]
+fn memo_skips_children_until_deps_change() {
+    let (t, runs) = (theme(), Counter::new(0));
+    let mut ui = Layout::new();
+    ui.build(|b| memo_view(b, &runs, 1, &t));
+    ui.build(|b| memo_view(b, &runs, 1, &t));
+    assert_eq!(runs.get(), 1, "unchanged deps ran the children again");
+    ui.build(|b| memo_view(b, &runs, 2, &t));
+    assert_eq!(runs.get(), 2);
+    let n = allocations(|| ui.build(|b| memo_view(b, &runs, 2, &t)));
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn memo_reruns_when_inherited_text_changes() {
+    let (t, runs) = (theme(), Counter::new(0));
+    let mut ui = Layout::new();
+    ui.build(|b| memo_view(b, &runs, 1, &t));
+    let bigger = TextStyle::new(Font::Named("mono".into()), FontParameters::new(20.0), Color::rgb(9, 9, 9));
+    ui.build(|b| memo_view(b, &runs, 1, &bigger));
+    assert_eq!(runs.get(), 2, "a theme change left a memo'd subtree stale");
+    // The child really took the new style: 12 chars at 8 px, one line.
+    ui.compute(VIEW, &Cells);
+    assert!(ui.take_repaint());
+}
+
+#[test]
+fn inherited_text_style_reaches_nested_text() {
+    let (t, mut ui) = (theme(), Layout::new());
+    ui.build(|b| {
+        b.with_text(&t, |b| {
+            b.div(Style::row(), |b| {
+                b.text(Style::new(), "abcd");
+                b.text_with(Style::new(), &TextStyle::new(Font::Named("x".into()), FontParameters::new(9.0), Color::rgb(0, 0, 0)).no_wrap(), "ab");
+            })
+        })
+    });
+    ui.compute(VIEW, &Cells);
+    let div = ui.children(ui.root()).next().unwrap();
+    let kids: Vec<_> = ui.children(div).collect();
+    assert_eq!(ui.rect(kids[0]).width, 32.0);
+    assert_eq!(ui.rect(kids[1]).width, 16.0);
 }

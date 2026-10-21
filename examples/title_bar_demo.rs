@@ -32,10 +32,10 @@ const DIM: Color = Color::rgb(0x8A, 0x91, 0x9E);
 const BLUE: Color = Color::rgb(0x61, 0xAF, 0xEF);
 const GREEN: Color = Color::rgb(0x98, 0xC3, 0x79);
 
-const SIDEBAR: u32 = 1;
-const SEARCH: u32 = 2;
-const FOCUS: u32 = 3;
-const SWITCH: u32 = 4;
+const SIDEBAR: u64 = 1;
+const SEARCH: u64 = 2;
+const FOCUS: u64 = 3;
+const SWITCH: u64 = 4;
 
 fn text(s: &str, size: f32, color: Color) -> Text {
     Text::new(s, Font::Named("sans-serif".into()), FontParameters::new(size), color).no_wrap()
@@ -43,9 +43,9 @@ fn text(s: &str, size: f32, color: Color) -> Text {
 
 struct Bar {
     ui: Layout,
-    controls: [(u32, NodeId, Paint); 4],
+    controls: [(u64, NodeId, Paint); 4],
     readout: NodeId,
-    hover: u32,
+    hover: u64,
     focus_mode: bool,
 }
 
