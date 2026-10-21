@@ -53,7 +53,7 @@ impl Bar {
     fn new() -> Self {
         let mut ui = Layout::new();
         let root = ui.root();
-        ui.set_style(root, |s| *s = Style::new());
+        ui.set_style(root, |_| Style::new());
         ui.set_paint(root, Some(Paint::background(PAGE)));
 
         let bar = ui.add(root, Style::row().height(px(59.0)));
@@ -254,18 +254,20 @@ impl ApplicationHandler for App {
                         bar.restyle();
                     }
                     let view = Rect::new(0.0, 0.0, size.width, size.height);
-                    let search = bar.ui.rect(bar.controls[1].1);
-                    let readout = format!(
-                        "window {:.0} px   search box x={:.1} w={:.0}   solves {}   rects moved last solve {}",
-                        size.width,
-                        search.x,
-                        search.width,
-                        bar.ui.solves(),
-                        bar.ui.moved_count()
-                    );
-                    bar.ui.set_text(bar.readout, &readout);
-                    let solved = bar.ui.compute(view, layer);
-                    if solved || changed {
+                    let mut solved = bar.ui.compute(view, layer);
+                    if solved {
+                        // Rewritten only after a real solve, so the readout
+                        // changes (and re-solves once more) only on resize.
+                        let search = bar.ui.rect(bar.controls[1].1);
+                        let readout = format!(
+                            "window {:.0} px   search box x={:.1} w={:.0}",
+                            size.width, search.x, search.width
+                        );
+                        bar.ui.set_text(bar.readout, &readout);
+                        bar.ui.compute(view, layer);
+                    }
+                    solved |= changed;
+                    if solved {
                         layer.clear();
                         bar.ui.paint(layer);
                     }

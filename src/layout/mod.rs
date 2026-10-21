@@ -218,9 +218,12 @@ pub struct Layout {
     viewport: Rect,
     scale: f32,
     dirty: bool,
+    /// `min_content` result, valid until something invalidates it.
+    min_cache: Option<(f32, f32)>,
     solves: u32,
     moved_count: usize,
     stack: Vec<(u32, f32, f32)>,
+    scratch: Vec<u32>,
 }
 
 impl Default for Layout {
@@ -260,9 +263,11 @@ impl Layout {
             scale: 1.0,
             // Nothing has been solved yet, so the first `compute` must run.
             dirty: true,
+            min_cache: None,
             solves: 0,
             moved_count: 0,
             stack: Vec::new(),
+            scratch: Vec::new(),
         }
     }
 
@@ -291,6 +296,31 @@ impl Layout {
         e
     }
 
+    /// Something that affects the solve changed.
+    fn invalidate(&mut self) {
+        self.dirty = true;
+        self.min_cache = None;
+    }
+
+    /// Text measurements and the solver's caches depend on the scale
+    /// factor, so a change drops both. Every path that learns the scale
+    /// goes through here.
+    fn set_scale(&mut self, scale: f32) {
+        if scale == self.scale {
+            return;
+        }
+        self.scale = scale;
+        for e in &self.entries {
+            if e.live {
+                if let Some(Leaf::Text(leaf)) = self.tree.get_node_context_mut(e.node) {
+                    leaf.forget();
+                }
+                let _ = self.tree.mark_dirty(e.node);
+            }
+        }
+        self.invalidate();
+    }
+
     fn id_of(&self, index: u32) -> NodeId {
         NodeId {
             index,
@@ -300,6 +330,10 @@ impl Layout {
 
     fn insert(&mut self, parent: NodeId, style: Style, leaf: Option<Leaf>) -> NodeId {
         let parent_node = self.entry(parent).node;
+        assert!(
+            self.tree.get_node_context(parent_node).is_none(),
+            "layout: text and measured leaves cannot have children"
+        );
         let node = match leaf {
             Some(leaf) => self.tree.new_leaf_with_context(style.inner, leaf),
             None => self.tree.new_leaf(style.inner),
@@ -329,7 +363,7 @@ impl Layout {
             (self.entries.len() - 1) as u32
         };
         self.entries[parent.index as usize].children.push(index);
-        self.dirty = true;
+        self.invalidate();
         self.id_of(index)
     }
 
@@ -369,8 +403,9 @@ impl Layout {
                 .children
                 .retain(|c| *c != id.index);
         }
-        self.stack.clear();
-        let mut doomed = vec![id.index];
+        let mut doomed = std::mem::take(&mut self.scratch);
+        doomed.clear();
+        doomed.push(id.index);
         let mut next = 0;
         while next < doomed.len() {
             let children = std::mem::take(&mut self.entries[doomed[next] as usize].children);
@@ -386,25 +421,32 @@ impl Layout {
             let _ = self.tree.remove(e.node);
             self.free.push(*index);
         }
-        self.dirty = true;
+        self.scratch = doomed;
+        self.invalidate();
     }
 
     /// Edits a node's style, marking the tree dirty **only if the edit
     /// changed something**: an animation may write the same width every
     /// frame and costs a comparison once it settles.
-    pub fn set_style(&mut self, id: NodeId, edit: impl FnOnce(&mut Style)) {
+    ///
+    /// The closure takes the current style and returns the new one, so the
+    /// builder methods chain: `ui.set_style(id, |s| s.width(px(80.0)))`.
+    pub fn set_style(&mut self, id: NodeId, edit: impl FnOnce(Style) -> Style) {
         let node = self.entry(id).node;
         let clip = self.entry(id).clip;
         let before = Style {
             inner: self.tree.style(node).expect("node exists").clone(),
             clip,
         };
-        let mut after = before.clone();
-        edit(&mut after);
+        let mut after = edit(before.clone());
+        if id.index == self.root {
+            // The root's size is the viewport's; it is not the caller's.
+            after.inner.size = before.inner.size;
+        }
         if after != before {
             self.entry_mut(id).clip = after.clip;
             self.tree.set_style(node, after.inner).expect("node exists");
-            self.dirty = true;
+            self.invalidate();
         }
     }
 
@@ -427,7 +469,7 @@ impl Layout {
         };
         if changed {
             let _ = self.tree.mark_dirty(node);
-            self.dirty = true;
+            self.invalidate();
         }
     }
 
@@ -440,7 +482,7 @@ impl Layout {
         };
         if changed {
             let _ = self.tree.mark_dirty(node);
-            self.dirty = true;
+            self.invalidate();
         }
     }
 
@@ -448,7 +490,7 @@ impl Layout {
     pub fn mark_dirty(&mut self, id: NodeId) {
         let node = self.entry(id).node;
         let _ = self.tree.mark_dirty(node);
-        self.dirty = true;
+        self.invalidate();
     }
 
     /// A user tag for hit-testing: `0` means none.
@@ -466,7 +508,8 @@ impl Layout {
         self.entry(id).rect
     }
 
-    /// Did `id`'s rect change in the last solve?
+    /// Did `id`'s rect change in the last solve? Meaningful right after a
+    /// [`Layout::compute`] that returned `true`; a no-op `compute` clears it.
     pub fn moved(&self, id: NodeId) -> bool {
         self.entry(id).moved
     }
@@ -500,17 +543,17 @@ impl Layout {
     /// Returns whether it actually solved.
     pub fn compute(&mut self, viewport: Rect, measurer: &dyn Measurer) -> bool {
         let scale = measurer.scale_factor().max(f32::MIN_POSITIVE);
-        if !self.dirty && viewport == self.viewport && scale == self.scale {
-            return false;
-        }
-        if scale != self.scale {
-            // Quantised text sizes depend on the scale.
-            self.scale = scale;
-            for e in &self.entries {
-                if e.live {
-                    let _ = self.tree.mark_dirty(e.node);
+        self.set_scale(scale);
+        if !self.dirty && viewport == self.viewport {
+            if self.moved_count > 0 {
+                // Nothing moved *this* frame; do not leave last frame's
+                // flags for a "redraw if moved" poll to find again.
+                self.moved_count = 0;
+                for e in &mut self.entries {
+                    e.moved = false;
                 }
             }
+            return false;
         }
         self.viewport = viewport;
         self.dirty = false;
@@ -539,8 +582,14 @@ impl Layout {
     /// window floor. Runs one extra min-content pass and marks the tree
     /// dirty so the next [`Layout::compute`] re-solves for the real
     /// viewport (the solver's per-node cache keeps that cheap).
+    ///
+    /// The answer is cached until something invalidates it, so asking every
+    /// frame costs nothing while the tree is static.
     pub fn min_content(&mut self, measurer: &dyn Measurer) -> (f32, f32) {
-        self.scale = measurer.scale_factor().max(f32::MIN_POSITIVE);
+        self.set_scale(measurer.scale_factor().max(f32::MIN_POSITIVE));
+        if let Some(cached) = self.min_cache {
+            return cached;
+        }
         let root_node = self.entries[self.root as usize].node;
         let mut style = self.tree.style(root_node).expect("root exists").clone();
         let saved = style.clone();
@@ -552,8 +601,12 @@ impl Layout {
         self.run(Size::MIN_CONTENT, measurer);
         let size = self.tree.layout(root_node).expect("root exists").size;
         self.tree.set_style(root_node, saved).expect("root exists");
+        // The stored layouts are min-content ones now: the next `compute`
+        // must re-solve for the real viewport (the cache makes that cheap).
         self.dirty = true;
-        (size.width, size.height)
+        let result = (size.width, size.height);
+        self.min_cache = Some(result);
+        result
     }
 
     fn run(&mut self, available: Size<AvailableSpace>, measurer: &dyn Measurer) {
@@ -590,7 +643,11 @@ impl Layout {
     /// the physical grid, diffed against the previous rects.
     fn snap(&mut self, viewport: Rect) {
         let scale = self.scale;
-        let snap = |v: f32| (v * scale).round() / scale;
+        // Round to the nearest physical pixel. The small bias makes exact
+        // ties round the same way for both of two sums that differ only by
+        // float noise, so a sibling's far edge and its neighbour's near
+        // edge always land on the same grid line.
+        let snap = |v: f32| (v * scale + 0.502).floor() / scale;
         self.moved_count = 0;
         let mut stack = std::mem::take(&mut self.stack);
         stack.clear();
@@ -626,13 +683,21 @@ impl Layout {
                     .map(|s| s.display == taffy::style::Display::None)
                     .unwrap_or(false);
                 if hidden {
-                    self.entries[child as usize].moved = false;
+                    self.clear_moved(child);
                 } else {
                     stack.push((child, x, y));
                 }
             }
         }
         self.stack = stack;
+    }
+
+    fn clear_moved(&mut self, index: u32) {
+        self.entries[index as usize].moved = false;
+        for ci in 0..self.entries[index as usize].children.len() {
+            let child = self.entries[index as usize].children[ci];
+            self.clear_moved(child);
+        }
     }
 
     /// The deepest node containing `point`, honouring `overflow: hidden`

@@ -288,7 +288,9 @@ impl Style {
     /// content; use [`Style::basis`] afterwards to override.
     pub fn grow(mut self, weight: f32) -> Self {
         self.inner.flex_grow = weight;
-        self.inner.flex_basis = Dimension::length(0.0);
+        if weight > 0.0 {
+            self.inner.flex_basis = Dimension::length(0.0);
+        }
         self
     }
 

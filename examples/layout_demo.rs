@@ -42,7 +42,7 @@ impl Ui {
     fn new() -> Self {
         let mut ui = Layout::new();
         let root = ui.root();
-        ui.set_style(root, |s| *s = Style::new().padding(12.0).gap(12.0));
+        ui.set_style(root, |_| Style::new().padding(12.0).gap(12.0));
         ui.set_paint(root, Some(Paint::background(BG)));
 
         // Toolbar: logo, a search box that grows up to 340px, two buttons.
@@ -165,17 +165,15 @@ impl ApplicationHandler for App {
                 {
                     let size = w.inner_size().to_logical::<f32>(w.scale_factor());
                     let ui = &mut self.ui;
-                    let text = format!(
-                        "{} solves, {} rects moved",
-                        ui.layout.solves(),
-                        ui.layout.moved_count()
-                    );
-                    ui.layout.set_text(ui.status, &text);
-                    // Only a real change re-solves, and only that redraws.
-                    if ui
-                        .layout
-                        .compute(Rect::new(0.0, 0.0, size.width, size.height), layer)
-                    {
+                    let view = Rect::new(0.0, 0.0, size.width, size.height);
+                    // Only a real change re-solves, and only that redraws. The
+                    // readout is rewritten after a solve, so it changes (and
+                    // re-solves once more) only when the window does.
+                    let solved = ui.layout.compute(view, layer);
+                    if solved {
+                        let text = format!("window {:.0} x {:.0}", size.width, size.height);
+                        ui.layout.set_text(ui.status, &text);
+                        ui.layout.compute(view, layer);
                         layer.clear();
                         ui.layout.paint(layer);
                     }

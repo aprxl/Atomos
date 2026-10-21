@@ -107,7 +107,7 @@ impl TextLeaf {
         }
     }
 
-    fn forget(&mut self) {
+    pub(super) fn forget(&mut self) {
         self.memo = [None; MEMO];
         self.next = 0;
         self.min_width = None;
@@ -194,7 +194,10 @@ impl TextLeaf {
 impl Layout {
     /// Sets (or clears) how `id` looks when painted.
     pub fn set_paint(&mut self, id: NodeId, paint: Option<Paint>) {
-        self.entry_mut(id).paint = paint.map(Box::new);
+        let slot = &mut self.entry_mut(id).paint;
+        if slot.as_deref() != paint.as_ref() {
+            *slot = paint.map(Box::new);
+        }
     }
 
     /// Draws every node in tree order into `layer`: backgrounds and

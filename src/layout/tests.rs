@@ -106,9 +106,9 @@ fn compute_is_a_no_op_until_something_changes() {
     let a = ui.add(ui.root(), Style::new().height(px(10.0)));
     assert!(ui.compute(VIEW, &M));
     assert!(!ui.compute(VIEW, &M));
-    ui.set_style(a, |s| *s = s.clone().height(px(10.0)));
+    ui.set_style(a, |s| s.height(px(10.0)));
     assert!(!ui.compute(VIEW, &M), "an identical style must not dirty");
-    ui.set_style(a, |s| *s = s.clone().height(px(20.0)));
+    ui.set_style(a, |s| s.height(px(20.0)));
     assert!(ui.compute(VIEW, &M));
     assert!(ui.compute(Rect::new(0.0, 0.0, 500.0, 300.0), &M));
     assert_eq!(ui.solves(), 3);
@@ -121,7 +121,7 @@ fn moved_reports_only_what_changed() {
     let b = ui.add(ui.root(), Style::new().height(px(10.0)));
     let c = ui.add(ui.root(), Style::new().height(px(10.0)));
     ui.compute(VIEW, &M);
-    ui.set_style(b, |s| *s = s.clone().height(px(30.0)));
+    ui.set_style(b, |s| s.height(px(30.0)));
     ui.compute(VIEW, &M);
     assert!(!ui.moved(a));
     assert!(ui.moved(b), "b grew");
@@ -173,7 +173,7 @@ fn hidden_node_takes_no_space_and_keeps_its_rect() {
     let rest = ui.add(row, Style::new().grow(1.0));
     ui.compute(VIEW, &M);
     assert_eq!(ui.rect(rest).x, 100.0);
-    ui.set_style(panel, |s| *s = s.clone().hidden(true));
+    ui.set_style(panel, |s| s.hidden(true));
     ui.compute(VIEW, &M);
     assert_eq!(ui.rect(rest).x, 0.0);
     assert_eq!(ui.rect(panel).width, 100.0, "keeps its last rect");
@@ -312,4 +312,143 @@ fn numbers() {
         ui.compute(VIEW, &M);
     }
     println!("clean compute (no-op)   = {:?}/call", t.elapsed() / 1_000_000);
+}
+
+// --- regressions from the PR #4 review ---
+
+fn paragraph_height(scale: f32, column: f32) -> f32 {
+    let m = Cells { scale };
+    let mut ui = Layout::new();
+    let col = ui.add(ui.root(), Style::new().width(px(column)));
+    let t = ui.add_text(col, Style::new(), text("aaaa bbbb cccc dddd"));
+    ui.compute(VIEW, &m);
+    ui.rect(t).height
+}
+
+#[test]
+fn a_scale_change_drops_cached_text_sizes() {
+    // Same physical width (160), half the logical one: the memo key alone
+    // would collide and return the one-line size.
+    let mut ui = Layout::new();
+    let col = ui.add(ui.root(), Style::new().width(px(160.0)));
+    let t = ui.add_text(col, Style::new(), text("aaaa bbbb cccc dddd"));
+    ui.compute(VIEW, &Cells { scale: 1.0 });
+    assert_eq!(ui.rect(t).height, 16.0);
+    ui.set_style(col, |s| s.width(px(80.0)));
+    ui.compute(VIEW, &Cells { scale: 2.0 });
+    assert_eq!(ui.rect(t).height, paragraph_height(2.0, 80.0));
+    assert_eq!(ui.rect(t).height, 32.0);
+}
+
+#[test]
+fn min_content_first_does_not_hide_a_scale_change() {
+    let mut ui = Layout::new();
+    let col = ui.add(ui.root(), Style::new().width(px(160.0)));
+    let t = ui.add_text(col, Style::new(), text("aaaa bbbb cccc dddd"));
+    ui.compute(VIEW, &Cells { scale: 1.0 });
+    ui.set_style(col, |s| s.width(px(80.0)));
+    let hi = Cells { scale: 2.0 };
+    ui.min_content(&hi); // documented order: before compute
+    ui.compute(VIEW, &hi);
+    assert_eq!(ui.rect(t).height, 32.0);
+}
+
+#[test]
+fn siblings_share_edges_at_any_origin_and_scale() {
+    let mut mismatches = Vec::new();
+    for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+        let m = Cells { scale };
+        for origin in [0.0, 0.3, 0.7, 1.0 / 3.0] {
+            for kids in 3..8 {
+                for half_steps in 0..=60 {
+                    let width = 90.0 + half_steps as f32 * 0.5;
+                    let mut ui = Layout::new();
+                    let row = ui.add(
+                        ui.root(),
+                        Style::row().height(px(10.0)).padding_left(origin),
+                    );
+                    let ids: Vec<_> =
+                        (0..kids).map(|_| ui.add(row, Style::new().grow(1.0))).collect();
+                    ui.compute(Rect::new(0.0, 0.0, width, 50.0), &m);
+                    for pair in ids.windows(2) {
+                        let (a, b) = (ui.rect(pair[0]), ui.rect(pair[1]));
+                        if (a.right() * scale).round() != (b.x * scale).round() {
+                            mismatches.push((scale, origin, kids, width, a.right(), b.x));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{} gaps/overlaps, e.g. {:?}", mismatches.len(), &mismatches[..mismatches.len().min(3)]);
+}
+
+#[test]
+fn hiding_a_parent_clears_its_descendants_moved_flags() {
+    let mut ui = Layout::new();
+    let spacer = ui.add(ui.root(), Style::new().height(px(10.0)));
+    let parent = ui.add(ui.root(), Style::new().height(px(20.0)));
+    let child = ui.add(parent, Style::new().height(px(5.0)));
+    ui.compute(VIEW, &M);
+    ui.set_style(spacer, |s| s.height(px(30.0)));
+    ui.compute(VIEW, &M);
+    assert!(ui.moved(child));
+    ui.set_style(parent, |s| s.hidden(true));
+    ui.compute(VIEW, &M);
+    assert!(!ui.moved(child));
+    assert_eq!(ui.moved_count(), 0);
+}
+
+#[test]
+fn a_no_op_compute_clears_the_moved_flags() {
+    let mut ui = Layout::new();
+    let a = ui.add(ui.root(), Style::new().height(px(10.0)));
+    ui.compute(VIEW, &M);
+    ui.set_style(a, |s| s.height(px(20.0)));
+    assert!(ui.compute(VIEW, &M));
+    assert!(ui.moved(a));
+    assert!(!ui.compute(VIEW, &M));
+    assert!(!ui.moved(a), "a poll on the next frame must not see it again");
+    assert_eq!(ui.moved_count(), 0);
+}
+
+#[test]
+fn min_content_is_cached_while_nothing_changes() {
+    let mut ui = Layout::new();
+    let row = ui.add(ui.root(), Style::row());
+    ui.add(row, Style::new().fixed(50.0));
+    for _ in 0..5 {
+        assert_eq!(ui.min_content(&M).0, 50.0);
+        ui.compute(VIEW, &M);
+    }
+    assert_eq!(ui.solves(), 1, "asking every frame must not re-solve every frame");
+    ui.add(row, Style::new().fixed(25.0));
+    assert_eq!(ui.min_content(&M).0, 75.0, "a change invalidates the cache");
+}
+
+#[test]
+fn grow_zero_keeps_an_explicit_width() {
+    let mut ui = Layout::new();
+    let row = ui.add(ui.root(), Style::row());
+    let a = ui.add(row, Style::new().width(px(100.0)).grow(0.0));
+    ui.compute(VIEW, &M);
+    assert_eq!(ui.rect(a).width, 100.0);
+}
+
+#[test]
+fn restyling_the_root_with_the_same_style_is_a_no_op() {
+    let mut ui = Layout::new();
+    let root = ui.root();
+    ui.set_style(root, |_| Style::new().padding(4.0));
+    ui.compute(VIEW, &M);
+    ui.set_style(root, |_| Style::new().padding(4.0));
+    assert!(!ui.compute(VIEW, &M));
+}
+
+#[test]
+#[should_panic(expected = "cannot have children")]
+fn text_leaves_cannot_take_children() {
+    let mut ui = Layout::new();
+    let t = ui.add_text(ui.root(), Style::new(), text("x"));
+    ui.add(t, Style::new());
 }
