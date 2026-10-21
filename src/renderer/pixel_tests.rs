@@ -943,6 +943,32 @@ mod layout_paint {
     }
 
     #[test]
+    fn a_border_is_a_ring_over_a_background_that_fills_the_whole_box() {
+        for radius in [0.0, 8.0] {
+            let Some(mut scene) = Scene::new((100, 100)) else { return };
+            let layer = scene.layer();
+            let mut ui = Layout::new();
+            let boxed = ui.add(ui.root(), Style::new().size(60.0, 60.0).margin(10.0));
+            ui.set_paint(
+                boxed,
+                Some(
+                    Paint::background(Color::rgb(0, 0, 200))
+                        .radius(radius)
+                        .border(4.0, Color::rgb(200, 0, 0)),
+                ),
+            );
+            ui.compute(Rect::new(0.0, 0.0, 100.0, 100.0), &layer);
+            layer.clear();
+            ui.paint(&layer);
+            scene.frame(1.0);
+            assert_near(scene.pixel(40, 40), [0, 0, 200, 255], 2); // interior: background
+            assert_near(scene.pixel(40, 12), [200, 0, 0, 255], 2); // top border band
+            assert_near(scene.pixel(12, 40), [200, 0, 0, 255], 2); // left border band
+            assert_near(scene.pixel(5, 40), [0, 0, 0, 255], 0); // outside
+        }
+    }
+
+    #[test]
     fn wrapped_text_is_measured_painted_and_stays_inside_its_box() {
         let Some(mut scene) = Scene::new((200, 160)) else { return };
         let layer = scene.layer();
