@@ -40,6 +40,8 @@
 mod paint;
 mod style;
 #[cfg(test)]
+mod title_bar_port;
+#[cfg(test)]
 mod tests;
 
 use taffy::style::AvailableSpace;
