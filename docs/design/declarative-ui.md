@@ -862,3 +862,27 @@ they cost no rebuild and no solve.
 **Where the builder lives.** The prototype showed the builder needs `Layout`'s private fields, so it stays in
 `src/layout/build.rs` instead of moving to `src/ui/` as the plan in section 9 said. `Ui` (events, scroll, slots) can
 still be a separate module later and wrap `Layout`.
+
+---
+
+## 12. Where the implementation differs from sections 3 and 6 (after PR #5 review)
+
+Sections 3 and 6 are the design; this is what the code does today, so the two do not drift silently.
+
+- **Identity.** `Id` is a plain `u64` set with `Style::id(..)`; the entry's `tag` holds it. There is no separate `key`:
+  the same value is the hit-test tag and the reconcile identity (section 3.6). Siblings must not share a nonzero id
+  (debug builds assert). `Layout::set_tag` on a node the builder manages changes its identity, so the next build
+  recreates it; set ids in the description. If a case needs a reconcile key that differs from the event id, add a
+  `key` field then.
+- **Text styles.** No `TextStyleId` interner yet. Text styles are `&TextStyle` values compared in place (zero
+  allocation) with a hash (`fingerprint`) used only for memo. The interner stays on the list for spans.
+- **Keyed lookup complexity.** A shifted identified child is found by a linear scan of the remaining siblings
+  (`reconcile`), not by the scratch `HashMap` of 3.6, and a move is a `Vec` remove plus insert in taffy's child list.
+  Both are cheap memory moves, so a keyed reorder of n children is O(n) per moved child, O(n²) worst case (full
+  reversal). Measured: reversing 2000 keyed children in `tests/builder.rs` finishes in milliseconds in a debug build.
+  The map is the upgrade if a profile of a large reorder shows it; section 3.6's O(n) claim applies to the lookup only
+  once that map exists.
+- **`El` and styles.** `El`'s fields are private; build one from a `Style` (which splits layout from look and
+  carries the id). The imperative `add`, `set_style` and `style()` now honour look and id too, so there is one
+  schema; only `Layout::set_paint` keeps the old "border drawn inside, space reserved by the caller" meaning.
+- **Memo.** Debug builds assert that `memo` wraps exactly one container (zero, several, or a leaf all panic).

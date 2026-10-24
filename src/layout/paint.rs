@@ -7,6 +7,7 @@
 
 use taffy::style::Display;
 
+use super::style::Look;
 use super::{Layout, Measurer, NodeId, Rect, Space};
 use crate::renderer::{
     Alignment, ClipShape, Color, FillRule, Font, FontParameters, Layer, PathPaint, Rounding,
@@ -26,6 +27,24 @@ pub struct Paint {
 }
 
 impl Paint {
+    /// The paint for a style's look half; `None` for a plain box.
+    pub(super) fn from_look(look: &Look) -> Option<Self> {
+        (*look != Look::default()).then(|| Self {
+            background: look.background.clone(),
+            border: look.border.clone(),
+            radius: look.radius,
+        })
+    }
+
+    /// The look half this paint was made from.
+    pub(super) fn to_look(paint: Option<&Paint>) -> Look {
+        paint.map_or_else(Look::default, |p| Look {
+            background: p.background.clone(),
+            border: p.border.clone(),
+            radius: p.radius,
+        })
+    }
+
     pub fn background(color: Color) -> Self {
         Self {
             background: Some(color),

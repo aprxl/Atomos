@@ -146,7 +146,7 @@ impl Color {
     /// whole has no floats to worry about *yet* — kept as an explicit
     /// method (rather than `#[derive(Hash)]`) so it reads the same way as
     /// `DrawCommand`'s manual impl, which does need to worry about floats.
-    pub(super) fn hash_bits<H: std::hash::Hasher>(&self, state: &mut H) {
+    pub(crate) fn hash_bits<H: std::hash::Hasher>(&self, state: &mut H) {
         use std::hash::Hash;
         match self {
             Color::Solid(rgba) => {

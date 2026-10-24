@@ -1,3 +1,6 @@
+//! Tests raw `taffy` only, not Atomos code: it checks the assumption the
+//! virtual-list design rests on, so it will fail if a taffy upgrade changes it.
+//!
 //! Spike for design risk R1: can detached "row island" subtrees live in the
 //! same `TaffyTree` as the main root, with independent caches and dirty
 //! marks? Counts measure calls to see which solves reuse cached results.

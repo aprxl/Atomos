@@ -224,7 +224,8 @@ impl Style {
     /// [`Paint::border`](super::Paint::border) it also takes `width` of
     /// space in layout on every side, so the box model matches the picture.
     pub fn border(mut self, width: f32, color: Color) -> Self {
-        let w = LengthPercentage::length(width.max(0.0));
+        let width = if width.is_finite() { width.max(0.0) } else { 0.0 };
+        let w = LengthPercentage::length(width);
         self.inner.border = taffy::Rect {
             left: w,
             right: w,

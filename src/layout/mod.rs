@@ -391,9 +391,9 @@ impl Layout {
             children: Vec::new(),
             rect: Rect::default(),
             moved: false,
-            tag: 0,
+            tag: style.id,
             clip: style.clip,
-            paint: None,
+            paint: Paint::from_look(&style.look).map(Box::new),
             memo: 0,
         };
         let index = if let Some(index) = self.free.pop() {
@@ -405,6 +405,7 @@ impl Layout {
             (self.entries.len() - 1) as u32
         };
         self.entries[parent.index as usize].children.push(index);
+        self.repaint = true;
         self.invalidate();
         self.id_of(index)
     }
@@ -473,36 +474,57 @@ impl Layout {
     ///
     /// The closure takes the current style and returns the new one, so the
     /// builder methods chain: `ui.set_style(id, |s| s.width(px(80.0)))`.
+    ///
+    /// Only the layout half re-solves. A changed look (`bg`, `radius`,
+    /// `border`) just asks for a repaint, and `id` is the node's tag.
     pub fn set_style(&mut self, id: NodeId, edit: impl FnOnce(Style) -> Style) {
-        let node = self.entry(id).node;
-        let clip = self.entry(id).clip;
-        let before = Style {
-            inner: self.tree.style(node).expect("node exists").clone(),
-            clip,
-            ..Style::default()
-        };
-        let mut after = edit(before.clone());
-        // Look and id are the builder's concern, not the solver's.
-        after.look = before.look.clone();
-        after.id = before.id;
-        if id.index == self.root {
-            // The root's size is the viewport's; it is not the caller's.
-            after.inner.size = before.inner.size;
+        let before = self.style(id);
+        let after = edit(before.clone());
+        if after.look != before.look {
+            self.set_paint(id, Paint::from_look(&after.look));
         }
-        if after != before {
-            self.entry_mut(id).clip = after.clip;
-            self.tree.set_style(node, after.inner).expect("node exists");
+        if after.id != before.id {
+            self.entry_mut(id).tag = after.id;
+        }
+        self.set_layout_style(id, &after);
+    }
+
+    /// Applies the layout half of `style` (what the solver sees), dirtying
+    /// the tree only if it differs from what is stored. No clone, so a
+    /// builder rebuild that changes nothing allocates nothing.
+    fn set_layout_style(&mut self, id: NodeId, style: &Style) {
+        let node = self.entry(id).node;
+        let current = self.tree.style(node).expect("node exists");
+        let mut inner = None;
+        if current != &style.inner {
+            let mut next = style.inner.clone();
+            if id.index == self.root {
+                // The root's size is the viewport's; it is not the caller's.
+                next.size = current.size;
+            }
+            if &next != current {
+                inner = Some(next);
+            }
+        }
+        let clip_changed = self.entry(id).clip != style.clip;
+        if inner.is_some() || clip_changed {
+            self.entry_mut(id).clip = style.clip;
+            if let Some(next) = inner {
+                self.tree.set_style(node, next).expect("node exists");
+            }
             self.invalidate();
         }
     }
 
-    /// The node's style as last set.
+    /// The node's style as last set, including the look and id that
+    /// `set_style` and the builder applied.
     pub fn style(&self, id: NodeId) -> Style {
         let e = self.entry(id);
         Style {
             inner: self.tree.style(e.node).expect("node exists").clone(),
             clip: e.clip,
-            ..Style::default()
+            look: Paint::to_look(e.paint.as_deref()),
+            id: e.tag,
         }
     }
 
@@ -540,7 +562,10 @@ impl Layout {
         self.invalidate();
     }
 
-    /// A user tag for hit-testing: `0` means none.
+    /// A user tag for hit-testing: `0` means none. On a node the builder
+    /// manages, the tag is also its identity: change it here and the next
+    /// `build` will not recognise the node and will recreate it. Set it with
+    /// [`Style::id`] in the description instead.
     pub fn set_tag(&mut self, id: NodeId, tag: u64) {
         self.entry_mut(id).tag = tag;
     }

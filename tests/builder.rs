@@ -120,7 +120,8 @@ fn keyed_reorder_moves_nodes_instead_of_recreating() {
     let ids_after: Vec<_> = ui.children(list).collect();
     assert_eq!(ids_after[0], ids_before[4]);
     assert_eq!(ids_after[4], ids_before[0]);
-    assert_eq!(ui.len(), 1 + 1 + 2 + 1 + 5 + 1 + 1 - 1 + 1 - 1 + 0 + 1 - 1);
+    // root, outer div, bar, "Save", list, 5 items, modeline text
+    assert_eq!(ui.len(), 11);
 }
 
 #[test]
@@ -213,11 +214,11 @@ fn memo_reruns_when_inherited_text_changes() {
     let (t, runs) = (theme(), Counter::new(0));
     let mut ui = Layout::new();
     ui.build(|b| memo_view(b, &runs, 1, &t));
+    assert!(ui.take_repaint());
     let bigger = TextStyle::new(Font::Named("mono".into()), FontParameters::new(20.0), Color::rgb(9, 9, 9));
     ui.build(|b| memo_view(b, &runs, 1, &bigger));
     assert_eq!(runs.get(), 2, "a theme change left a memo'd subtree stale");
-    // The child really took the new style: 12 chars at 8 px, one line.
-    ui.compute(VIEW, &Cells);
+    // The memo'd child really took the new colour.
     assert!(ui.take_repaint());
 }
 
@@ -237,4 +238,103 @@ fn inherited_text_style_reaches_nested_text() {
     let kids: Vec<_> = ui.children(div).collect();
     assert_eq!(ui.rect(kids[0]).width, 32.0);
     assert_eq!(ui.rect(kids[1]).width, 16.0);
+}
+
+#[cfg(debug_assertions)]
+mod misuse {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "share id")]
+    fn duplicate_sibling_ids_assert() {
+        let mut ui = Layout::new();
+        ui.build(|b| {
+            b.el(Style::new().id(5));
+            b.el(Style::new().id(5));
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "not a leaf")]
+    fn memo_on_a_leaf_asserts() {
+        let mut ui = Layout::new();
+        ui.build(|b| b.memo(1, |b| b.el(Style::new())));
+    }
+
+    #[test]
+    #[should_panic(expected = "described none")]
+    fn memo_with_nothing_asserts() {
+        let mut ui = Layout::new();
+        ui.build(|b| b.memo(1, |_| {}));
+    }
+
+    #[test]
+    #[should_panic(expected = "described several")]
+    fn memo_with_two_containers_asserts() {
+        let mut ui = Layout::new();
+        ui.build(|b| {
+            b.memo(1, |b| {
+                b.div(Style::new(), |_| {});
+                b.div(Style::new(), |_| {});
+            })
+        });
+    }
+}
+
+#[test]
+fn positional_element_vanishing_before_an_identified_one() {
+    let mut ui = Layout::new();
+    let describe = |ui: &mut Layout, first: bool| {
+        ui.build(|b| {
+            if first {
+                b.el(Style::new().height(px(10.0)));
+            }
+            b.el(Style::new().id(9).height(px(20.0)));
+            b.el(Style::new().height(px(30.0)));
+        })
+    };
+    describe(&mut ui, true);
+    let kids: Vec<_> = ui.children(ui.root()).collect();
+    describe(&mut ui, false);
+    let after: Vec<_> = ui.children(ui.root()).collect();
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0], kids[1], "the identified element must survive");
+    assert_eq!(ui.tag(after[0]), 9);
+    // Appearing again inserts in front without recreating the others.
+    describe(&mut ui, true);
+    let again: Vec<_> = ui.children(ui.root()).collect();
+    assert_eq!(&again[1..], &after[..]);
+}
+
+#[test]
+fn large_keyed_reversal_keeps_every_node() {
+    let (t, mut its) = (theme(), items(2000));
+    let mut ui = Layout::new();
+    ui.build(|b| view(b, &t, &its, 1, false));
+    let list = ui.children(ui.children(ui.root()).next().unwrap()).nth(1).unwrap();
+    let before: Vec<_> = ui.children(list).collect();
+    its.reverse();
+    ui.build(|b| view(b, &t, &its, 1, false));
+    let after: Vec<_> = ui.children(list).collect();
+    let mut expect = before.clone();
+    expect.reverse();
+    assert_eq!(after, expect);
+    assert_eq!(ui.len(), 2000 + 6);
+}
+
+#[test]
+fn imperative_api_honours_look_and_id() {
+    let mut ui = Layout::new();
+    let c = Color::rgb(10, 20, 30);
+    let n = ui.add(ui.root(), Style::new().height(px(20.0)).bg(c.clone()).radius(3.0).id(77));
+    assert_eq!(ui.tag(n), 77);
+    assert!(ui.take_repaint());
+    ui.compute(VIEW, &Cells);
+    let solves = ui.solves();
+    ui.set_style(n, |s| s.bg(Color::rgb(1, 1, 1)));
+    assert!(!ui.compute(VIEW, &Cells), "a look edit re-solved");
+    assert_eq!(ui.solves(), solves);
+    assert!(ui.take_repaint());
+    ui.set_style(n, |s| s.id(0));
+    assert_eq!(ui.tag(n), 0);
 }

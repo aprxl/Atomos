@@ -11,7 +11,6 @@
 //! recreate everything after it.
 
 use super::paint::TextLeaf;
-use super::style::Look;
 use super::{Layout, Leaf, NodeId, Paint, Style};
 use crate::renderer::{Color, Font, FontParameters};
 
@@ -20,21 +19,18 @@ use crate::renderer::{Color, Font, FontParameters};
 /// splits the layout half from the look half.
 #[derive(Clone, Debug, PartialEq)]
 pub struct El {
-    pub style: Style,
-    pub paint: Option<Paint>,
-    /// Hit-test tag and reconcile identity. `0` means positional.
-    pub id: u64,
+    style: Style,
+    paint: Option<Paint>,
+    /// Hit-test tag and reconcile identity. `0` means positional. Siblings
+    /// must not share a nonzero id (debug builds assert).
+    id: u64,
 }
 
 impl From<Style> for El {
     fn from(mut style: Style) -> Self {
         let look = std::mem::take(&mut style.look);
         let id = std::mem::take(&mut style.id);
-        let paint = (look != Look::default()).then(|| Paint {
-            background: look.background,
-            border: look.border,
-            radius: look.radius,
-        });
+        let paint = Paint::from_look(&look);
         El { style, paint, id }
     }
 }
@@ -95,20 +91,23 @@ impl TextStyle {
         self
     }
 
-    /// Hash of every field, with no allocation (hashes the `Debug` text).
+    /// Hash of every field (floats by bits), with no allocation.
     fn fingerprint(&self) -> u64 {
-        use std::fmt::Write;
-        use std::hash::Hasher;
-        struct Sink(std::collections::hash_map::DefaultHasher);
-        impl Write for Sink {
-            fn write_str(&mut self, s: &str) -> std::fmt::Result {
-                self.0.write(s.as_bytes());
-                Ok(())
-            }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.font.hash(&mut h);
+        for v in [
+            self.params.size,
+            self.params.weight,
+            self.params.width,
+            self.params.tracking,
+            self.params.slant,
+        ] {
+            v.to_bits().hash(&mut h);
         }
-        let mut sink = Sink(Default::default());
-        let _ = write!(sink, "{self:?}");
-        sink.0.finish() | 1
+        self.color.hash_bits(&mut h);
+        self.wrap.hash(&mut h);
+        h.finish() | 1
     }
 }
 
@@ -222,6 +221,18 @@ impl Build<'_> {
     pub fn el(&mut self, el: impl Into<El>) {
         let el = el.into();
         self.reconcile(false, &el);
+        self.leaf_done();
+    }
+
+    /// Where the next child goes: the open container and its position.
+    fn cursor(&self) -> (u32, usize) {
+        let f = self.frames.last().expect("describe inside build");
+        (f.parent, f.pos)
+    }
+
+    /// A leaf cannot carry a memo; it has no children to skip.
+    fn leaf_done(&self) {
+        debug_assert_eq!(self.taken_memo, 0, "memo wraps a container, not a leaf");
     }
 
     /// Wraps exactly one element (the next `div`/`open`) so that, when
@@ -234,8 +245,19 @@ impl Build<'_> {
         deps.hash(&mut h);
         self.ui.text_stack.prints[self.depth].hash(&mut h);
         self.pending_memo = h.finish() | 1;
+        let (parent, start) = self.cursor();
         f(self);
-        debug_assert_eq!(self.pending_memo, 0, "memo must wrap exactly one container");
+        // Exactly one container: none leaves the marker unconsumed, a leaf
+        // trips the check in `leaf_done`, and two would skip the second.
+        debug_assert!(
+            self.pending_memo == 0,
+            "memo must wrap exactly one container, but it described none"
+        );
+        debug_assert_eq!(
+            self.cursor(),
+            (parent, start + 1),
+            "memo must wrap exactly one container, but it described several"
+        );
         self.pending_memo = 0;
     }
 
@@ -286,6 +308,7 @@ impl Build<'_> {
         if recolor || remeasure {
             ui.repaint = true;
         }
+        self.leaf_done();
     }
 
     /// Text from `format_args!` in the inherited style, written into a
@@ -313,10 +336,7 @@ impl Build<'_> {
     /// container, updates it to match `el`, and returns its entry index.
     fn reconcile(&mut self, is_text: bool, el: &El) -> u32 {
         self.taken_memo = std::mem::take(&mut self.pending_memo);
-        let (parent, pos) = {
-            let f = self.frames.last().expect("describe inside build");
-            (f.parent, f.pos)
-        };
+        let (parent, pos) = self.cursor();
         let matches = |ui: &Layout, index: u32| {
             let e = &ui.entries[index as usize];
             e.tag == el.id && ui.is_text(index) == is_text
@@ -357,20 +377,21 @@ impl Build<'_> {
                 self.create(parent, pos, is_text, el)
             }
         };
+        debug_assert!(
+            el.id == 0
+                || !self.ui.entries[parent as usize].children[..pos]
+                    .iter()
+                    .any(|c| self.ui.entries[*c as usize].tag == el.id),
+            "layout: two siblings share id {}",
+            el.id
+        );
         self.frames.last_mut().unwrap().pos += 1;
         index
     }
 
     fn update(&mut self, index: u32, el: &El) {
         let id = self.ui.id_of(index);
-        let node = self.ui.entries[index as usize].node;
-        let same_style = self.ui.tree.style(node).map(|s| s == &el.style.inner).unwrap_or(false)
-            && self.ui.entries[index as usize].clip == el.style.clip;
-        if !same_style {
-            // The root's size belongs to the viewport; leave it alone.
-            let style = el.style.clone();
-            self.ui.set_style(id, |_| style);
-        }
+        self.ui.set_layout_style(id, &el.style);
         if self.ui.entries[index as usize].paint.as_deref() != el.paint.as_ref() {
             self.ui.set_paint(id, el.paint.clone());
         }
