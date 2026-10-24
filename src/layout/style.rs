@@ -4,6 +4,7 @@
 //! callers never name the backend and it can be swapped without breaking
 //! them: `Style::new().width(px(80.0)).grow(1.0)`.
 
+use crate::renderer::Color;
 use taffy::style::{
     AlignContent, AlignItems, AlignSelf, Dimension, Display, FlexDirection, FlexWrap,
     JustifyContent, LengthPercentage, LengthPercentageAuto, Overflow as Flow, Position,
@@ -122,6 +123,19 @@ pub enum Overflow {
 pub struct Style {
     pub(super) inner: taffy::Style,
     pub(super) clip: bool,
+    /// How the box looks. Not part of what the solver sees: the builder
+    /// splits it off (`Style::el`) so a colour change never re-solves.
+    pub(super) look: Look,
+    /// Identity for hit-testing and for the builder's reconcile. `0` = none.
+    pub(super) id: u64,
+}
+
+/// The look half of a [`Style`]: what paints, not what lays out.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Look {
+    pub(super) background: Option<Color>,
+    pub(super) border: Option<(f32, Color)>,
+    pub(super) radius: f32,
 }
 
 impl Default for Style {
@@ -131,7 +145,12 @@ impl Default for Style {
             flex_direction: FlexDirection::Column,
             ..taffy::Style::default()
         };
-        Self { inner, clip: false }
+        Self {
+            inner,
+            clip: false,
+            look: Look::default(),
+            id: 0,
+        }
     }
 }
 
@@ -187,6 +206,41 @@ impl Style {
     /// A column. Same as [`Style::new`], spelled out.
     pub fn column() -> Self {
         Self::default()
+    }
+
+    /// Fill colour. Applied by the builder; see [`Style::el`].
+    pub fn bg(mut self, color: Color) -> Self {
+        self.look.background = Some(color);
+        self
+    }
+
+    /// Corner radius in logical pixels.
+    pub fn radius(mut self, radius: f32) -> Self {
+        self.look.radius = radius;
+        self
+    }
+
+    /// A border of `width` logical pixels in `color`. Unlike
+    /// [`Paint::border`](super::Paint::border) it also takes `width` of
+    /// space in layout on every side, so the box model matches the picture.
+    pub fn border(mut self, width: f32, color: Color) -> Self {
+        let width = if width.is_finite() { width.max(0.0) } else { 0.0 };
+        let w = LengthPercentage::length(width);
+        self.inner.border = taffy::Rect {
+            left: w,
+            right: w,
+            top: w,
+            bottom: w,
+        };
+        self.look.border = Some((width, color));
+        self
+    }
+
+    /// Identity: events, `Layout::rect_of` and the builder's reconcile
+    /// find the element by it. Keep it unique among siblings.
+    pub fn id(mut self, id: u64) -> Self {
+        self.id = id;
+        self
     }
 
     /// A row.

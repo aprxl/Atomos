@@ -7,6 +7,7 @@
 
 use taffy::style::Display;
 
+use super::style::Look;
 use super::{Layout, Measurer, NodeId, Rect, Space};
 use crate::renderer::{
     Alignment, ClipShape, Color, FillRule, Font, FontParameters, Layer, PathPaint, Rounding,
@@ -26,6 +27,24 @@ pub struct Paint {
 }
 
 impl Paint {
+    /// The paint for a style's look half; `None` for a plain box.
+    pub(super) fn from_look(look: &Look) -> Option<Self> {
+        (*look != Look::default()).then(|| Self {
+            background: look.background.clone(),
+            border: look.border.clone(),
+            radius: look.radius,
+        })
+    }
+
+    /// The look half this paint was made from.
+    pub(super) fn to_look(paint: Option<&Paint>) -> Look {
+        paint.map_or_else(Look::default, |p| Look {
+            background: p.background.clone(),
+            border: p.border.clone(),
+            radius: p.radius,
+        })
+    }
+
     pub fn background(color: Color) -> Self {
         Self {
             background: Some(color),
@@ -148,6 +167,32 @@ impl TextLeaf {
         true
     }
 
+    /// Makes the leaf show `text` in `font`/`params`/`color`/`wrap`,
+    /// comparing first so an unchanged description allocates and
+    /// invalidates nothing. Returns whether measurement must re-run.
+    pub(super) fn describe(
+        &mut self,
+        text: &str,
+        font: &Font,
+        params: &FontParameters,
+        color: &Color,
+        wrap: bool,
+    ) -> (bool, bool) {
+        let mut remeasure = self.set_text(text);
+        if self.text.font != *font || self.text.params != *params || self.text.wrap != wrap {
+            self.text.font = font.clone();
+            self.text.params = *params;
+            self.text.wrap = wrap;
+            self.forget();
+            remeasure = true;
+        }
+        let recolor = self.text.color != *color;
+        if recolor {
+            self.text.color = color.clone();
+        }
+        (remeasure, recolor)
+    }
+
     pub(super) fn set_font(&mut self, font: Font, params: FontParameters) -> bool {
         if self.text.font == font && self.text.params == params {
             return false;
@@ -221,7 +266,12 @@ impl Layout {
     pub fn set_paint(&mut self, id: NodeId, paint: Option<Paint>) {
         let slot = &mut self.entry_mut(id).paint;
         if slot.as_deref() != paint.as_ref() {
-            *slot = paint.map(Box::new);
+            match (slot.as_deref_mut(), paint) {
+                // Assign in place: no allocation when a paint changes.
+                (Some(old), Some(new)) => *old = new,
+                (_, new) => *slot = new.map(Box::new),
+            }
+            self.repaint = true;
         }
     }
 
