@@ -116,6 +116,10 @@ pub(super) struct Frame {
     pos: usize,
     /// Memo hash to record on `close`; `0` for none.
     memo: u64,
+    /// Where this container's parked children start in `Layout::parked`.
+    park_from: usize,
+    /// Slot in `Layout::id_maps`, built on the first id miss.
+    map: Option<usize>,
 }
 
 /// The inherited text style stack, kept on the `Layout` so its strings are
@@ -151,10 +155,17 @@ impl Layout {
     pub fn build(&mut self, f: impl FnOnce(&mut Build<'_>)) {
         let mut frames = std::mem::take(&mut self.build_frames);
         frames.clear();
+        self.build_gen = self.build_gen.wrapping_add(1).max(1);
+        self.parked.clear();
+        self.id_maps_used = 0;
+        #[cfg(debug_assertions)]
+        self.described_ids.clear();
         frames.push(Frame {
             parent: self.root,
             pos: 0,
             memo: 0,
+            park_from: 0,
+            map: None,
         });
         let mut b = Build {
             ui: self,
@@ -193,13 +204,32 @@ impl Build<'_> {
             parent: i,
             pos,
             memo: if hit { 0 } else { memo },
+            park_from: self.ui.parked.len(),
+            map: None,
         });
         hit
     }
 
     /// Ends the container opened last, removing children not described.
     pub fn close(&mut self) {
-        let Frame { parent, pos, memo } = self.frames.pop().expect("close without open");
+        let Frame {
+            parent,
+            pos,
+            memo,
+            park_from,
+            map,
+        } = self.frames.pop().expect("close without open");
+        if map.is_some() {
+            self.ui.id_maps_used -= 1;
+        }
+        // Children set aside and never reclaimed are gone.
+        while self.ui.parked.len() > park_from {
+            let e = self.ui.parked.pop().expect("length checked");
+            if self.ui.entries[e as usize].parent.is_none() {
+                let id = self.ui.id_of(e);
+                self.ui.remove(id);
+            }
+        }
         while self.ui.entries[parent as usize].children.len() > pos {
             let last = *self.ui.entries[parent as usize].children.last().unwrap();
             let id = self.ui.id_of(last);
@@ -348,13 +378,7 @@ impl Build<'_> {
         let found = if pos < len && matches(self.ui, at(self.ui, pos)) {
             Some(at(self.ui, pos))
         } else if el.id != 0 {
-            // Shifted: look for the same id further along and move it up.
-            let hit = (pos + 1..len).find(|p| matches(self.ui, at(self.ui, *p)));
-            hit.map(|from| {
-                let index = at(self.ui, from);
-                self.ui.move_child(parent, from, pos);
-                index
-            })
+            self.claim(parent, pos, el.id, is_text)
         } else if pos + 1 < len
             && self.ui.entries[at(self.ui, pos) as usize].tag == 0
             && matches(self.ui, at(self.ui, pos + 1))
@@ -377,16 +401,73 @@ impl Build<'_> {
                 self.create(parent, pos, is_text, el)
             }
         };
-        debug_assert!(
-            el.id == 0
-                || !self.ui.entries[parent as usize].children[..pos]
-                    .iter()
-                    .any(|c| self.ui.entries[*c as usize].tag == el.id),
+        #[cfg(debug_assertions)]
+        assert!(
+            el.id == 0 || self.ui.described_ids.insert((parent, el.id)),
             "layout: two siblings share id {}",
             el.id
         );
+        self.ui.entries[index as usize].seen = self.ui.build_gen;
         self.frames.last_mut().unwrap().pos += 1;
         index
+    }
+
+    /// Finds the not-yet-described child (or one parked earlier in this
+    /// container) with identity `id` and leaves it at `pos`. Children
+    /// skipped on the way are parked, not moved one by one, so deleting
+    /// the first row of a long keyed list is one range removal, not a
+    /// shift of every later row. A parked child whose id never reappears
+    /// is removed when the container closes.
+    fn claim(&mut self, parent: u32, pos: usize, id: u64, is_text: bool) -> Option<u32> {
+        let slot = self.id_map(parent, pos);
+        let e = *self.ui.id_maps[slot].get(&id)?;
+        let ent = &self.ui.entries[e as usize];
+        if !ent.live
+            || ent.seen == self.ui.build_gen
+            || ent.tag != id
+            || self.ui.is_text(e) != is_text
+        {
+            return None;
+        }
+        match ent.parent {
+            Some(p) if p == parent => {
+                let children = &self.ui.entries[parent as usize].children;
+                let from = pos + children[pos..].iter().position(|c| *c == e)?;
+                if from > pos {
+                    self.ui.park_range(parent, pos, from);
+                }
+                Some(e)
+            }
+            None => {
+                self.ui.attach_child(parent, pos, e);
+                Some(e)
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// The id table for the open container, built on first use from the
+    /// children not yet described.
+    fn id_map(&mut self, parent: u32, pos: usize) -> usize {
+        if let Some(slot) = self.frames.last().expect("describe inside build").map {
+            return slot;
+        }
+        let slot = self.ui.id_maps_used;
+        self.ui.id_maps_used += 1;
+        if slot == self.ui.id_maps.len() {
+            self.ui.id_maps.push(Default::default());
+        }
+        let ui = &mut *self.ui;
+        let map = &mut ui.id_maps[slot];
+        map.clear();
+        for c in &ui.entries[parent as usize].children[pos..] {
+            let tag = ui.entries[*c as usize].tag;
+            if tag != 0 {
+                map.insert(tag, *c);
+            }
+        }
+        self.frames.last_mut().expect("frame").map = Some(slot);
+        slot
     }
 
     fn update(&mut self, index: u32, el: &El) {
@@ -430,6 +511,33 @@ impl Layout {
             self.tree.get_node_context(self.entries[index as usize].node),
             Some(Leaf::Text(_))
         )
+    }
+
+    /// Detaches children `from..to` of `parent` (solver and ours) and
+    /// parks them for the rest of this container's description.
+    fn park_range(&mut self, parent: u32, from: usize, to: usize) {
+        let pnode = self.entries[parent as usize].node;
+        self.tree
+            .remove_children_range(pnode, from..to)
+            .expect("range valid");
+        let start = self.parked.len();
+        self.parked
+            .extend(self.entries[parent as usize].children.drain(from..to));
+        for c in &self.parked[start..] {
+            self.entries[*c as usize].parent = None;
+        }
+        self.invalidate();
+    }
+
+    /// Re-attaches a parked child at `pos`.
+    fn attach_child(&mut self, parent: u32, pos: usize, child: u32) {
+        let pnode = self.entries[parent as usize].node;
+        self.tree
+            .insert_child_at_index(pnode, pos, self.entries[child as usize].node)
+            .expect("position valid");
+        self.entries[parent as usize].children.insert(pos, child);
+        self.entries[child as usize].parent = Some(parent);
+        self.invalidate();
     }
 
     /// Moves child `from` of `parent` to position `to`, in both the

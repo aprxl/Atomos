@@ -876,12 +876,18 @@ Sections 3 and 6 are the design; this is what the code does today, so the two do
   `key` field then.
 - **Text styles.** No `TextStyleId` interner yet. Text styles are `&TextStyle` values compared in place (zero
   allocation) with a hash (`fingerprint`) used only for memo. The interner stays on the list for spans.
-- **Keyed lookup complexity.** A shifted identified child is found by a linear scan of the remaining siblings
-  (`reconcile`), not by the scratch `HashMap` of 3.6, and a move is a `Vec` remove plus insert in taffy's child list.
-  Both are cheap memory moves, so a keyed reorder of n children is O(n) per moved child, O(n²) worst case (full
-  reversal). Measured: reversing 2000 keyed children in `tests/builder.rs` finishes in milliseconds in a debug build.
-  The map is the upgrade if a profile of a large reorder shows it; section 3.6's O(n) claim applies to the lookup only
-  once that map exists.
+- **Keyed reconcile (park and reclaim).** An identified element that is not at the cursor is looked up in a per-container
+  `HashMap<id, entry>` built lazily on the first miss (tables are pooled on `Layout`, reused across builds). If the
+  match is further along, the children skipped on the way are detached with one range removal and *parked*, not moved
+  one by one. If a parked child's id is described later in the same container it is re-attached (identity kept);
+  parked children never reclaimed are removed when the container closes. Deleting the first row of a 20k-row keyed
+  list is therefore one O(n) range drain; every later row matches at the cursor. Inserting at the front creates one
+  node. A full reversal parks once, then re-attaches each row at the end of the short described prefix. Only a real
+  reorder pays a `Vec` insert. Tests: `deleting_the_first_of_many_keyed_rows_is_linear_and_keeps_identity` (20k rows,
+  survivors keep their nodes, time bound relative to an unchanged rebuild), `large_keyed_reversal_keeps_every_node`,
+  `inserting_at_the_front_and_replacing_everything_keep_working`. This is the scratch-map design of section 3.6, with
+  parking instead of per-child moves.
+- **Duplicate ids** are detected in debug builds with a per-build set of `(parent, id)`, so the check is O(1) per element.
 - **`El` and styles.** `El`'s fields are private; build one from a `Style` (which splits layout from look and
   carries the id). The imperative `add`, `set_style` and `style()` now honour look and id too, so there is one
   schema; only `Layout::set_paint` keeps the old "border drawn inside, space reserved by the caller" meaning.

@@ -338,3 +338,53 @@ fn imperative_api_honours_look_and_id() {
     ui.set_style(n, |s| s.id(0));
     assert_eq!(ui.tag(n), 0);
 }
+
+fn list_children(ui: &Layout) -> Vec<atomos::layout::NodeId> {
+    let list = ui.children(ui.children(ui.root()).next().unwrap()).nth(1).unwrap();
+    ui.children(list).collect()
+}
+
+#[test]
+fn deleting_the_first_of_many_keyed_rows_is_linear_and_keeps_identity() {
+    use std::time::Instant;
+    let (t, mut its) = (theme(), items(20_000));
+    let mut ui = Layout::new();
+    ui.build(|b| view(b, &t, &its, 1, false));
+    let before = list_children(&ui);
+
+    let start = Instant::now();
+    ui.build(|b| view(b, &t, &its, 1, false));
+    let unchanged = start.elapsed();
+
+    its.remove(0);
+    let start = Instant::now();
+    ui.build(|b| view(b, &t, &its, 1, false));
+    let deleted = start.elapsed();
+
+    assert_eq!(list_children(&ui), before[1..], "survivors must keep their nodes");
+    // root, outer div, bar, "Save", list, 19_999 rows, modeline text
+    assert_eq!(ui.len(), 6 + 19_999);
+    assert!(
+        deleted < unchanged * 10 + std::time::Duration::from_millis(100),
+        "delete took {deleted:?} against {unchanged:?} for an unchanged rebuild"
+    );
+}
+
+#[test]
+fn inserting_at_the_front_and_replacing_everything_keep_working() {
+    let (t, mut its) = (theme(), items(1000));
+    let mut ui = Layout::new();
+    ui.build(|b| view(b, &t, &its, 1, false));
+    let before = list_children(&ui);
+    its.insert(0, Item { id: 5000, name: "new".into() });
+    ui.build(|b| view(b, &t, &its, 1, false));
+    let after = list_children(&ui);
+    assert_eq!(after[1..], before[..], "existing rows keep their nodes");
+    assert_ne!(after[0], before[0]);
+
+    // Entirely new ids: everything is recreated, the old rows are removed.
+    let fresh: Vec<_> = (0..1000).map(|i| Item { id: 10_000 + i, name: format!("n{i}") }).collect();
+    ui.build(|b| view(b, &t, &fresh, 1, false));
+    assert_eq!(list_children(&ui).len(), 1000);
+    assert_eq!(ui.len(), 11 - 5 + 1000);
+}

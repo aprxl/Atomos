@@ -238,6 +238,8 @@ struct Entry {
     paint: Option<Box<Paint>>,
     /// Hash recorded by `Build::memo`; `0` when not memoised.
     memo: u64,
+    /// The `Layout::build` generation that last described this node.
+    seen: u32,
 }
 
 /// The tree. Built by the app, mutated freely, solved on demand.
@@ -256,6 +258,15 @@ pub struct Layout {
     stack: Vec<(u32, f32, f32)>,
     scratch: Vec<u32>,
     build_frames: Vec<build::Frame>,
+    build_gen: u32,
+    /// Children set aside by the builder this build; reclaimed if their id
+    /// reappears under the same parent, removed when the parent closes.
+    parked: Vec<u32>,
+    /// Per-open-container id lookup tables, reused across builds.
+    id_maps: Vec<std::collections::HashMap<u64, u32>>,
+    id_maps_used: usize,
+    #[cfg(debug_assertions)]
+    described_ids: std::collections::HashSet<(u32, u64)>,
     build_scratch: String,
     text_stack: build::TextStack,
     /// Something that only repaints changed (a colour, a paint).
@@ -290,6 +301,7 @@ impl Layout {
             clip: false,
             paint: None,
             memo: 0,
+            seen: 0,
         };
         Self {
             tree,
@@ -306,6 +318,12 @@ impl Layout {
             stack: Vec::new(),
             scratch: Vec::new(),
             build_frames: Vec::new(),
+            build_gen: 0,
+            parked: Vec::new(),
+            id_maps: Vec::new(),
+            id_maps_used: 0,
+            #[cfg(debug_assertions)]
+            described_ids: Default::default(),
             build_scratch: String::new(),
             text_stack: build::TextStack::new(),
             repaint: false,
@@ -395,6 +413,7 @@ impl Layout {
             clip: style.clip,
             paint: Paint::from_look(&style.look).map(Box::new),
             memo: 0,
+            seen: 0,
         };
         let index = if let Some(index) = self.free.pop() {
             let generation = self.entries[index as usize].generation + 1;
