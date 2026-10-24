@@ -171,3 +171,17 @@ is the old editor roadmap (marked historical).
 vendored platform copy should be deleted in favour of the `atomos` crate (path
 or git dependency), after porting its remaining callers to `with_clip` /
 `set_clip`, `FrameOutcome`, `InputEvent`, and logical-pixel layers.
+
+## Declarative builder follow-ups (from PR #5 review)
+
+### Unkeyed node beside keyed ones is recreated on reorder
+**Trigger:** before a view mixes unkeyed and keyed siblings under one parent that reorders.
+In `[U, K1]` becoming `[K1, U']`, claiming `K1` parks the unkeyed `U`, so it is recreated. Either do not park `tag == 0` nodes or document "put unkeyed siblings first" (`src/layout/build.rs`, `claim`).
+
+### Parked nodes leak if a view closure panics mid-build
+**Trigger:** if the app ever catches panics around `build`.
+At build start, remove entries left in `Layout::parked` whose parent is `None`.
+
+### Id lookup tables never shrink and use SipHash
+**Trigger:** after a profile of a large keyed list, or when memory per list matters.
+Shrink `id_maps` when capacity exceeds 4x the current size, use a cheap `u64` hasher, and re-measure `size_of::<Entry>()` against the roughly 80 bytes quoted in `docs/design/flexbox-layout.md` (`seen` and `memo` were added).
